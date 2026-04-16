@@ -101,6 +101,13 @@ static inline void node_wrlock(ztree_t *t, ztree_node_id_t id)
     pthread_rwlock_wrlock(node_latch_for_id(t, id));
 }
 
+static inline void node_rdlock(ztree_t *t, ztree_node_id_t id)
+{
+    if (id == ZTREE_INVALID_NODE_ID)
+        return;
+    pthread_rwlock_rdlock(node_latch_for_id(t, id));
+}
+
 static inline void node_unlock(ztree_t *t, ztree_node_id_t id)
 {
     if (id == ZTREE_INVALID_NODE_ID)
@@ -1051,13 +1058,79 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
             continue;
         }
 
-        /* Descent with latch-crabbing. */
+        /* ── Descent: read-crabbing through internals, upgrade at leaf ─────
+         *
+         * Concurrency model
+         * -----------------
+         *   • Hold an rdlock on at most one node at any time during descent.
+         *     Crabbing acquires the child's rdlock and releases the parent's,
+         *     mirroring the original wrlock-crab pattern but allowing many
+         *     concurrent descenders past internal nodes (notably the root).
+         *
+         *   • At the leaf, atomically *upgrade* by releasing the rdlock and
+         *     re-acquiring as wrlock.  pthread_rwlock has no atomic upgrade,
+         *     so a window opens between rd-unlock and wr-lock in which
+         *     another writer may modify or split the leaf.  Two post-upgrade
+         *     checks make this safe:
+         *
+         *       (a) Reload the leaf via NLT and confirm it is still a leaf.
+         *           If the tree grew (a new internal root was published),
+         *           our former "root-leaf" is now an internal — restart.
+         *
+         *       (b) If we descended through a parent (depth ≥ 1), reload
+         *           the latest parent snapshot and confirm it still routes
+         *           our key to *this* leaf_id.  A concurrent split of the
+         *           leaf demotes this leaf_id to the LEFT half; if our key
+         *           now belongs to the new right sibling (key ≥ promote_key),
+         *           the parent will route to a different child and we must
+         *           restart.
+         *
+         *     Once we hold the leaf's wrlock, no other thread can split the
+         *     leaf (splitting requires wrlock on the leaf), so the parent's
+         *     pointer to leaf_id is stable for the duration of our hold.
+         *
+         * Deadlock analysis
+         * -----------------
+         *   • Descent: top-down, ≤ 1 lock held at a time (rdlock during
+         *     internals, wrlock at the leaf after upgrade).
+         *
+         *   • Ascent (parent propagation): bottom-up, ≤ 1 lock held at a
+         *     time (one wrlock per parent level, released before moving up).
+         *
+         *   • Cross-thread interaction:
+         *       - Descender(rdlock @ X) vs Ascender(wrlock @ X): ascender
+         *         waits until all readers drain.  No cycle (descender does
+         *         not need anything the ascender holds).
+         *       - Two ascenders on different paths: each grabs one wrlock at
+         *         a time on its own ancestor chain.  No nested holds, no
+         *         cycle.
+         *       - Two upgraders on the SAME leaf: both release rdlock and
+         *         contend for the wrlock; pthread_rwlock serialises them.
+         *         No deadlock — just sequencing.
+         *
+         *   • Bucket-collision handling matches the original: same
+         *     latch_for_id → no relock during descent.  In the upgrade,
+         *     unlock-then-wrlock on the SAME physical lock is a no-op for
+         *     other holders' point of view (we briefly drop and re-take).
+         *     The post-upgrade reload picks up any concurrent change.
+         *
+         * Verification load
+         * -----------------
+         *   The parent reload in check (b) takes no node latch — we already
+         *   hold the leaf's wrlock, which prevents the leaf from being split,
+         *   so the parent's child_node_id pointer to leaf_id (if present) is
+         *   stable.  We only read parent fields, never mutate them.  Any
+         *   concurrent parent-side mutation (e.g., another insert splitting
+         *   a SIBLING leaf) shows up via load_latest_node returning the new
+         *   page; either the new page still routes us to leaf_id (we
+         *   proceed) or it doesn't (we restart).
+         */
         insert_path_frame path[MAX_HEIGHT];
         int depth = 0;
 
         ztree_node_id_t cur_id = root_nid;
         uint32_t cur_zone = root_zone;
-        node_wrlock(t, cur_id);
+        node_rdlock(t, cur_id);
 
         while (1)
         {
@@ -1078,10 +1151,60 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
 
             if (f->page.is_leaf)
             {
+                /* ── Upgrade rdlock → wrlock on the leaf ─────────────── */
+                node_unlock(t, cur_id);
+                node_wrlock(t, cur_id);
+
+                /* Reload after upgrade; leaf may have been CoW-relocated,
+                 * split, or otherwise modified during the unlock/wrlock gap. */
+                if (!load_latest_node(t, cur_zone, cur_id,
+                                      &f->zone_id, &f->slot_id, &f->page))
+                {
+                    node_unlock(t, cur_id);
+                    goto retry_insert;
+                }
+
+                /* Post-upgrade check (a): the tree may have grown, replacing
+                 * the root with a new internal node.  Our former root-leaf
+                 * is then an internal node and our key may belong elsewhere. */
+                if (!f->page.is_leaf)
+                {
+                    node_unlock(t, cur_id);
+                    goto retry_insert;
+                }
+
+                /* Post-upgrade check (b): if we descended through a parent,
+                 * confirm the parent's latest snapshot still routes our key
+                 * to this leaf_id.  Catches the split-during-upgrade race. */
+                if (depth >= 1)
+                {
+                    insert_path_frame *pf = &path[depth - 1];
+                    ztree_page latest_parent;
+                    uint32_t pzone, pslot;
+                    if (!load_latest_node(t, pf->zone_id, pf->node_id,
+                                          &pzone, &pslot, &latest_parent)
+                        || latest_parent.is_leaf)
+                    {
+                        node_unlock(t, cur_id);
+                        goto retry_insert;
+                    }
+
+                    uint32_t new_cidx = child_pos_for_key(&latest_parent, key);
+                    ztree_node_id_t routed = (new_cidx == RIGHTMOST_IDX)
+                                                 ? latest_parent.ptr_node_id
+                                                 : latest_parent.internal[new_cidx].child_node_id;
+                    if (routed != cur_id)
+                    {
+                        node_unlock(t, cur_id);
+                        goto retry_insert;
+                    }
+                }
+
                 depth++;
                 break;
             }
 
+            /* Internal node — read-crab to the next child. */
             uint32_t cidx = child_pos_for_key(&f->page, key);
             f->cidx_from_parent = cidx;
 
@@ -1089,13 +1212,13 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                                           ? f->page.ptr_node_id
                                           : f->page.internal[cidx].child_node_id;
 
-            /*
-             * Parent/child can hash to the same latch bucket. In that case we
-             * already hold the required lock and must not wrlock it again.
-             */
+            /* Parent/child can hash to the same latch bucket; in that case
+             * the rdlock we hold already covers the next node, so we must
+             * not relock or re-unlock (POSIX leaves recursive rdlock as
+             * implementation-defined). */
             if (node_latch_for_id(t, next_id) != node_latch_for_id(t, cur_id))
             {
-                node_wrlock(t, next_id);
+                node_rdlock(t, next_id);
                 node_unlock(t, cur_id);
             }
 

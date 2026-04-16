@@ -1,0 +1,211 @@
+3.1. Architecture
+Fig. 4 illustrates the architecture and data layout of ZTree on ZNS
+SSDs. The logical tree structure corresponding to this example is consistent
+with that in Fig. 2. ZTree consists of three distinct logical layers
+from top to bottom. The Root Layer (RLayer) serves as the global entry
+point of ZTree, which stores the latest version of the root node. The
+Internal Layer (ILayer) contains the internal nodes of the ZTree, which
+store the minimum key and storage location of their child nodes. The
+Leaf Layer (LLayer) holds the leaf nodes of the ZTree, where all value
+data is stored in ascending key order within each node.
+ZTree employs a layer-wise data layout to assign different logical
+layers to independent zones of ZNS SSDs. The RLayer is designated to a
+fixed high-priority zone (Zone#0 in default), which remains in the open
+state during runtime to minimize overhead on accessing the root node.
+For the ILayer and LLayer, ZTree implements a dynamic node allocation
+mechanism to strategically distributes tree nodes among multiple zones,
+leveraging the inter-zone parallelism of ZNS SSDs to improve index performance.
+In addition, ZTree partitions the logical space of a zone into
+multiple slots, each with a capacity consistent with the tree node (4KB by
+default). ZTree assigns a unique 𝑆𝑙𝑜𝑡𝐼𝐷 to each slot sequentially within
+a zone and appends updated nodes to the slots during runtime.
+3.1.1. Dynamic node allocation
+ZTree proposes a node allocator to dynamically manage the zone resources
+of ZNS SSDs and strategically schedule the assignment of tree
+nodes among available zones at runtime. ZTree constructs dedicated logical
+zone groups for the ILayer and LLayer, referred to as ILayer Zone
+Group (IZGroup) and LLayer Zone Group (LZGroup), respectively. Based
+on the experimental analysis show in Fig. 3, the number of available
+zones in IZGroup and LZGroup is initially set to 4 and 6 respectively
+to maximize the concurrent throughput, which can also be customized
+by the user. Additionally, the allocator dynamically attach idle zones
+to expand the group capacity when available zones are exhausted. The
+newly added zone is initialized to the open state and its write pointer is
+reset to the beginning LBA offset.
+ZTree introduces different node allocation strategies for ILayer and
+LLayer based on their access characteristics. The ILayer typically occupies
+less than 1% of the total B+-Tree size and are accessed more frequently
+than that on the LLayer [35,36]. Therefore, the allocator evenly
+distributes internal nodes across all available zones in the IZGroup with
+a round-robin manner, fully leveraging the inter-zone parallelism of ZNS
+SSDs to enhance index performance.
+In contrast, real-world workloads often exhibit skewed access patterns
+on tree nodes [37]. Previous study [38] randomly distributes leaf
+nodes across all zones to maximize throughput, which leads to both hot
+(frequently-updated) and cold (infrequently-updated) nodes coexisting
+in a same zone. However, the update operations on hot nodes would generate
+a large amount of invalid data and rapidly consumes zone capacity.
+To clean and reset a filled zone, ZNS SSD requires garbage collection
+that transfers all the valid cold nodes to another available zone before
+reset the invalidated zone, which significantly increases the amount of
+data migration and leads to write amplification.
+To address this problem, ZTree adopts a heat-aware node scheduling
+strategy in the LLayer to achieve an efficient balance between indexing
+performance and disk utilization. Specifically, the allocator maintains a
+metadata entry for each node, including a 2-byte Counter to track the
+historical access frequency and a 2-byte Timestamp to record the last
+access time. Each node operation (e.g., SEARCH or INSERT) increments
+the Counter and updates the Timestamp.
+ZTree designates 80% of the available zones in the LZGroup as hot
+zones and uses the remaining zones as cold zones by default. At runtime,
+the allocator identifies hot nodes whose Counter or Timestamp are in the
+top 50th-percentile, which are evenly scheduled across all hot zones in a
+round-robin manner. This takes advantage of the multi-zone parallelism
+to enhance performance under intensive skewed workloads and mitigate
+data migration induced by garbage collection. Conversely, ZTree consolidates
+cold nodes into fewer cold zones to reduce the burden of garbage
+collection and data migration in ZNS SSDs. To mitigate load imbalance
+caused by notably varied hotness over time, the metadata entry is reset
+after the related node is re-allocated to a new zone.
+Furthermore, ZTree periodically conducts zone re-balancing operations
+to redistribute hot and cold zones, thereby achieving wear leveling
+across different physical zones. Specifically, the re-balancing mechanism
+dynamically assigns cold or hot labels to the physical zones in
+a round-robin manner at runtime, which is triggered upon zone initialization
+and does not interfere with the critical path of tree operations.
+Consequently, the zone re-balancing would not introduce measurable
+scheduling overhead.
+3.1.2. Two-stage node tracking
+To align with the sequential write characteristics of ZNS, when randomly
+updating (UPDATE/INSERT/DELETE) tree nodes, ZTree generates
+a replica of the target node rather than modifying the original one,
+then sequentially writes the updated node to zones in an append-only
+manner. However, as mentioned in Section 2.2, such out-of-place write
+mechanism will recursively update all its parent nodes when modifying
+a leaf node, leading to significant write amplification and reduced
+throughput performance. To mitigate this issue, ZTree introduces a twostage
+node tracking mechanism to decouple parent-child dependencies
+by abstracting references at the zone level.
+Each tree node contains a 4-byte 𝑁𝑜𝑑𝑒𝐼𝐷 that uniquely identifies
+the node within a ZTree instance. The 𝑁𝑜𝑑𝑒𝐼𝐷 is initialized upon new
+node allocation and remains constant during updates until the node is
+deleted or merged. The index entry in non-leaf nodes stores the lowest
+key of the child node and holds a pointer that references the child
+nodes. Different from traditional B+-Trees that directly store the logical
+addressing (i.e., LBAs or page identifiers) in the pointer [11], ZTree
+jointly uses the 𝑍𝑜𝑛𝑒𝐼𝐷 and 𝑁𝑜𝑑𝑒𝐼𝐷 to record the storage information
+of the child node. The 𝑍𝑜𝑛𝑒𝐼𝐷 specifies the ZNS zone where the child
+node currently reside. Therefore, updates to child nodes within the same
+zones would no longer require modifying the references in their parent
+nodes, effectively truncating the cascading update path in most cases.
+
+fig 5. Structure of the Node Location Table in ZTree. 이건 그림이어서 복사가 안돼서 내가 설명할게
+NLT에는 한 엔트리가 2바이트 존ID, 1비트 Sealed T/F플래그, 한개의 Node Tracker 이고,
+Node Tracker는 한 엔트리가 4바이트의 NodeID, 3바이트의 SlotID야.
+
+Furthermore, ZTree assigns an Node Location Table (NLTable) in
+memory to quickly locate the targeted node in zones. Fig. 5 illustrates
+the structure of the NLTable. It comprises multiple entries that record
+the 𝑍𝑜𝑛𝑒𝐼𝐷 of each attached zone and include a 𝑆𝑒𝑎𝑙𝑒𝑑 field to schedule
+the garbage collection (detailed in the next section). Moreover, the
+node tracker records the latest storage locations of all valid tree nodes
+within a zone, which consists of the 𝑁𝑜𝑑𝑒𝐼𝐷 and a 3-byte 𝑆𝑙𝑜𝑡𝐼𝐷 field.
+ZTree uses Eq. 1 to determine the actual storage offset of the node on
+disks. This computation process is lock-free and minimizes contention
+with concurrent data querying. When a tree node is updated, ZTree acquires
+the write pointer of zone and updates the 𝑆𝑙𝑜𝑡𝐼𝐷 field in the
+corresponding NLTable entry.
+𝑂𝑓𝑓𝑠𝑒𝑡𝑁𝑜𝑑𝑒 = 𝑂𝑓𝑓𝑠𝑒𝑡𝑍𝑜𝑛𝑒 + 𝑆𝑙𝑜𝑡𝐼𝐷 ∗ 𝑁𝑜𝑑𝑒𝑆𝑖𝑧𝑒 (1)
+The memory usage of NLTable will expand linearly with the tree capacity,
+as it records the storage location of each valid node. In memoryconstrained
+environments, ZTree provides an option to restrict the available
+memory for NLTable and strategically flush table entries to SSDs.
+Specifically, ZTree statically caches the table entries for all RLayer and
+ILayer nodes to ensure efficient tree traversal, which requires minimal
+memory since internal nodes typically occupy less than 1% of the total
+B+-Tree. For the LLayer, ZTree prioritizes caching the corresponding
+NLTable entries for hot zones until the memory limit is reached, while
+flushing other entries to the SSD. During runtime, ZTree dynamically
+loads the NLTable entries into memory upon opening the targeted zone
+and releases the memory when the zone is closed. We will evaluate the
+memory usage of NLTable in the experimental section and evaluate the
+performance of ZTree under memory-constrained conditions.
+
+3.2. Tree operations
+ZTree supports four common data operations, including SEARCH,
+INSERT, UPDATE and DELETE.
+SEARCH: An index search on the ZTree involves traversing each
+layer from the top down. To execute a point search for a targeted 𝐾𝑒𝑦,
+ZTree initially locates the root node in the RLayer, and then queries the
+internal nodes in the ILayers. Within an internal node, a binary search is
+conducted to find an entry with the greatest key that is equal to or less
+than 𝐾𝑒𝑦, where the values of this entry are the 𝑍𝑜𝑛𝑒𝐼𝐷 and 𝑁𝑜𝑑𝑒𝐼𝐷
+of the child node in the bottom layer (Algorithms 1–4).
+ZTree then opens the specified zone using the 𝑍𝑜𝑛𝑒𝐼𝐷 and searches
+the NLTable with the 𝑁𝑜𝑑𝑒𝐼𝐷 to efficiently locate the latest storage
+position of the targeted node. Upon reaching the LLayer, ZTree performs
+a binary search within the target leaf node to find the matching key.
+The search operation involves only SSD reads and dose not modify the
+tree structure. To prevent inconsistencies arising from concurrent read
+and write operations, ZTree utilizes the latch-crabbing scheme [39] that
+acquires a read lock on each accessed node and releases it until locking
+the child node in the top-down order.
+
+Algorithm 1: SEARCH(𝐾𝑒𝑦)
+Input: The 𝐾𝑒𝑦 to search for
+Output: The corresponding 𝑉 𝑎𝑙𝑢𝑒, otherwise return NULL
+1 curNode ← RLayer.Get_RootNode();
+2 while curNode is not in LLayer do
+3 𝑍𝑜𝑛𝑒𝐼𝐷, 𝑁𝑜𝑑𝑒𝐼𝐷 ← Binary_Search(curNode, 𝐾𝑒𝑦);
+4 curZone ← Open_Zone(𝑍𝑜𝑛𝑒𝐼𝐷);
+5 𝑆𝑙𝑜𝑡𝐼𝐷 ← NLTable[𝑍𝑜𝑛𝑒𝐼𝐷][𝑁𝑜𝑑𝑒𝐼𝐷];
+6 curNode ← 𝑂𝑓𝑓𝑠𝑒𝑡𝑐𝑢𝑟𝑍𝑜𝑛𝑒 + 𝑆𝑙𝑜𝑡𝐼𝐷 ∗ 𝑁𝑜𝑑𝑒𝑆𝑖𝑧𝑒
+7 matchEntry ← Binary_Search(curNode, 𝐾𝑒𝑦);
+8 if matchEntry.key == 𝐾𝑒𝑦 then
+9 return matchEntry.value;
+10 else
+11 return NULL;
+
+UPDATE: The update operation locates the leaf node via an index
+search and directly modifies the corresponding value in the target KV entry.
+If the data written to the current zone does not exceed the threshold
+(95% of zone capacity), the newly updated node is directly appended
+to the zone and prevents recursively updating on the parent nodes. In
+contrast, ZTree employs the dynamic node allocation to schedule the
+target node to another available zone (line 9). ZTree registers the node
+to the new zone’s NLTable while updating the 𝑍𝑜𝑛𝑒𝐼𝐷 field in the index
+of parent node (line 11-12).
+
+Algorithm 2: UPDATE(Key, Value)
+Input: The 𝐾𝑒𝑦 and new 𝑉 𝑎𝑙𝑢𝑒 to update.
+Output: Return 𝑇 𝑟𝑢𝑒 if successful, otherwise 𝐹𝑎𝑙𝑠𝑒.
+1 curZone, curNode ← Find_Leaf(𝐾𝑒𝑦);
+2 entry ← Binary_Search(curNode, 𝐾𝑒𝑦);
+3 if entry.key ≠ 𝐾𝑒𝑦 then
+4 return False
+5 entry.value ← Value;
+6 if curZone.capacity ≥ Threshold then
+7 Append(curZone, curNode);
+8 else
+9 newZone ← Dynamic_Allocation(curNode);
+10 Append(newZone, curNode);
+11 SyncNLT(newZone);
+12 UpdateKV(parentNode, curNode.𝑍𝑜𝑛𝑒𝐼𝐷);
+13 return True;
+
+INSERT: The insertion locates the target leaf node in a same way
+as search. If the node has sufficient free space, the incoming KV pair is
+directly inserted and the modified leaf node is appended to the zone.
+Conversely, the node undergoes a split to maintain the balancing properties
+of ZTree if the insertion causes the number of keys to exceed node
+capacity. The median key is propagated to the parent and the remaining
+KV pairs are evenly partitioned between the original node and a newly created sibling.
+In contrast to traditional B+-Trees that typically achieve atomic node splitting through I/O transactions or write-ahead logging (WAL) [11,40], ZTree employs a phased data persistence strategy during node splitting to ensure crash consistency. Initially, ZTree allocates a new sib-ling node and moves all post-median KV pairs from the original node. The sibling is scheduled and persisted to an available zone according to the dynamic node allocation (line 7-10). Next, ZTree propagates the median key to the parent node and updates the 𝑍𝑜𝑛𝑒𝐼𝐷 and 𝑁𝑜𝑑𝑒𝐼𝐷fields of the new sibling node (line 13-15). Following the propagation phase, ZTree temporarily tolerates KV redundancies between the origi-nal and sibling nodes. Finally, ZTree appends the updated original node to the end of the zone (line 17).
+It should be noted that the persistence of original node should not be scheduled ahead of updating the parent. In this case, ZTree can only access the post-split original node through the old parent, while the sibling will treated as invalid after an unexpected system crash.
+
+Algorithm 3: INSERT(Key, Value)Input: The 𝐾𝑒𝑦 and 𝑉𝑎𝑙𝑢𝑒 to insert.Output: Return 𝑇𝑟𝑢𝑒 if successful.1curZone, curNode ← Find_Leaf(𝐾𝑒𝑦);2InsertKV(curNode, 𝐾𝑒𝑦, 𝑉𝑎𝑙𝑢𝑒);3if curNode.count ≤ Max_Node_Capacity then4Append(curZone, curNode);5return True6// Phase 1: node splitting;7moveKeys ← split(curNode);8newZone ← Dynamic_Allocation();9sibling ← Create_Node(newZone, moveKeys);10Append(newZone, sibling);11SyncNLT(newZone);12// Phase 2: parent propagation;13pointer ← [sibling.𝑍𝑜𝑛𝑒𝐼𝐷, sibling.𝑁𝑜𝑑𝑒𝐼𝐷];14InsertKV(parentNode, sibling.𝑚𝑖𝑛𝑘𝑒𝑦, pointer);15Append(parentZone, parentNode);16// Phase 3: original node persistence;17Append(curZone, curNode);
+
+DELETE: ZTree deletes target key-value pairs from nodes and then evaluates its capacity. When the remaining KV pairs fall below the threshold, a merge operation is triggered to maintain the balanced tree structure. Conventional B+-Trees merge nodes by borrowing part of KV pairs from a sibling node [11], which results in extra data written for up-dating both original and sibling nodes, as well as the cascading update of their parent nodes to indicate the key range within the subtrees.
+In contrast, ZTree strategically initiates merge operations only when the combined KV pairs of the target and sibling nodes do not exceed the node capacity limit. Specifically, ZTree consolidates all KV pairs from the sibling and followed by persisting the current node. It then removes the index entries of the sibling in the parent node and marks it as invalid through NLTable updates. This approach reduces write amplification while enhancing the utilization of node capacity through adjacent node consolidation.
+
+Algorithm 4: DELETE(Key, Value)Input: The 𝐾𝑒𝑦 to delete.Output: Return 𝑇𝑟𝑢𝑒 if successful.1curZone, curNode ← Find_Leaf(𝐾𝑒𝑦);2DeleteKV(curNode, 𝐾𝑒𝑦);3if curNode.KVNum ≥ Min_Node_Capacity then4Append(curZone, curNode);5return True6if curNode.KVNum + sibling.KVNum ≤ Max_Node_Capacity then7InsertKV(curNode, sibling.key[], sibling.value[]);8Append(curZone, curNode);9DeleteKV(parentNode, sibling.minkey);10Append(parentZone, parentNode);11NLTable[siblingZone][sibling.𝑁𝑜𝑑𝑒𝐼𝐷] ← NULL;12SyncNLT(siblingZone);

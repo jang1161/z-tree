@@ -1039,7 +1039,15 @@ static void flush_page_immediate(ztree_t *t,
     }
 
     if (pg->is_leaf)
+    {
+        /* Paper §3.1.1: reset heat metadata when a node is reallocated to
+         * a new zone, so the next placement decision starts from a fresh
+         * signal.  zone_heat_reset() preserves the timestamp dimension so
+         * the freshly-relocated node still flags as recently-active. */
+        if (prev_zone != ZTREE_INVALID_ZONE_ID && prev_zone != target_zone)
+            zone_heat_reset(&t->za, pg->node_id);
         zone_heat_record_write(&t->za, pg->node_id);
+    }
 
     atomic_fetch_add_explicit(&t->stat_page_appends, 1, memory_order_relaxed);
 
@@ -1413,6 +1421,16 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                 memset(&right, 0, sizeof right);
                 right.is_leaf = 1;
                 right.node_id = assign_stable_node_id(t);
+
+                /* Inherit heat from the parent leaf so the new sibling's
+                 * first allocation reflects the workload character of the
+                 * data it just received (right gets the upper half of the
+                 * pre-split keys, so its future write rate mirrors the
+                 * pre-split node's).  Without this, right starts at
+                 * (cnt=0, ts=0) and zone_is_hot classifies it cold under
+                 * the percentile policy, sticking it in the small cold
+                 * pool. */
+                zone_heat_inherit(&t->za, right.node_id, leaf->node_id);
 
                 for (uint32_t i = 0; i < sp; i++)
                     leaf->leaf[i] = tmp[i];

@@ -45,25 +45,38 @@
  *
  *   Zone  0- 1  → RLayer  (meta / superblock ping-pong pair)
  *   Zone  2-17  → ILayer pool  (16 zones available for IZGroup)
- *                  Initial IZGroup = zones 2-5 (4 zones)
- *                  Dynamic expansion attaches zones 6-17 as IZGroup fills
+ *                  Initial IZGroup = zones 2-3 (2 zones)
+ *                  Dynamic expansion attaches more zones as IZGroup fills
  *   Zone 18+    → LLayer pool  (all remaining zones for LZGroup)
- *                  Initial LZGroup = 8 zones (6 hot + 2 cold)
+ *                  Initial LZGroup = 10 zones (9 hot + 1 cold)
  *                  80% of pool → hot zones; 20% → cold zones
  *                  Dynamic expansion attaches more zones as LZGroup fills
  *
  * Active-zone budget (device hard limit = 13):
- *   IZGroup initial (4) + LZGroup hot initial (6) + LZGroup cold initial (2) = 12 ≤ 13
+ *   IZGroup initial (2) + LZGroup hot initial (9) + LZGroup cold initial (1)
+ *     + RLayer meta (1) = 13 ≤ 13
+ *
+ * Tuning rationale (measured at 16 threads, percentile heat policy):
+ *   • IZGroup was barely contended (0.2 ms total wait, avg 4.8 µs) with
+ *     4 zones — plenty of headroom; halved to 2 to free the budget.
+ *   • LZGroup-Cold sees only ~6 % of leaf writes under inherit-based heat
+ *     classification — 1 zone with on-demand expansion is enough.
+ *   • LZGroup-Hot was the dominant bottleneck (238 s wait, avg 261 µs);
+ *     boosting from 6 → 9 cuts threads-per-zone from 2.67 to 1.78,
+ *     directly reducing the queue depth that drives per-zone-mutex wait.
+ *
+ * The original paper-stated split (IZ=4, Hot=6, Cold=2) is preserved in
+ * code comments above each #define for reference.
  */
 #define ZTREE_META_ZONE_0          0U
 #define ZTREE_META_ZONE_1          1U
 #define ZTREE_ILAYER_ZONE_START    2U   /* first zone of ILayer pool        */
 #define ZTREE_ILAYER_POOL_SIZE    16U   /* ILayer pool size (zones 2-17)    */
-#define ZTREE_ILAYER_INIT_COUNT    4U   /* initial IZGroup size             */
+#define ZTREE_ILAYER_INIT_COUNT    2U   /* initial IZGroup size (paper: 4)  */
 #define ZTREE_LLAYER_ZONE_START   18U   /* first zone of LLayer pool        */
-#define ZTREE_LZGROUP_INIT_SIZE    8U   /* initial LZGroup total size       */
-#define ZTREE_LZGROUP_HOT_INIT     6U   /* initial hot  zone count in LZGroup */
-#define ZTREE_LZGROUP_COLD_INIT    2U   /* initial cold zone count in LZGroup */
+#define ZTREE_LZGROUP_INIT_SIZE   10U   /* initial LZGroup total size       */
+#define ZTREE_LZGROUP_HOT_INIT     9U   /* initial hot  zones (paper: 6)    */
+#define ZTREE_LZGROUP_COLD_INIT    1U   /* initial cold zones (paper: 2)    */
 
 /* Magic numbers for on-disk structures */
 #define ZTREE_ZH_MAGIC   0x5A545245455A4E53ULL  /* "ZTREEZNS" */

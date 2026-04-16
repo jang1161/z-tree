@@ -172,6 +172,12 @@ void zone_alloc_init(zone_alloc_t *za,
     atomic_store_explicit(&za->cold_group_count, za->cold_init_count, memory_order_relaxed);
     atomic_store_explicit(&za->cold_rr, 0, memory_order_relaxed);
 
+    /* Percentile-based heat policy state */
+    atomic_store_explicit(&za->heat_median_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&za->heat_median_ts,    0, memory_order_relaxed);
+    atomic_store_explicit(&za->heat_writes_since_recompute, 0, memory_order_relaxed);
+    atomic_store_explicit(&za->heat_recompute_in_progress,  0, memory_order_relaxed);
+
     za->zone_full      = zone_full;
     za->zone_wp_bytes  = zone_wp_bytes;
     za->zones          = zones;
@@ -222,6 +228,84 @@ uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
     }
 }
 
+/* ───────────────────────────────────────────────────────────────────────────
+ * Percentile-based heat policy (paper §3.1.1)
+ *
+ * recompute_heat_medians() scans the entire heat_table, collects all
+ * non-zero (Counter, Timestamp) pairs, sorts each dimension, and stores
+ * the 50th-percentile values.  zone_is_hot() then classifies a node as
+ * hot iff its Counter OR Timestamp exceeds the corresponding median.
+ *
+ * Cost: with ZTREE_HEAT_TABLE_SIZE = 65536 entries, the scan + qsort runs
+ * in roughly 1–3 ms on modern x86.  Recomputation is gated by
+ * ZTREE_HEAT_RECOMPUTE_INTERVAL (16 K writes by default), so the
+ * amortised overhead is well under 1% even for tight insert workloads.
+ * Only one thread runs the recompute at a time; others see
+ * heat_recompute_in_progress = 1 and skip until the next interval.
+ *
+ * Bootstrap: until at least ZTREE_HEAT_MIN_SAMPLES non-zero entries exist,
+ * the medians stay at 0 and zone_is_hot() falls back to default-hot.
+ * This avoids the pathological default-cold pinning observed when median
+ * is undefined and every leaf would otherwise be classified cold.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+static int cmp_u16(const void *a, const void *b)
+{
+    uint16_t x = *(const uint16_t *)a;
+    uint16_t y = *(const uint16_t *)b;
+    return (x > y) - (x < y);
+}
+
+static void recompute_heat_medians(zone_alloc_t *za)
+{
+    /* Heap allocation: ZTREE_HEAT_TABLE_SIZE * 2 bytes = 128 KB per array,
+     * too large for a stack frame.  malloc/free per recompute is fine — one
+     * call every ~16 K writes is negligible. */
+    uint16_t *cnts = malloc(ZTREE_HEAT_TABLE_SIZE * sizeof(uint16_t));
+    uint16_t *tss  = malloc(ZTREE_HEAT_TABLE_SIZE * sizeof(uint16_t));
+    if (!cnts || !tss)
+    {
+        free(cnts);
+        free(tss);
+        return; /* skip this round; medians stay at their previous values */
+    }
+
+    size_t n = 0;
+    for (size_t i = 0; i < ZTREE_HEAT_TABLE_SIZE; i++)
+    {
+        uint16_t c = atomic_load_explicit(&za->heat_table[i].access_count,
+                                          memory_order_relaxed);
+        if (c == 0)
+            continue; /* empty bucket — exclude from population */
+        uint16_t t = atomic_load_explicit(&za->heat_table[i].last_write_ts,
+                                          memory_order_relaxed);
+        cnts[n] = c;
+        tss[n]  = t;
+        n++;
+    }
+
+    if (n < ZTREE_HEAT_MIN_SAMPLES)
+    {
+        /* Too few samples for a meaningful median.  Force defaults to 0
+         * so zone_is_hot() takes the bootstrap (default-hot) branch. */
+        atomic_store_explicit(&za->heat_median_count, 0, memory_order_relaxed);
+        atomic_store_explicit(&za->heat_median_ts,    0, memory_order_relaxed);
+        free(cnts);
+        free(tss);
+        return;
+    }
+
+    qsort(cnts, n, sizeof(uint16_t), cmp_u16);
+    qsort(tss,  n, sizeof(uint16_t), cmp_u16);
+
+    /* 50th percentile = element at index n/2 (lower median for even n). */
+    atomic_store_explicit(&za->heat_median_count, cnts[n / 2], memory_order_relaxed);
+    atomic_store_explicit(&za->heat_median_ts,    tss[n / 2],  memory_order_relaxed);
+
+    free(cnts);
+    free(tss);
+}
+
 void zone_heat_record_write(zone_alloc_t *za, ztree_node_id_t node_id)
 {
     if (node_id == ZTREE_INVALID_NODE_ID)
@@ -252,6 +336,89 @@ void zone_heat_record_write(zone_alloc_t *za, ztree_node_id_t node_id)
     atomic_store_explicit(&za->heat_table[idx].last_write_ts,
                           zone_monotonic_ts_16b(),
                           memory_order_relaxed);
+
+    /* Periodic median recompute.  Every Nth write triggers a one-shot
+     * recompute pass; only the thread that successfully claims the
+     * in_progress flag runs it, the rest skip and continue. */
+    uint64_t writes_now = atomic_fetch_add_explicit(
+        &za->heat_writes_since_recompute, 1, memory_order_relaxed) + 1;
+    if (writes_now >= ZTREE_HEAT_RECOMPUTE_INTERVAL)
+    {
+        uint8_t expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&za->heat_recompute_in_progress,
+                                                    &expected, 1,
+                                                    memory_order_acq_rel,
+                                                    memory_order_relaxed))
+        {
+            /* Reset the rolling counter inside the critical section so
+             * concurrent writers will only re-trigger once we've finished
+             * (and the next batch of writes accumulates). */
+            atomic_store_explicit(&za->heat_writes_since_recompute, 0,
+                                  memory_order_relaxed);
+            recompute_heat_medians(za);
+            atomic_store_explicit(&za->heat_recompute_in_progress, 0,
+                                  memory_order_release);
+        }
+        /* If CAS lost, another thread is already recomputing; do nothing. */
+    }
+}
+
+void zone_heat_reset(zone_alloc_t *za, ztree_node_id_t node_id)
+{
+    if (node_id == ZTREE_INVALID_NODE_ID)
+        return;
+
+    size_t idx = (size_t)(node_id % ZTREE_HEAT_TABLE_SIZE);
+
+    /* Counter goes to 0 — paper §3.1.1 reset rule.  Timestamp is set to
+     * "now" rather than 0 so the freshly-relocated node still flags as
+     * recently-active under the OR-combined hot test; otherwise zeroing
+     * both fields would force the node into the cold pool for one full
+     * recompute interval, recreating the very pathology percentile-based
+     * heat is meant to avoid. */
+    atomic_store_explicit(&za->heat_table[idx].access_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&za->heat_table[idx].last_write_ts,
+                          zone_monotonic_ts_16b(),
+                          memory_order_relaxed);
+}
+
+void zone_heat_inherit(zone_alloc_t *za,
+                       ztree_node_id_t dst,
+                       ztree_node_id_t src)
+{
+    if (dst == ZTREE_INVALID_NODE_ID || src == ZTREE_INVALID_NODE_ID)
+        return;
+
+    size_t src_idx = (size_t)(src % ZTREE_HEAT_TABLE_SIZE);
+    size_t dst_idx = (size_t)(dst % ZTREE_HEAT_TABLE_SIZE);
+
+    /* Same bucket via hash collision: dst and src physically share the
+     * heat slot.  Resetting dst's counter would also wipe src's counter
+     * (we'd be zeroing the parent's heat right at the moment we're
+     * trying to use it).  Leave the bucket alone — both nodes will share
+     * the parent's full heat under hash-collision semantics, which the
+     * heat table already accepts as approximate. */
+    if (src_idx == dst_idx)
+        return;
+
+    /* Inherit semantics:
+     *   • Timestamp is COPIED from src.  This is the channel through
+     *     which the parent's hot/cold character propagates to the
+     *     freshly split sibling: zone_is_hot(dst) will test ts against
+     *     the median, getting the same recently-active signal the parent
+     *     would have.
+     *   • Counter is RESET to 0.  The new node hasn't actually been
+     *     written to yet, so its access frequency starts fresh.  This
+     *     also avoids inflating the heat-table population with phantom
+     *     duplicates of the parent's count, which would bias the median
+     *     upward over time. */
+    uint16_t src_ts = atomic_load_explicit(&za->heat_table[src_idx].last_write_ts,
+                                           memory_order_relaxed);
+
+    atomic_store_explicit(&za->heat_table[dst_idx].access_count, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&za->heat_table[dst_idx].last_write_ts, src_ts,
+                          memory_order_relaxed);
 }
 
 int zone_is_hot(zone_alloc_t *za, ztree_node_id_t node_id)
@@ -261,9 +428,23 @@ int zone_is_hot(zone_alloc_t *za, ztree_node_id_t node_id)
 
     size_t idx = (size_t)(node_id % ZTREE_HEAT_TABLE_SIZE);
 
-    uint16_t cnt = atomic_load_explicit(&za->heat_table[idx].access_count,
-                                        memory_order_relaxed);
+    uint16_t cnt     = atomic_load_explicit(&za->heat_table[idx].access_count,
+                                            memory_order_relaxed);
+    uint16_t ts      = atomic_load_explicit(&za->heat_table[idx].last_write_ts,
+                                            memory_order_relaxed);
+    uint16_t med_cnt = atomic_load_explicit(&za->heat_median_count,
+                                            memory_order_relaxed);
+    uint16_t med_ts  = atomic_load_explicit(&za->heat_median_ts,
+                                            memory_order_relaxed);
 
-    /* Paper-aligned: treat as hot if access_count > ZTREE_HEAT_HOT_THRESHOLD (10) */
-    return (cnt > ZTREE_HEAT_HOT_THRESHOLD) ? 1 : 0;
+    /* Bootstrap: medians not yet computed (or workload too sparse).
+     * Default to hot — putting new leaves in the larger hot pool avoids
+     * the default-cold pinning that funnels everything into 2 zones. */
+    if (med_cnt == 0 && med_ts == 0)
+        return 1;
+
+    /* Paper §3.1.1: hot iff Counter OR Timestamp is in the top 50th
+     * percentile.  We use strict > so exactly-at-median nodes count as
+     * cold (lower-half tiebreak). */
+    return (cnt > med_cnt) || (ts > med_ts) ? 1 : 0;
 }

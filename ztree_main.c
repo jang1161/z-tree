@@ -94,18 +94,132 @@ static inline pthread_rwlock_t *node_latch_for_id(ztree_t *t, ztree_node_id_t id
     return &t->node_latches[idx];
 }
 
+/* Atomic monotonic-max — used by all three lock-profile buckets. */
+static inline void prof_update_max(_Atomic(uint64_t) *target, uint64_t sample)
+{
+    uint64_t cur = atomic_load_explicit(target, memory_order_relaxed);
+    while (sample > cur)
+    {
+        if (atomic_compare_exchange_weak_explicit(target, &cur, sample,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed))
+            return;
+    }
+}
+
+/* Per-zone write mutex (ZWL) profile recorders, broken out by zone group.
+ *
+ * Routing rule (matches zone_alloc_init layout in cow_open):
+ *   zone_id ∈ [ilayer_pool_base, hot_pool_base)   → IZGroup (internal)
+ *   zone_id ∈ [hot_pool_base,    cold_pool_base)  → LZGroup hot
+ *   zone_id ≥  cold_pool_base                     → LZGroup cold
+ *
+ * Meta zones (0, 1) never reach this path — they go through zone_append_page
+ * which doesn't take zone_write_locks — so we don't classify them.
+ *
+ * Every lock attempt (successful pwrite OR loop-retry on full/sealed zone)
+ * adds one to acquire_count and contributes its wait time.  Hold time is
+ * recorded separately at unlock so we can distinguish brief recheck-and-
+ * release acquisitions from full pwrite-spanning holds.
+ *
+ * Aggregated total across all groups is computed at print time
+ * (sum/max of the three per-group counters). */
+
+typedef enum
+{
+    ZWL_GROUP_IZ   = 0,
+    ZWL_GROUP_HOT  = 1,
+    ZWL_GROUP_COLD = 2,
+    ZWL_GROUP_NONE = 3,   /* meta or otherwise unclassified */
+} zwl_group_t;
+
+static inline zwl_group_t zone_group_of(ztree_t *t, uint32_t zone_id)
+{
+    if (zone_id >= t->za.cold_pool_base)
+        return ZWL_GROUP_COLD;
+    if (zone_id >= t->za.hot_pool_base)
+        return ZWL_GROUP_HOT;
+    if (zone_id >= t->za.ilayer_pool_base)
+        return ZWL_GROUP_IZ;
+    return ZWL_GROUP_NONE;
+}
+
+static inline void record_zwl_wait(ztree_t *t, uint32_t zone_id, uint64_t wait_ns)
+{
+    _Atomic(uint64_t) *wait_p, *cnt_p, *max_p;
+    switch (zone_group_of(t, zone_id))
+    {
+    case ZWL_GROUP_IZ:
+        wait_p = &t->prof_zwl_iz_wait_ns_sum;
+        cnt_p  = &t->prof_zwl_iz_acquire_count;
+        max_p  = &t->prof_zwl_iz_max_wait_ns;
+        break;
+    case ZWL_GROUP_HOT:
+        wait_p = &t->prof_zwl_hot_wait_ns_sum;
+        cnt_p  = &t->prof_zwl_hot_acquire_count;
+        max_p  = &t->prof_zwl_hot_max_wait_ns;
+        break;
+    case ZWL_GROUP_COLD:
+        wait_p = &t->prof_zwl_cold_wait_ns_sum;
+        cnt_p  = &t->prof_zwl_cold_acquire_count;
+        max_p  = &t->prof_zwl_cold_max_wait_ns;
+        break;
+    default:
+        return;
+    }
+    atomic_fetch_add_explicit(wait_p, wait_ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(cnt_p,  1,       memory_order_relaxed);
+    prof_update_max(max_p, wait_ns);
+}
+
+static inline void record_zwl_hold(ztree_t *t, uint32_t zone_id, uint64_t hold_ns)
+{
+    _Atomic(uint64_t) *hold_p;
+    switch (zone_group_of(t, zone_id))
+    {
+    case ZWL_GROUP_IZ:   hold_p = &t->prof_zwl_iz_hold_ns_sum;   break;
+    case ZWL_GROUP_HOT:  hold_p = &t->prof_zwl_hot_hold_ns_sum;  break;
+    case ZWL_GROUP_COLD: hold_p = &t->prof_zwl_cold_hold_ns_sum; break;
+    default: return;
+    }
+    atomic_fetch_add_explicit(hold_p, hold_ns, memory_order_relaxed);
+}
+
+/*
+ * node_wrlock / node_rdlock are instrumented for lock-contention profiling.
+ * Each call samples wall time before and after the rwlock acquisition; the
+ * delta is the wait time (= contention).  We don't measure hold time on
+ * node latches because (a) node_unlock is shared between rd/wr unlocks and
+ * doesn't know which type was acquired, and (b) hold time for these latches
+ * is dominated by leaf modification + flush, which is already captured by
+ * stat_apply_ns_*.
+ *
+ * Overhead per call: ≈ 60-80 ns (two clock_gettime + three relaxed atomics).
+ */
 static inline void node_wrlock(ztree_t *t, ztree_node_id_t id)
 {
     if (id == ZTREE_INVALID_NODE_ID)
         return;
+    uint64_t t0 = monotonic_ns();
     pthread_rwlock_wrlock(node_latch_for_id(t, id));
+    uint64_t t1 = monotonic_ns();
+    uint64_t wait = t1 - t0;
+    atomic_fetch_add_explicit(&t->prof_nl_wr_wait_ns_sum, wait, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->prof_nl_wr_acquire_count, 1, memory_order_relaxed);
+    prof_update_max(&t->prof_nl_wr_max_wait_ns, wait);
 }
 
 static inline void node_rdlock(ztree_t *t, ztree_node_id_t id)
 {
     if (id == ZTREE_INVALID_NODE_ID)
         return;
+    uint64_t t0 = monotonic_ns();
     pthread_rwlock_rdlock(node_latch_for_id(t, id));
+    uint64_t t1 = monotonic_ns();
+    uint64_t wait = t1 - t0;
+    atomic_fetch_add_explicit(&t->prof_nl_rd_wait_ns_sum, wait, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->prof_nl_rd_acquire_count, 1, memory_order_relaxed);
+    prof_update_max(&t->prof_nl_rd_max_wait_ns, wait);
 }
 
 static inline void node_unlock(ztree_t *t, ztree_node_id_t id)
@@ -751,11 +865,22 @@ static void flush_page_immediate(ztree_t *t,
     uint64_t cur_wp;
     bool     sticky_ok = false;
 
+    /* zwl_hold_start: timestamp at which the currently-held zone_write_lock
+     * was acquired.  Set after every successful lock acquisition (sticky or
+     * dynamic alloc) and consumed at the post-pwrite unlock (record_zwl_hold).
+     * For early-release paths (sealed / full / no-space) we record the small
+     * hold inline before unlocking. */
+    uint64_t zwl_hold_start = 0;
+
     /* ── Phase 1a: try stickiness ──────────────────────────────────────── */
     if (prev_zone != ZTREE_INVALID_ZONE_ID
         && !atomic_load_explicit(&t->zone_full[prev_zone], memory_order_acquire))
     {
+        uint64_t lock_t0 = monotonic_ns();
         pthread_mutex_lock(&t->zone_write_locks[prev_zone]);
+        uint64_t lock_t1 = monotonic_ns();
+        record_zwl_wait(t, prev_zone, lock_t1 - lock_t0);
+        zwl_hold_start = lock_t1;
 
         uint64_t zone_start = t->zones[prev_zone].start;
         uint64_t zone_end   = zone_start + t->zones[prev_zone].capacity;
@@ -776,6 +901,7 @@ static void flush_page_immediate(ztree_t *t,
         }
         else
         {
+            record_zwl_hold(t, prev_zone, monotonic_ns() - zwl_hold_start);
             pthread_mutex_unlock(&t->zone_write_locks[prev_zone]);
         }
     }
@@ -789,7 +915,11 @@ static void flush_page_immediate(ztree_t *t,
                               ? zone_alloc_llayer(&t->za, pg->node_id, avoid_zone)
                               : zone_alloc_ilayer(&t->za, avoid_zone);
 
+            uint64_t lock_t0 = monotonic_ns();
             pthread_mutex_lock(&t->zone_write_locks[target_zone]);
+            uint64_t lock_t1 = monotonic_ns();
+            record_zwl_wait(t, target_zone, lock_t1 - lock_t0);
+            zwl_hold_start = lock_t1;
 
             /* Re-check zone_full under the lock: the allocator's expand
              * path may have finished this zone between our pick and our
@@ -797,6 +927,7 @@ static void flush_page_immediate(ztree_t *t,
             if (atomic_load_explicit(&t->zone_full[target_zone],
                                      memory_order_acquire))
             {
+                record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
                 pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
                 continue;
             }
@@ -808,6 +939,7 @@ static void flush_page_immediate(ztree_t *t,
 
             if (wp + ZTREE_PAGE_SIZE > zone_end)
             {
+                record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
                 pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
                 atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
                 nlt_set_zone_sealed(&t->nlt, target_zone, true);
@@ -876,6 +1008,8 @@ static void flush_page_immediate(ztree_t *t,
         exit(EXIT_FAILURE);
     }
 
+    /* Successful pwrite — record full hold time spanning the pwrite. */
+    record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
     pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
 
     /* Zone-full detection (mirrors zone_append_page logic). */
@@ -1837,6 +1971,125 @@ void cow_close(cow_tree *t)
             (unsigned long long)zone_chg,
             (unsigned long long)par_rew,
             (fl_samp > 0) ? (double)fl_sum / (double)fl_samp / 1000.0 : 0.0);
+
+    /* ── Lock contention profile ─────────────────────────────────────────
+     * Three buckets: NLT global wrlock, per-zone write mutex (broken down
+     * by zone group + aggregated), node latches split into rd/wr.
+     *
+     * Per-acquisition fields:
+     *   acquires       — total successful lock acquisitions
+     *                    (per-zone mutex counts each retry inside the
+     *                    dynamic-alloc loop separately)
+     *   wait_total_ms  — Σ time blocked waiting for the lock
+     *   avg_wait_us    — wait_total / acquires
+     *   max_wait_us    — worst single wait observed (tail latency)
+     *   hold_total_ms  — Σ time the lock was held (NLT/ZWL only)
+     *   avg_hold_us    — hold_total / acquires
+     *
+     * Zone-group breakdown lets you see WHICH group is the bottleneck:
+     *   IZGroup typically ≪ hot (internal nodes are rare on insert).
+     *   LZGroup-Hot is usually the dominant one — heat-aware allocator
+     *   funnels frequent leaf writes here, and stickiness keeps them.
+     *   LZGroup-Cold should be quiet unless the heat heuristic is
+     *   misclassifying.
+     *
+     * Reading the numbers:
+     *   • avg_wait ≈ avg_hold  → highly contended; threads queue up.
+     *   • avg_wait ≪ avg_hold  → uncontended; lock free most of the time.
+     *   • Large max_wait with small avg → bursty contention (tail). */
+    uint64_t nlt_wait  = atomic_load_explicit(&t->nlt.prof_wait_ns_sum,   memory_order_relaxed);
+    uint64_t nlt_hold  = atomic_load_explicit(&t->nlt.prof_hold_ns_sum,   memory_order_relaxed);
+    uint64_t nlt_cnt   = atomic_load_explicit(&t->nlt.prof_acquire_count, memory_order_relaxed);
+    uint64_t nlt_max   = atomic_load_explicit(&t->nlt.prof_max_wait_ns,   memory_order_relaxed);
+
+    /* Per-group ZWL stats. */
+    uint64_t iz_wait   = atomic_load_explicit(&t->prof_zwl_iz_wait_ns_sum,   memory_order_relaxed);
+    uint64_t iz_hold   = atomic_load_explicit(&t->prof_zwl_iz_hold_ns_sum,   memory_order_relaxed);
+    uint64_t iz_cnt    = atomic_load_explicit(&t->prof_zwl_iz_acquire_count, memory_order_relaxed);
+    uint64_t iz_max    = atomic_load_explicit(&t->prof_zwl_iz_max_wait_ns,   memory_order_relaxed);
+
+    uint64_t hot_wait  = atomic_load_explicit(&t->prof_zwl_hot_wait_ns_sum,   memory_order_relaxed);
+    uint64_t hot_hold  = atomic_load_explicit(&t->prof_zwl_hot_hold_ns_sum,   memory_order_relaxed);
+    uint64_t hot_cnt   = atomic_load_explicit(&t->prof_zwl_hot_acquire_count, memory_order_relaxed);
+    uint64_t hot_max   = atomic_load_explicit(&t->prof_zwl_hot_max_wait_ns,   memory_order_relaxed);
+
+    uint64_t cold_wait = atomic_load_explicit(&t->prof_zwl_cold_wait_ns_sum,   memory_order_relaxed);
+    uint64_t cold_hold = atomic_load_explicit(&t->prof_zwl_cold_hold_ns_sum,   memory_order_relaxed);
+    uint64_t cold_cnt  = atomic_load_explicit(&t->prof_zwl_cold_acquire_count, memory_order_relaxed);
+    uint64_t cold_max  = atomic_load_explicit(&t->prof_zwl_cold_max_wait_ns,   memory_order_relaxed);
+
+    /* Aggregated: sum the totals/counts, take max of the maxes. */
+    uint64_t zwl_wait  = iz_wait + hot_wait + cold_wait;
+    uint64_t zwl_hold  = iz_hold + hot_hold + cold_hold;
+    uint64_t zwl_cnt   = iz_cnt  + hot_cnt  + cold_cnt;
+    uint64_t zwl_max   = iz_max;
+    if (hot_max  > zwl_max) zwl_max = hot_max;
+    if (cold_max > zwl_max) zwl_max = cold_max;
+
+    uint64_t nlrd_wait = atomic_load_explicit(&t->prof_nl_rd_wait_ns_sum,   memory_order_relaxed);
+    uint64_t nlrd_cnt  = atomic_load_explicit(&t->prof_nl_rd_acquire_count, memory_order_relaxed);
+    uint64_t nlrd_max  = atomic_load_explicit(&t->prof_nl_rd_max_wait_ns,   memory_order_relaxed);
+
+    uint64_t nlwr_wait = atomic_load_explicit(&t->prof_nl_wr_wait_ns_sum,   memory_order_relaxed);
+    uint64_t nlwr_cnt  = atomic_load_explicit(&t->prof_nl_wr_acquire_count, memory_order_relaxed);
+    uint64_t nlwr_max  = atomic_load_explicit(&t->prof_nl_wr_max_wait_ns,   memory_order_relaxed);
+
+#define _AVG_US(sum, cnt) ((cnt) > 0 ? (double)(sum) / (double)(cnt) / 1000.0 : 0.0)
+#define _MS(ns)           ((double)(ns) / 1.0e6)
+#define _US(ns)           ((double)(ns) / 1.0e3)
+
+    fprintf(stderr,
+            "\n[ztree lock profile]\n"
+            "  NLT global wrlock:\n"
+            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
+            "    hold_total=%.2f ms (avg %.2f us)\n"
+            "  Per-zone write mutex — TOTAL:\n"
+            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
+            "    hold_total=%.2f ms (avg %.2f us)\n"
+            "  Per-zone write mutex — IZGroup (zones [%u, %u)):\n"
+            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
+            "    hold_total=%.2f ms (avg %.2f us)\n"
+            "  Per-zone write mutex — LZGroup-Hot (zones [%u, %u)):\n"
+            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
+            "    hold_total=%.2f ms (avg %.2f us)\n"
+            "  Per-zone write mutex — LZGroup-Cold (zones [%u, %u)):\n"
+            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
+            "    hold_total=%.2f ms (avg %.2f us)\n"
+            "  Node latch rdlock (descent crab):\n"
+            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
+            "  Node latch wrlock (leaf upgrade + ascent):\n"
+            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n",
+            (unsigned long long)nlt_cnt,
+            _MS(nlt_wait), _AVG_US(nlt_wait, nlt_cnt), _US(nlt_max),
+            _MS(nlt_hold), _AVG_US(nlt_hold, nlt_cnt),
+
+            (unsigned long long)zwl_cnt,
+            _MS(zwl_wait), _AVG_US(zwl_wait, zwl_cnt), _US(zwl_max),
+            _MS(zwl_hold), _AVG_US(zwl_hold, zwl_cnt),
+
+            t->za.ilayer_pool_base, t->za.hot_pool_base,
+            (unsigned long long)iz_cnt,
+            _MS(iz_wait), _AVG_US(iz_wait, iz_cnt), _US(iz_max),
+            _MS(iz_hold), _AVG_US(iz_hold, iz_cnt),
+
+            t->za.hot_pool_base, t->za.cold_pool_base,
+            (unsigned long long)hot_cnt,
+            _MS(hot_wait), _AVG_US(hot_wait, hot_cnt), _US(hot_max),
+            _MS(hot_hold), _AVG_US(hot_hold, hot_cnt),
+
+            t->za.cold_pool_base, t->za.cold_pool_base + t->za.cold_pool_size,
+            (unsigned long long)cold_cnt,
+            _MS(cold_wait), _AVG_US(cold_wait, cold_cnt), _US(cold_max),
+            _MS(cold_hold), _AVG_US(cold_hold, cold_cnt),
+
+            (unsigned long long)nlrd_cnt,
+            _MS(nlrd_wait), _AVG_US(nlrd_wait, nlrd_cnt), _US(nlrd_max),
+            (unsigned long long)nlwr_cnt,
+            _MS(nlwr_wait), _AVG_US(nlwr_wait, nlwr_cnt), _US(nlwr_max));
+
+#undef _AVG_US
+#undef _MS
+#undef _US
 
     /* Destroy subsystems */
     cache_destroy(t);

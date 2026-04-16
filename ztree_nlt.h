@@ -72,6 +72,14 @@ typedef struct
     _Atomic(size_t) used;         /* live zone entries                  */
     _Atomic(uint64_t) generation; /* detects concurrent resize/update   */
     pthread_rwlock_t grow_lock;   /* protects grow/rehash + updates     */
+
+    /* ── Lock contention profile (global wrlock) ─────────────────────
+     * Recorded around every wrlock acquisition in the public NLT API.
+     * Use these to gauge whether the global NLT lock is the bottleneck. */
+    _Atomic(uint64_t) prof_wait_ns_sum;     /* Σ time blocked waiting for wrlock */
+    _Atomic(uint64_t) prof_hold_ns_sum;     /* Σ time wrlock was held            */
+    _Atomic(uint64_t) prof_acquire_count;   /* # of wrlock acquisitions          */
+    _Atomic(uint64_t) prof_max_wait_ns;     /* tail (worst single wait)          */
 } nlt_t;
 
 /* ───────────────────────────────────────────────────────────────────────────

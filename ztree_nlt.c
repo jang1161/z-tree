@@ -4,8 +4,51 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <time.h>
 
 #include "ztree_nlt.h"
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Lock contention profiling helpers
+ *
+ * Wrap every wrlock acquisition in the public NLT API.  Records:
+ *   wait_ns = elapsed time waiting for the lock (= contention)
+ *   hold_ns = elapsed time the lock was held (= critical section size)
+ *   count   = +1
+ *   max_wait_ns = monotonic CAS max of wait_ns samples
+ *
+ * Two clock_gettime calls per acquire (≈ 60-80 ns vDSO overhead) are
+ * acceptable here because nlt_update is already on the slow side.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+static inline uint64_t nlt_monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static inline void nlt_update_max(_Atomic(uint64_t) *target, uint64_t sample)
+{
+    uint64_t cur = atomic_load_explicit(target, memory_order_relaxed);
+    while (sample > cur)
+    {
+        if (atomic_compare_exchange_weak_explicit(target, &cur, sample,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed))
+            return;
+    }
+}
+
+static inline void nlt_record_lock(nlt_t *nlt,
+                                   uint64_t wait_ns,
+                                   uint64_t hold_ns)
+{
+    atomic_fetch_add_explicit(&nlt->prof_wait_ns_sum, wait_ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&nlt->prof_hold_ns_sum, hold_ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&nlt->prof_acquire_count, 1, memory_order_relaxed);
+    nlt_update_max(&nlt->prof_max_wait_ns, wait_ns);
+}
 
 /* ───────────────────────────────────────────────────────────────────────────
  * Internal helpers
@@ -259,6 +302,12 @@ void nlt_init(nlt_t *nlt, size_t initial_cap)
     atomic_store_explicit(&nlt->used, 0, memory_order_relaxed);
     atomic_store_explicit(&nlt->generation, 0, memory_order_relaxed);
 
+    /* Lock profile counters */
+    atomic_store_explicit(&nlt->prof_wait_ns_sum,   0, memory_order_relaxed);
+    atomic_store_explicit(&nlt->prof_hold_ns_sum,   0, memory_order_relaxed);
+    atomic_store_explicit(&nlt->prof_acquire_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&nlt->prof_max_wait_ns,   0, memory_order_relaxed);
+
     if (pthread_rwlock_init(&nlt->grow_lock, NULL) != 0)
     {
         perror("nlt_init: pthread_rwlock_init");
@@ -375,12 +424,16 @@ void nlt_update(nlt_t *nlt, const nlt_location_t *entry)
         return;
     }
 
+    uint64_t lock_t0 = nlt_monotonic_ns();
     pthread_rwlock_wrlock(&nlt->grow_lock);
+    uint64_t lock_t1 = nlt_monotonic_ns();
 
     nlt_zone_entry_t *zone = nlt_find_zone_entry(nlt, entry->zone_id, 1);
     if (!zone)
     {
+        uint64_t lock_t2 = nlt_monotonic_ns();
         pthread_rwlock_unlock(&nlt->grow_lock);
+        nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
         return;
     }
 
@@ -397,7 +450,9 @@ void nlt_update(nlt_t *nlt, const nlt_location_t *entry)
     zone->tracker.entries[pos].slot_id = entry->slot_id;
 
     atomic_fetch_add_explicit(&nlt->generation, 1, memory_order_release);
+    uint64_t lock_t2 = nlt_monotonic_ns();
     pthread_rwlock_unlock(&nlt->grow_lock);
+    nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
 }
 
 void nlt_remove(nlt_t *nlt, uint32_t zone_id, ztree_node_id_t node_id)
@@ -407,12 +462,16 @@ void nlt_remove(nlt_t *nlt, uint32_t zone_id, ztree_node_id_t node_id)
         return;
     }
 
+    uint64_t lock_t0 = nlt_monotonic_ns();
     pthread_rwlock_wrlock(&nlt->grow_lock);
+    uint64_t lock_t1 = nlt_monotonic_ns();
 
     nlt_zone_entry_t *zone = nlt_find_zone_entry(nlt, zone_id, 0);
     if (!zone || zone->tracker.capacity == 0)
     {
+        uint64_t lock_t2 = nlt_monotonic_ns();
         pthread_rwlock_unlock(&nlt->grow_lock);
+        nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
         return;
     }
 
@@ -422,7 +481,9 @@ void nlt_remove(nlt_t *nlt, uint32_t zone_id, ztree_node_id_t node_id)
 
     if (zone->tracker.entries[pos].node_id != node_id)
     {
+        uint64_t lock_t2 = nlt_monotonic_ns();
         pthread_rwlock_unlock(&nlt->grow_lock);
+        nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
         return;
     }
 
@@ -447,7 +508,9 @@ void nlt_remove(nlt_t *nlt, uint32_t zone_id, ztree_node_id_t node_id)
     }
 
     atomic_fetch_add_explicit(&nlt->generation, 1, memory_order_release);
+    uint64_t lock_t2 = nlt_monotonic_ns();
     pthread_rwlock_unlock(&nlt->grow_lock);
+    nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
 }
 
 void nlt_set_zone_sealed(nlt_t *nlt, uint32_t zone_id, bool sealed)
@@ -457,14 +520,18 @@ void nlt_set_zone_sealed(nlt_t *nlt, uint32_t zone_id, bool sealed)
         return;
     }
 
+    uint64_t lock_t0 = nlt_monotonic_ns();
     pthread_rwlock_wrlock(&nlt->grow_lock);
+    uint64_t lock_t1 = nlt_monotonic_ns();
     nlt_zone_entry_t *zone = nlt_find_zone_entry(nlt, zone_id, 1);
     if (zone)
     {
         zone->sealed = sealed ? 1 : 0;
         atomic_fetch_add_explicit(&nlt->generation, 1, memory_order_release);
     }
+    uint64_t lock_t2 = nlt_monotonic_ns();
     pthread_rwlock_unlock(&nlt->grow_lock);
+    nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
 }
 
 int nlt_zone_is_sealed(const nlt_t *nlt, uint32_t zone_id)

@@ -299,27 +299,57 @@ void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id)
         return;
     }
 
-    /* Grow the appropriate group by 1. */
+    /* Grow the group by 1, but ONLY if the current number of non-full
+     * (writable) zones in the group is below init_count.  This caps
+     * per-group OPEN zones to the configured init count and prevents
+     * the total active zone count from creeping above the device limit.
+     *
+     * No explicit zone-open command is issued — the new zone will be
+     * implicitly opened by the first pwrite from flush_page_immediate.
+     * If that pwrite triggers EOVERFLOW (device hasn't fully released
+     * the old zone's active slot yet), the retry logic in
+     * flush_page_immediate handles it gracefully. */
+    uint32_t pool_base, pool_size, init_cnt;
+    _Atomic(uint32_t) *grp_cnt;
+
     if (zone_id >= za->cold_pool_base)
     {
-        uint32_t cur = atomic_load_explicit(&za->cold_group_count, memory_order_relaxed);
-        if (cur < za->cold_pool_size)
-            atomic_compare_exchange_strong_explicit(&za->cold_group_count,
-                &cur, cur + 1, memory_order_acq_rel, memory_order_relaxed);
+        pool_base = za->cold_pool_base;
+        pool_size = za->cold_pool_size;
+        init_cnt  = za->cold_init_count;
+        grp_cnt   = &za->cold_group_count;
     }
     else if (zone_id >= za->hot_pool_base)
     {
-        uint32_t cur = atomic_load_explicit(&za->hot_group_count, memory_order_relaxed);
-        if (cur < za->hot_pool_size)
-            atomic_compare_exchange_strong_explicit(&za->hot_group_count,
-                &cur, cur + 1, memory_order_acq_rel, memory_order_relaxed);
+        pool_base = za->hot_pool_base;
+        pool_size = za->hot_pool_size;
+        init_cnt  = za->hot_init_count;
+        grp_cnt   = &za->hot_group_count;
     }
-    else if (zone_id >= za->ilayer_pool_base)
+    else
     {
-        uint32_t cur = atomic_load_explicit(&za->ilayer_group_count, memory_order_relaxed);
-        if (cur < za->ilayer_pool_size)
-            atomic_compare_exchange_strong_explicit(&za->ilayer_group_count,
-                &cur, cur + 1, memory_order_acq_rel, memory_order_relaxed);
+        pool_base = za->ilayer_pool_base;
+        pool_size = za->ilayer_pool_size;
+        init_cnt  = za->ilayer_init_count;
+        grp_cnt   = &za->ilayer_group_count;
+    }
+
+    /* Count non-full zones in this group. */
+    uint32_t cur_count = atomic_load_explicit(grp_cnt, memory_order_relaxed);
+    uint32_t active = 0;
+    for (uint32_t i = 0; i < cur_count; i++)
+    {
+        uint32_t zid = pool_base + i;
+        if (!atomic_load_explicit(&za->zone_full[zid], memory_order_relaxed))
+            active++;
+    }
+
+    /* Only grow if active < init_count (room for a replacement). */
+    if (active < init_cnt && cur_count < pool_size)
+    {
+        atomic_compare_exchange_strong_explicit(grp_cnt,
+            &cur_count, cur_count + 1,
+            memory_order_acq_rel, memory_order_relaxed);
     }
 
     pthread_mutex_unlock(&za->lifecycle_lock);

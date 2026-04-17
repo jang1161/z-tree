@@ -80,8 +80,17 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                 return zone_id;
         }
 
-        /* All active group zones are sealed.  Attach the next batch. */
-        uint32_t new_count = count + init_count;
+        /* All active group zones are sealed.  Attach ONE replacement.
+         *
+         * The primary growth mechanism is zone_grow_group_by_one() in
+         * flush_page_immediate, which increments group_count by 1 every
+         * time a zone is sealed.  This fallback expansion fires only
+         * when all zones in the current scan range are simultaneously
+         * out of space (rare: usually the sliding growth has already
+         * added a replacement).  Adding just 1 zone here avoids
+         * opening too many new zones at once and exceeding the device's
+         * max_active_zones budget. */
+        uint32_t new_count = count + 1;
         if (new_count > pool_size)
             new_count = pool_size;
 
@@ -98,32 +107,76 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                                                     memory_order_acq_rel,
                                                     memory_order_relaxed))
         {
-            /* We won the expansion. Finish every zone in the outgoing group
-             * (except avoid_zone, which still has space) so the device's
-             * max_active_zones budget frees up before the new batch is
-             * implicitly opened by the next pwrite. CLOSED zones still count
-             * toward active, so zbd_finish_zones is the only safe release. */
+            /* We won the expansion.  Finish EVERY zone in the outgoing
+             * group so the device's max_active_zones budget frees up
+             * before the new batch is implicitly opened by the next
+             * pwrite.
+             *
+             * Critical: we call zbd_finish_zones UNCONDITIONALLY for
+             * each outgoing zone, regardless of whether zone_full was
+             * already set.  A zone can be in a gap state where:
+             *   • zone_has_space() returns 0 (WP + PAGE > capacity)
+             *   • zone_full is still 0 (95% seal threshold not reached)
+             *   • device still counts the zone as OPEN (active slot used)
+             * The previous code only called finish when was_full==0, but
+             * that skipped zones that had been sealed (zone_full=1) by
+             * the 95% threshold in flush_page_immediate IF the earlier
+             * zone_finish_if_full call failed silently.  Calling finish
+             * unconditionally is safe (finishing an already-FULL zone
+             * is a harmless no-op at the device level) and guarantees
+             * the active slot is released. */
             if (za->fd >= 0) {
+                /* Finish all outgoing zones, then verify each one has
+                 * actually transitioned to FULL at the device level.
+                 *
+                 * Some ZNS devices acknowledge zbd_finish_zones (rc=0)
+                 * but update the zone-state table asynchronously.  If we
+                 * proceed before the transition commits, pwriting to a
+                 * new zone (which implicitly opens it) can exceed the
+                 * device's max_active_zones limit.  The verify loop
+                 * re-reads each zone's state via zbd_report_zones and
+                 * retries the finish until the zone is genuinely FULL. */
                 for (uint32_t i = 0; i < count; i++) {
                     uint32_t zid = pool_base + i;
                     if (zid == avoid_zone)
                         continue;
-                    /* Serialize with pwriters on this zone. Holding the
-                     * write lock ensures any in-flight pwrite completes
-                     * before we issue zbd_finish_zones, and any allocator
-                     * that picked this zone but has not yet locked will
-                     * see zone_full=1 after we release and retry. */
                     if (za->zone_write_locks)
                         pthread_mutex_lock(&za->zone_write_locks[zid]);
-                    uint8_t was_full = atomic_exchange_explicit(
-                        &za->zone_full[zid], 1, memory_order_acq_rel);
-                    if (!was_full) {
-                        zbd_finish_zones(za->fd,
-                                         (off_t)za->zones[zid].start,
-                                         (off_t)za->zone_size);
-                    }
+                    atomic_store_explicit(
+                        &za->zone_full[zid], 1, memory_order_release);
+                    zbd_finish_zones(za->fd,
+                                     (off_t)za->zones[zid].start,
+                                     (off_t)za->zone_size);
                     if (za->zone_write_locks)
                         pthread_mutex_unlock(&za->zone_write_locks[zid]);
+                }
+
+                /* Verify-and-retry loop: re-read zone states and retry
+                 * finish for any zone that hasn't reached FULL yet. */
+                for (int attempt = 0; attempt < 100; attempt++) {
+                    int all_full = 1;
+                    for (uint32_t i = 0; i < count; i++) {
+                        uint32_t zid = pool_base + i;
+                        if (zid == avoid_zone)
+                            continue;
+                        struct zbd_zone zinfo;
+                        unsigned int nz = 1;
+                        if (zbd_report_zones(za->fd,
+                                             (off_t)za->zones[zid].start,
+                                             (off_t)za->zone_size,
+                                             ZBD_RO_ALL, &zinfo, &nz) != 0
+                            || nz == 0)
+                            continue;
+                        if (zinfo.cond != ZBD_ZONE_COND_FULL) {
+                            zbd_finish_zones(za->fd,
+                                             (off_t)za->zones[zid].start,
+                                             (off_t)za->zone_size);
+                            all_full = 0;
+                        }
+                    }
+                    if (all_full)
+                        break;
+                    usleep(100);
                 }
             }
         }

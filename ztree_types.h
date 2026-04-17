@@ -52,9 +52,9 @@
  *                  80% of pool → hot zones; 20% → cold zones
  *                  Dynamic expansion attaches more zones as LZGroup fills
  *
- * Active-zone budget (device hard limit = 13):
+ * Active-zone budget (device hard limit = 14):
  *   IZGroup initial (2) + LZGroup hot initial (9) + LZGroup cold initial (1)
- *     + RLayer meta (1) = 13 ≤ 13
+ *     + RLayer meta (1) = 13 ≤ 14
  *
  * Tuning rationale (measured at 16 threads, percentile heat policy):
  *   • IZGroup was barely contended (0.2 ms total wait, avg 4.8 µs) with
@@ -75,8 +75,8 @@
 #define ZTREE_ILAYER_INIT_COUNT    2U   /* initial IZGroup size (paper: 4)  */
 #define ZTREE_LLAYER_ZONE_START   18U   /* first zone of LLayer pool        */
 #define ZTREE_LZGROUP_INIT_SIZE   10U   /* initial LZGroup total size       */
-#define ZTREE_LZGROUP_HOT_INIT     9U   /* initial hot  zones (paper: 6)    */
-#define ZTREE_LZGROUP_COLD_INIT    1U   /* initial cold zones (paper: 2)    */
+#define ZTREE_LZGROUP_HOT_INIT     8U   /* initial hot  zones (paper: 6)    */
+#define ZTREE_LZGROUP_COLD_INIT    2U   /* initial cold zones (paper: 2)    */
 
 /* Magic numbers for on-disk structures */
 #define ZTREE_ZH_MAGIC   0x5A545245455A4E53ULL  /* "ZTREEZNS" */

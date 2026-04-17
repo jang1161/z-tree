@@ -144,44 +144,6 @@ static inline zwl_group_t zone_group_of(ztree_t *t, uint32_t zone_id)
     return ZWL_GROUP_NONE;
 }
 
-/* Immediately grow the zone group by 1 when a zone is sealed, so the
- * next rr_pick_zone scan finds a replacement.  Without this, the active
- * zone count drops by 1 every time a zone seals, and only jumps back
- * up when ALL zones in the batch are full (batch expansion).  With this
- * inline growth, the active count stays constant at ~init_count.
- *
- * Capped at pool_size to avoid overflowing the pool. */
-static inline void zone_grow_group_by_one(ztree_t *t, uint32_t zone_id)
-{
-    zone_alloc_t *za = &t->za;
-    switch (zone_group_of(t, zone_id))
-    {
-    case ZWL_GROUP_IZ: {
-        uint32_t cur = atomic_load_explicit(&za->ilayer_group_count, memory_order_relaxed);
-        if (cur < za->ilayer_pool_size)
-            atomic_compare_exchange_strong_explicit(&za->ilayer_group_count,
-                &cur, cur + 1, memory_order_acq_rel, memory_order_relaxed);
-        break;
-    }
-    case ZWL_GROUP_HOT: {
-        uint32_t cur = atomic_load_explicit(&za->hot_group_count, memory_order_relaxed);
-        if (cur < za->hot_pool_size)
-            atomic_compare_exchange_strong_explicit(&za->hot_group_count,
-                &cur, cur + 1, memory_order_acq_rel, memory_order_relaxed);
-        break;
-    }
-    case ZWL_GROUP_COLD: {
-        uint32_t cur = atomic_load_explicit(&za->cold_group_count, memory_order_relaxed);
-        if (cur < za->cold_pool_size)
-            atomic_compare_exchange_strong_explicit(&za->cold_group_count,
-                &cur, cur + 1, memory_order_acq_rel, memory_order_relaxed);
-        break;
-    }
-    default:
-        break;
-    }
-}
-
 static inline void record_zwl_wait(ztree_t *t, uint32_t zone_id, uint64_t wait_ns)
 {
     _Atomic(uint64_t) *wait_p, *cnt_p, *max_p;
@@ -917,6 +879,9 @@ static void flush_page_immediate(ztree_t *t,
      * hold inline before unlocking. */
     uint64_t zwl_hold_start = 0;
 
+retry_flush:
+    sticky_ok = false;
+
     /* ── Phase 1a: try stickiness ──────────────────────────────────────── */
     if (prev_zone != ZTREE_INVALID_ZONE_ID
         && !atomic_load_explicit(&t->zone_full[prev_zone], memory_order_acquire))
@@ -988,8 +953,7 @@ static void flush_page_immediate(ztree_t *t,
                 pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
                 atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
                 nlt_set_zone_sealed(&t->nlt, target_zone, true);
-                zone_finish_if_full(t, target_zone);
-                zone_grow_group_by_one(t, target_zone);
+                zone_seal_and_replace(&t->za, target_zone);
                 continue;
             }
 
@@ -1045,6 +1009,17 @@ static void flush_page_immediate(ztree_t *t,
     if (pwr != (ssize_t)ZTREE_PAGE_SIZE)
     {
         int e = errno;
+        if (e == EOVERFLOW)
+        {
+            /* Too many active zones — undo WP reservation, release lock,
+             * sleep briefly, then retry the entire zone selection. */
+            atomic_fetch_sub_explicit(&t->zone_wp_bytes[target_zone],
+                                      ZTREE_PAGE_SIZE, memory_order_relaxed);
+            record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
+            pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+            usleep(500);
+            goto retry_flush;
+        }
         fprintf(stderr,
                 "flush_page_immediate: pwrite at 0x%llx ret=%zd errno=%d (%s) "
                 "target_zone=%u prev_zone=%u avoid=%u is_leaf=%u sticky=%d\n",
@@ -1064,8 +1039,7 @@ static void flush_page_immediate(ztree_t *t,
     if (new_wp >= zone_end)
     {
         atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
-        zone_finish_if_full(t, target_zone);
-        zone_grow_group_by_one(t, target_zone);
+        zone_seal_and_replace(&t->za, target_zone);
     }
 
     cache_insert(t, pn, pg);
@@ -1082,8 +1056,7 @@ static void flush_page_immediate(ztree_t *t,
     {
         atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
         nlt_set_zone_sealed(&t->nlt, target_zone, true);
-        zone_finish_if_full(t, target_zone);
-        zone_grow_group_by_one(t, target_zone);
+        zone_seal_and_replace(&t->za, target_zone);
     }
 
     if (pg->is_leaf)
@@ -1722,12 +1695,12 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
             new_root_slot = prop.left_slot;
             need_root_publish = 1;
 
-                fprintf(stderr,
-                    "[ZTREE ROOT MOVE] root_id=%u root_zone=%u root_slot=%u seq_snapshot=%lu\n",
-                    (unsigned)new_root_nid,
-                    (unsigned)new_root_zone,
-                    (unsigned)new_root_slot,
-                    seq_snapshot);
+                // fprintf(stderr,
+                //     "[ZTREE ROOT MOVE] root_id=%u root_zone=%u root_slot=%u seq_snapshot=%lu\n",
+                //     (unsigned)new_root_nid,
+                //     (unsigned)new_root_zone,
+                //     (unsigned)new_root_slot,
+                //     seq_snapshot);
         }
 
         {

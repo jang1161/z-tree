@@ -72,7 +72,7 @@
 #define ZTREE_META_ZONE_1          1U
 #define ZTREE_ILAYER_ZONE_START    2U   /* first zone of ILayer pool        */
 #define ZTREE_ILAYER_POOL_SIZE    16U   /* ILayer pool size (zones 2-17)    */
-#define ZTREE_ILAYER_INIT_COUNT    2U   /* initial IZGroup size (paper: 4)  */
+#define ZTREE_ILAYER_INIT_COUNT    3U   /* initial IZGroup size (paper: 4)  */
 #define ZTREE_LLAYER_ZONE_START   18U   /* first zone of LLayer pool        */
 #define ZTREE_LZGROUP_INIT_SIZE   10U   /* initial LZGroup total size       */
 #define ZTREE_LZGROUP_HOT_INIT     8U   /* initial hot  zones (paper: 6)    */

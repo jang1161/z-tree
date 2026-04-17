@@ -123,6 +123,14 @@ typedef struct {
     int               fd;              /* device fd for zbd_finish_zones  */
     uint64_t          zone_size;       /* zone stride in bytes            */
     pthread_mutex_t  *zone_write_locks;/* per-zone; guards write vs finish */
+
+    /* Global lifecycle lock.
+     *
+     * lifecycle_lock serialises all zone seal → finish → verify → grow
+     * operations.  If the device rejects a pwrite with EOVERFLOW (too
+     * many active zones), the caller retries after a short sleep —
+     * see flush_page_immediate in ztree_main.c. */
+    pthread_mutex_t    lifecycle_lock;
 } zone_alloc_t;
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -180,6 +188,17 @@ uint32_t zone_alloc_ilayer(zone_alloc_t *za, uint32_t avoid_zone);
  */
 uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
                            uint32_t avoid_zone);
+
+/*
+ * zone_seal_and_replace  –  atomically finish a sealed zone and grow the
+ * group by 1.  Must be called AFTER zone_full[zone_id] has been set and
+ * AFTER the per-zone zone_write_lock has been released.  Takes the global
+ * lifecycle_lock internally, so only one zone transition can be in
+ * progress at a time.  Includes verify-and-retry: re-reads the zone
+ * descriptor via zbd_report_zones and retries zbd_finish_zones until the
+ * device confirms FULL state.
+ */
+void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id);
 
 /*
  * zone_heat_record_write  –  increment write counter and update timestamp for

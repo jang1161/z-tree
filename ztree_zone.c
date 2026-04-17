@@ -107,35 +107,13 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                                                     memory_order_acq_rel,
                                                     memory_order_relaxed))
         {
-            /* We won the expansion.  Finish EVERY zone in the outgoing
-             * group so the device's max_active_zones budget frees up
-             * before the new batch is implicitly opened by the next
-             * pwrite.
-             *
-             * Critical: we call zbd_finish_zones UNCONDITIONALLY for
-             * each outgoing zone, regardless of whether zone_full was
-             * already set.  A zone can be in a gap state where:
-             *   • zone_has_space() returns 0 (WP + PAGE > capacity)
-             *   • zone_full is still 0 (95% seal threshold not reached)
-             *   • device still counts the zone as OPEN (active slot used)
-             * The previous code only called finish when was_full==0, but
-             * that skipped zones that had been sealed (zone_full=1) by
-             * the 95% threshold in flush_page_immediate IF the earlier
-             * zone_finish_if_full call failed silently.  Calling finish
-             * unconditionally is safe (finishing an already-FULL zone
-             * is a harmless no-op at the device level) and guarantees
-             * the active slot is released. */
+            /* Fallback expansion: finish + verify all outgoing zones
+             * under lifecycle_lock, then update active budget.  The
+             * outer for(;;) loop will retry the scan and find the
+             * newly added zone. */
+            pthread_mutex_lock(&za->lifecycle_lock);
             if (za->fd >= 0) {
-                /* Finish all outgoing zones, then verify each one has
-                 * actually transitioned to FULL at the device level.
-                 *
-                 * Some ZNS devices acknowledge zbd_finish_zones (rc=0)
-                 * but update the zone-state table asynchronously.  If we
-                 * proceed before the transition commits, pwriting to a
-                 * new zone (which implicitly opens it) can exceed the
-                 * device's max_active_zones limit.  The verify loop
-                 * re-reads each zone's state via zbd_report_zones and
-                 * retries the finish until the zone is genuinely FULL. */
+                int finished_count = 0;
                 for (uint32_t i = 0; i < count; i++) {
                     uint32_t zid = pool_base + i;
                     if (zid == avoid_zone)
@@ -150,11 +128,8 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                     if (za->zone_write_locks)
                         pthread_mutex_unlock(&za->zone_write_locks[zid]);
                 }
-
-                /* Verify-and-retry loop: re-read zone states and retry
-                 * finish for any zone that hasn't reached FULL yet. */
-                for (int attempt = 0; attempt < 100; attempt++) {
-                    int all_full = 1;
+                for (int attempt = 0; attempt < 200; attempt++) {
+                    finished_count = 0;
                     for (uint32_t i = 0; i < count; i++) {
                         uint32_t zid = pool_base + i;
                         if (zid == avoid_zone)
@@ -166,19 +141,24 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                                              (off_t)za->zone_size,
                                              ZBD_RO_ALL, &zinfo, &nz) != 0
                             || nz == 0)
+                        {
+                            finished_count++;
                             continue;
-                        if (zinfo.cond != ZBD_ZONE_COND_FULL) {
+                        }
+                        if (zinfo.cond == ZBD_ZONE_COND_FULL) {
+                            finished_count++;
+                        } else {
                             zbd_finish_zones(za->fd,
                                              (off_t)za->zones[zid].start,
                                              (off_t)za->zone_size);
-                            all_full = 0;
                         }
                     }
-                    if (all_full)
+                    if (finished_count >= (int)count)
                         break;
-                    usleep(100);
+                    usleep(200);
                 }
             }
+            pthread_mutex_unlock(&za->lifecycle_lock);
         }
     }
 }
@@ -231,6 +211,11 @@ void zone_alloc_init(zone_alloc_t *za,
     atomic_store_explicit(&za->heat_writes_since_recompute, 0, memory_order_relaxed);
     atomic_store_explicit(&za->heat_recompute_in_progress,  0, memory_order_relaxed);
 
+    if (pthread_mutex_init(&za->lifecycle_lock, NULL) != 0)
+    {
+        perror("zone_alloc_init: lifecycle_lock");
+        exit(EXIT_FAILURE);
+    }
     za->zone_full      = zone_full;
     za->zone_wp_bytes  = zone_wp_bytes;
     za->zones          = zones;
@@ -242,8 +227,102 @@ void zone_alloc_init(zone_alloc_t *za,
 
 void zone_alloc_destroy(zone_alloc_t *za)
 {
-    (void)za;
+    pthread_mutex_destroy(&za->lifecycle_lock);
     /* zone arrays are owned by ztree_t; we must not free them here */
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * zone_seal_and_replace  –  finish a sealed zone and grow its group by 1.
+ *
+ * Serialised by lifecycle_lock so at most one zone open/close transition
+ * is in flight at any time across all threads.  Includes verify-and-retry
+ * to handle devices that acknowledge zbd_finish_zones (rc=0) but complete
+ * the OPEN→FULL transition asynchronously.
+ * ─────────────────────────────────────────────────────────────────────────── */
+void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id)
+{
+    if (za->fd < 0)
+        return;
+
+    pthread_mutex_lock(&za->lifecycle_lock);
+
+    /* 0. Check if another thread already processed this zone. Under
+     *    lifecycle_lock, so no race with other seal_and_replace calls. */
+    {
+        struct zbd_zone pre_check;
+        unsigned int pre_nz = 1;
+        if (zbd_report_zones(za->fd,
+                             (off_t)za->zones[zone_id].start,
+                             (off_t)za->zone_size,
+                             ZBD_RO_ALL, &pre_check, &pre_nz) == 0
+            && pre_nz > 0
+            && pre_check.cond == ZBD_ZONE_COND_FULL)
+        {
+            /* Already FULL — a previous call finished this zone and
+             * grew the group.  Skip to avoid double-decrementing
+             * active_open_count and double-growing group_count. */
+            pthread_mutex_unlock(&za->lifecycle_lock);
+            return;
+        }
+    }
+
+    /* 1. Finish the sealed zone + verify FULL with retry. */
+    zbd_finish_zones(za->fd,
+                     (off_t)za->zones[zone_id].start,
+                     (off_t)za->zone_size);
+
+    int verified_full = 0;
+    for (int attempt = 0; attempt < 200; attempt++)
+    {
+        struct zbd_zone zinfo;
+        unsigned int nz = 1;
+        if (zbd_report_zones(za->fd,
+                             (off_t)za->zones[zone_id].start,
+                             (off_t)za->zone_size,
+                             ZBD_RO_ALL, &zinfo, &nz) != 0
+            || nz == 0)
+            break;
+        if (zinfo.cond == ZBD_ZONE_COND_FULL)
+        {
+            verified_full = 1;
+            break;
+        }
+        zbd_finish_zones(za->fd,
+                         (off_t)za->zones[zone_id].start,
+                         (off_t)za->zone_size);
+        usleep(200);
+    }
+
+    if (!verified_full)
+    {
+        pthread_mutex_unlock(&za->lifecycle_lock);
+        return;
+    }
+
+    /* Grow the appropriate group by 1. */
+    if (zone_id >= za->cold_pool_base)
+    {
+        uint32_t cur = atomic_load_explicit(&za->cold_group_count, memory_order_relaxed);
+        if (cur < za->cold_pool_size)
+            atomic_compare_exchange_strong_explicit(&za->cold_group_count,
+                &cur, cur + 1, memory_order_acq_rel, memory_order_relaxed);
+    }
+    else if (zone_id >= za->hot_pool_base)
+    {
+        uint32_t cur = atomic_load_explicit(&za->hot_group_count, memory_order_relaxed);
+        if (cur < za->hot_pool_size)
+            atomic_compare_exchange_strong_explicit(&za->hot_group_count,
+                &cur, cur + 1, memory_order_acq_rel, memory_order_relaxed);
+    }
+    else if (zone_id >= za->ilayer_pool_base)
+    {
+        uint32_t cur = atomic_load_explicit(&za->ilayer_group_count, memory_order_relaxed);
+        if (cur < za->ilayer_pool_size)
+            atomic_compare_exchange_strong_explicit(&za->ilayer_group_count,
+                &cur, cur + 1, memory_order_acq_rel, memory_order_relaxed);
+    }
+
+    pthread_mutex_unlock(&za->lifecycle_lock);
 }
 
 uint32_t zone_alloc_ilayer(zone_alloc_t *za, uint32_t avoid_zone)

@@ -1,22 +1,7 @@
 /*
- * ztree_nlt.h  –  Node Location Table (NLT) interface (Lock-Free Reads)
+ * ztree_nlt.h  –  Node Location Table (NLT): NodeID → (zone_id, slot_id)
  *
- * Paper-aligned lock-free NLT for efficient node address resolution.
- * The NLT maintains a mapping:
- *
- *   NodeID  →  (zone_id, slot_id)
- *
- * where:
- *   NodeID   is the stable, globally-unique identifier of a tree node.
- *   zone_id  is the zone that currently holds the node's latest copy.
- *   slot_id  is the slot index within that zone.
- *
- * Physical byte offset  =  zone_start[zone_id] + slot_id × PAGE_SIZE
- *
- * Thread safety:
- *   - nlt_lookup: **lock-free** (atomic reads only)
- *   - nlt_update: write-lock protected (grow/rehash synchronization)
- *   - nlt_remove: write-lock protected
+ * Lock-free reads (nlt_lookup), write-lock protected updates/removes.
  */
 
 #pragma once
@@ -24,12 +9,7 @@
 #include "ztree_types.h"
 
 /* ───────────────────────────────────────────────────────────────────────────
- * Paper-aligned NLTable location tuple
- *
- * ZoneID + NodeID identify a tracker bucket, SlotID identifies the latest
- * physical position of that node within the zone.
- * SlotID is stored as uint32_t for implementation simplicity and to avoid
- * the 16-bit range limit in large zones.
+ * NLT location tuple
  * ─────────────────────────────────────────────────────────────────────────── */
 typedef struct
 {
@@ -73,9 +53,7 @@ typedef struct
     _Atomic(uint64_t) generation; /* detects concurrent resize/update   */
     pthread_rwlock_t grow_lock;   /* protects grow/rehash + updates     */
 
-    /* ── Lock contention profile (global wrlock) ─────────────────────
-     * Recorded around every wrlock acquisition in the public NLT API.
-     * Use these to gauge whether the global NLT lock is the bottleneck. */
+    /* ── Lock contention profile (global wrlock) ───────────────────── */
     _Atomic(uint64_t) prof_wait_ns_sum;     /* Σ time blocked waiting for wrlock */
     _Atomic(uint64_t) prof_hold_ns_sum;     /* Σ time wrlock was held            */
     _Atomic(uint64_t) prof_acquire_count;   /* # of wrlock acquisitions          */
@@ -86,11 +64,7 @@ typedef struct
  * Public API
  * ─────────────────────────────────────────────────────────────────────────── */
 
-/*
- * nlt_init  –  initialise the NLT with the given initial capacity.
- * capacity must be > 0; it is rounded up to the next power of two.
- * Exits the process on allocation failure.
- */
+/* nlt_init  –  initialise the NLT (capacity rounded to next power of two). */
 void nlt_init(nlt_t *nlt, size_t initial_cap);
 
 /*
@@ -98,21 +72,11 @@ void nlt_init(nlt_t *nlt, size_t initial_cap);
  */
 void nlt_destroy(nlt_t *nlt);
 
-/*
- * nlt_lookup  –  look up a node's current physical location.
- * Query must supply the zone_id bucket and node_id key.
- * If query->zone_id is ZTREE_INVALID_ZONE_ID, implementations may fall back
- * to a slow path scan, but callers should pass the zone hint whenever known.
- * Returns 1 and fills *out on success, 0 if the node is not in the table.
- */
+/* nlt_lookup  –  lock-free lookup. Pass zone_id hint when known.
+ * Returns 1 + fills *out on success, 0 if not found. */
 int nlt_lookup(nlt_t *nlt, const nlt_location_t *query, nlt_location_t *out);
 
-/*
- * nlt_update  –  insert or update the location entry for node_id.
- * If the node is already present, its slot_id is overwritten in place.
- * The zone entry is created on demand and the table grows automatically
- * when the zone-bucket load factor exceeds 70%.
- */
+/* nlt_update  –  insert or update location; auto-grows at 70% load. */
 void nlt_update(nlt_t *nlt, const nlt_location_t *entry);
 
 /*

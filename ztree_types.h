@@ -1,27 +1,10 @@
 /*
  * ztree_types.h  –  Shared type definitions for ZTree
  *
- * ZTree is a Copy-on-Write B+-Tree optimized for ZNS (Zoned Namespace) NVMe
- * devices.  It extends the baseline COW tree with three new mechanisms:
- *
- *   1. Node Location Table (NLT): maps a stable NodeID to its current
- *      physical (zone_id, slot_id) location, so parent nodes only need to
- *      store (zone_id, node_id) pairs rather than raw LBAs.
- *
- *   2. 3-Layer Architecture: RLayer (metadata/root), ILayer (internal nodes,
- *      round-robin over dedicated zones), LLayer (leaf nodes, heat-aware
- *      80/20 hot/cold zone split).
- *
- *   3. Two-Stage Tracking: when a node is re-appended within the same zone,
- *      only the NLT slot entry is updated – the parent node does NOT need to
- *      be rewritten.  A parent rewrite is triggered only when a child moves
- *      to a different zone or a node split occurs.
- *
- * Compile with:
- *   gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
- *       -Iinclude -I. \
- *       src/Z-tree/ztree_nlt.c src/Z-tree/ztree_zone.c src/Z-tree/ztree_main.c \
- *       -o build/bin/ztree -lzbd -lnvme -lpthread
+ * CoW B+-Tree for ZNS NVMe with:
+ *   1. NLT: NodeID → (zone_id, slot_id) indirection
+ *   2. 3-Layer: RLayer (meta), ILayer (internal), LLayer (leaf, heat-aware)
+ *   3. Two-Stage Tracking: same-zone updates skip parent rewrite
  */
 
 #pragma once
@@ -41,32 +24,9 @@
 #define ZTREE_PAGE_SIZE         4096U
 
 /*
- * Zone layout on device (paper-aligned):
- *
- *   Zone  0- 1  → RLayer  (meta / superblock ping-pong pair)
- *   Zone  2-17  → ILayer pool  (16 zones available for IZGroup)
- *                  Initial IZGroup = zones 2-3 (2 zones)
- *                  Dynamic expansion attaches more zones as IZGroup fills
- *   Zone 18+    → LLayer pool  (all remaining zones for LZGroup)
- *                  Initial LZGroup = 10 zones (9 hot + 1 cold)
- *                  80% of pool → hot zones; 20% → cold zones
- *                  Dynamic expansion attaches more zones as LZGroup fills
- *
- * Active-zone budget (device hard limit = 14):
- *   IZGroup initial (2) + LZGroup hot initial (9) + LZGroup cold initial (1)
- *     + RLayer meta (1) = 13 ≤ 14
- *
- * Tuning rationale (measured at 16 threads, percentile heat policy):
- *   • IZGroup was barely contended (0.2 ms total wait, avg 4.8 µs) with
- *     4 zones — plenty of headroom; halved to 2 to free the budget.
- *   • LZGroup-Cold sees only ~6 % of leaf writes under inherit-based heat
- *     classification — 1 zone with on-demand expansion is enough.
- *   • LZGroup-Hot was the dominant bottleneck (238 s wait, avg 261 µs);
- *     boosting from 6 → 9 cuts threads-per-zone from 2.67 to 1.78,
- *     directly reducing the queue depth that drives per-zone-mutex wait.
- *
- * The original paper-stated split (IZ=4, Hot=6, Cold=2) is preserved in
- * code comments above each #define for reference.
+ * Zone layout: zones 0-1 RLayer, 2-17 ILayer, 18+ LLayer (80/20 hot/cold).
+ * Active-zone budget (device limit=14): IZ(3)+Hot(8)+Cold(2)+Meta(1)=14.
+ * Original paper split (IZ=4, Hot=6, Cold=2) in comments per #define.
  */
 #define ZTREE_META_ZONE_0          0U
 #define ZTREE_META_ZONE_1          1U
@@ -86,14 +46,8 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * B+-Tree fan-out constants
  *
- * Page header is padded to exactly 128 bytes.
- * Remaining 3968 bytes hold the union of leaf / internal entries.
- *
- *   Leaf entry       = key(8) + value(120)           = 128 bytes
- *   Internal entry   = key(8) + node_id(4) + zone_id(4) = 16 bytes
- *
- *   Max leaf entries     = 3968 / 128 = 31  → LEAF_ORDER     = 32
- *   Max internal entries = 3968 / 16  = 248 → INTERNAL_ORDER = 249
+ * 128B header + 3968B body = 4096B page.
+ * Leaf: 3968/128=31 entries (ORDER=32). Internal: 3968/16=248 (ORDER=249).
  * ═══════════════════════════════════════════════════════════════════════════ */
 #define ZTREE_LEAF_ORDER     32U
 #define ZTREE_INTERNAL_ORDER 249U
@@ -136,13 +90,8 @@ typedef struct {
     ztree_record record;  /* associated value (120 B)    */
 } ztree_leaf_entity;      /* exactly 128 bytes           */
 
-/*
- * Internal child pointer.
- *
- * Unlike raw-LBA designs, ZTree stores (child_zone_id, child_node_id) so
- * that a child can be re-appended within the same zone without requiring
- * the parent to be rewritten.  The NLT resolves node_id → current slot.
- */
+/* Internal child pointer: (zone_id, node_id) indirection via NLT,
+ * so same-zone child updates skip parent rewrite. */
 typedef struct {
     uint64_t        key;            /* separator / fence key           */
     ztree_node_id_t child_node_id;  /* stable child identifier         */
@@ -150,20 +99,7 @@ typedef struct {
 } ztree_internal_entity;  /* exactly 16 bytes */
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Page layout  (must be exactly ZTREE_PAGE_SIZE = 4096 bytes)
- *
- * Header (128 B):
- *   node_id      4   – stable global ID written on every append
- *   zone_id      4   – zone where this copy resides (cross-check)
- *   slot_id      4   – slot within zone
- *   is_leaf      4
- *   num_keys     4
- *   ptr_zone_id  4   – rightmost-child zone (internal only)
- *   ptr_node_id  4   – rightmost-child node_id (internal only)
- *   _pad0        4
- *   _pad1       96
- *
- * Body (3968 B): union of leaf[31] or internal[248]
+ * Page layout (4096 B = 128 B header + 3968 B body)
  * ═══════════════════════════════════════════════════════════════════════════ */
 typedef struct {
     /* ── header ─────────────────────────────────────────────────── */
@@ -200,11 +136,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  _pad[ZTREE_PAGE_SIZE - 8 - 1 - 8];
 } ztree_zone_header;   /* 4096 bytes */
 
-/*
- * Superblock entry – appended to the active RLayer zone after each TXG.
- * The root is identified by (root_node_id, root_zone_id) so the NLT can
- * be seeded at startup without a full zone scan.
- */
+/* Superblock entry – appended to active RLayer zone after each TXG. */
 typedef struct __attribute__((packed)) {
     uint64_t        magic;          /* ZTREE_SB_MAGIC                       */
     uint64_t        seq_no;         /* monotonically increasing              */
@@ -238,13 +170,9 @@ typedef struct ztree_insert_req {
 } ztree_insert_req;
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Global page cache  (4-way set-associative, keyed by physical page number)
- *
- * The cache is kept here as a flat array of ztree_cache_set.  Each set has
- * ZTREE_CACHE_WAYS ways protected by a single per-set mutex.  LRU eviction
- * uses a global atomic clock counter.
+ * Global page cache (4-way set-associative, LRU eviction)
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define ZTREE_CACHE_NUM_SETS   (4096 * 4 * 12)
+#define ZTREE_CACHE_NUM_SETS   (4096)
 #define ZTREE_CACHE_WAYS       4
 
 typedef struct {

@@ -9,16 +9,7 @@
 #include "ztree_nlt.h"
 
 /* ───────────────────────────────────────────────────────────────────────────
- * Lock contention profiling helpers
- *
- * Wrap every wrlock acquisition in the public NLT API.  Records:
- *   wait_ns = elapsed time waiting for the lock (= contention)
- *   hold_ns = elapsed time the lock was held (= critical section size)
- *   count   = +1
- *   max_wait_ns = monotonic CAS max of wait_ns samples
- *
- * Two clock_gettime calls per acquire (≈ 60-80 ns vDSO overhead) are
- * acceptable here because nlt_update is already on the slow side.
+ * Lock contention profiling helpers (wrlock wait/hold/count/max)
  * ─────────────────────────────────────────────────────────────────────────── */
 
 static inline uint64_t nlt_monotonic_ns(void)

@@ -1,9 +1,10 @@
 watch -n 1 'sudo nvme zns report-zone /dev/nvme3n2 | awk '\''{
     for(i=1;i<=NF;i++){
         if($i=="State:"){
-            count[$(i+1)]++
+            state = $(i+1)
+            count[state]++
 
-            if($(i+1)=="0x20"){
+            if(state=="0x20" || state=="0x30"){
                 slba = strtonum($2)
                 wp   = strtonum($4)
                 cap  = strtonum($6)
@@ -11,8 +12,9 @@ watch -n 1 'sudo nvme zns report-zone /dev/nvme3n2 | awk '\''{
                 zone = slba / strtonum("0x400000")
                 usage = (wp - slba) / cap * 100
 
-                line = sprintf("Zone: %-5d SLBA: %-12s WP: %-12s Usage: %6.2f%%",
-                               zone, $2, $4, usage)
+                tag = (state=="0x30") ? " [C]" : ""
+                line = sprintf("Zone: %-5d SLBA: %-12s WP: %-12s Usage: %6.2f%%%s",
+                               zone, $2, $4, usage, tag)
 
                 if(zone==0 || zone==1){
                     r[++r_idx] = line
@@ -33,7 +35,7 @@ watch -n 1 'sudo nvme zns report-zone /dev/nvme3n2 | awk '\''{
 END{
     for(s in count) print s, count[s]
 
-    print "---- 0x20 (opened) zones ----"
+    print "---- active zones (0x20=open, 0x30=closed) ----"
 
     print "# RLayer"
     for(i=1;i<=r_idx;i++) print r[i]

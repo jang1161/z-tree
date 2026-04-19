@@ -48,21 +48,12 @@ static int zone_has_space(zone_alloc_t *za, uint32_t zone_id)
     return (wp + ZTREE_PAGE_SIZE <= start + cap) ? 1 : 0;
 }
 
-/*
- * Dynamic_Allocation (paper §3.2): round-robin within the active group.
- *
- * Each call advances the counter by one, so T concurrent callers get T
- * different starting zones → inter-zone I/O parallelism.
- *
- * When every zone in the active group is sealed (zone_full=1), the group
- * is expanded by `init_count' idle zones from the pool.  At most one
- * expansion batch is open at a time, so the device's active-zone budget
- * is consumed gradually rather than all at once.
- */
+/* Dynamic_Allocation (paper §3.2): round-robin within the active group.
+ * Expands group by 1 when all zones are sealed. */
 static uint32_t rr_pick_zone(zone_alloc_t *za,
                               uint32_t pool_base,
                               uint32_t pool_size,
-                              uint32_t init_count,
+                              uint32_t init_count __attribute__((unused)),
                               _Atomic(uint32_t) *group_count,
                               _Atomic(uint32_t) *rr_counter,
                               uint32_t avoid_zone,
@@ -80,16 +71,8 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                 return zone_id;
         }
 
-        /* All active group zones are sealed.  Attach ONE replacement.
-         *
-         * The primary growth mechanism is zone_grow_group_by_one() in
-         * flush_page_immediate, which increments group_count by 1 every
-         * time a zone is sealed.  This fallback expansion fires only
-         * when all zones in the current scan range are simultaneously
-         * out of space (rare: usually the sliding growth has already
-         * added a replacement).  Adding just 1 zone here avoids
-         * opening too many new zones at once and exceeding the device's
-         * max_active_zones budget. */
+        /* All active zones sealed.  Attach 1 replacement (fallback;
+         * primary growth is via zone_seal_and_replace). */
         uint32_t new_count = count + 1;
         if (new_count > pool_size)
             new_count = pool_size;
@@ -107,10 +90,7 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                                                     memory_order_acq_rel,
                                                     memory_order_relaxed))
         {
-            /* Fallback expansion: finish + verify all outgoing zones
-             * under lifecycle_lock, then update active budget.  The
-             * outer for(;;) loop will retry the scan and find the
-             * newly added zone. */
+            /* Finish outgoing zones under lifecycle_lock. */
             pthread_mutex_lock(&za->lifecycle_lock);
             if (za->fd >= 0) {
                 int finished_count = 0;
@@ -233,11 +213,7 @@ void zone_alloc_destroy(zone_alloc_t *za)
 
 /* ───────────────────────────────────────────────────────────────────────────
  * zone_seal_and_replace  –  finish a sealed zone and grow its group by 1.
- *
- * Serialised by lifecycle_lock so at most one zone open/close transition
- * is in flight at any time across all threads.  Includes verify-and-retry
- * to handle devices that acknowledge zbd_finish_zones (rc=0) but complete
- * the OPEN→FULL transition asynchronously.
+ * Serialised by lifecycle_lock; handles async OPEN→FULL transitions.
  * ─────────────────────────────────────────────────────────────────────────── */
 void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id)
 {
@@ -246,8 +222,7 @@ void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id)
 
     pthread_mutex_lock(&za->lifecycle_lock);
 
-    /* 0. Check if another thread already processed this zone. Under
-     *    lifecycle_lock, so no race with other seal_and_replace calls. */
+    /* 0. Dedup: skip if another thread already finished this zone. */
     {
         struct zbd_zone pre_check;
         unsigned int pre_nz = 1;
@@ -258,57 +233,20 @@ void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id)
             && pre_nz > 0
             && pre_check.cond == ZBD_ZONE_COND_FULL)
         {
-            /* Already FULL — a previous call finished this zone and
-             * grew the group.  Skip to avoid double-decrementing
-             * active_open_count and double-growing group_count. */
+            /* Already FULL — skip to avoid double-growing. */
             pthread_mutex_unlock(&za->lifecycle_lock);
             return;
         }
     }
 
-    /* 1. Finish the sealed zone + verify FULL with retry. */
+    /* 1. Finish the sealed zone (no verify loop; EOVERFLOW retry
+     *    in flush_page_immediate handles async transitions). */
     zbd_finish_zones(za->fd,
                      (off_t)za->zones[zone_id].start,
                      (off_t)za->zone_size);
 
-    int verified_full = 0;
-    for (int attempt = 0; attempt < 200; attempt++)
-    {
-        struct zbd_zone zinfo;
-        unsigned int nz = 1;
-        if (zbd_report_zones(za->fd,
-                             (off_t)za->zones[zone_id].start,
-                             (off_t)za->zone_size,
-                             ZBD_RO_ALL, &zinfo, &nz) != 0
-            || nz == 0)
-            break;
-        if (zinfo.cond == ZBD_ZONE_COND_FULL)
-        {
-            verified_full = 1;
-            break;
-        }
-        zbd_finish_zones(za->fd,
-                         (off_t)za->zones[zone_id].start,
-                         (off_t)za->zone_size);
-        usleep(200);
-    }
-
-    if (!verified_full)
-    {
-        pthread_mutex_unlock(&za->lifecycle_lock);
-        return;
-    }
-
-    /* Grow the group by 1, but ONLY if the current number of non-full
-     * (writable) zones in the group is below init_count.  This caps
-     * per-group OPEN zones to the configured init count and prevents
-     * the total active zone count from creeping above the device limit.
-     *
-     * No explicit zone-open command is issued — the new zone will be
-     * implicitly opened by the first pwrite from flush_page_immediate.
-     * If that pwrite triggers EOVERFLOW (device hasn't fully released
-     * the old zone's active slot yet), the retry logic in
-     * flush_page_immediate handles it gracefully. */
+    /* Grow by 1 only if writable zones < init_count (caps OPEN zones).
+     * New zone is implicitly opened by its first pwrite. */
     uint32_t pool_base, pool_size, init_cnt;
     _Atomic(uint32_t) *grp_cnt;
 
@@ -368,11 +306,7 @@ uint32_t zone_alloc_ilayer(zone_alloc_t *za, uint32_t avoid_zone)
 uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
                            uint32_t avoid_zone)
 {
-    /*
-     * Heat-aware placement: hot nodes go to hot zones (denser writes, worse
-     * GC amplification) and cold nodes go to cold zones (sparse writes, lower
-     * GC amplification).  Within each group, round-robin for parallelism.
-     */
+    /* Heat-aware placement: hot → hot zones, cold → cold zones. */
     if (zone_is_hot(za, node_id)) {
         return rr_pick_zone(za,
                             za->hot_pool_base, za->hot_pool_size,
@@ -393,22 +327,9 @@ uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
 /* ───────────────────────────────────────────────────────────────────────────
  * Percentile-based heat policy (paper §3.1.1)
  *
- * recompute_heat_medians() scans the entire heat_table, collects all
- * non-zero (Counter, Timestamp) pairs, sorts each dimension, and stores
- * the 50th-percentile values.  zone_is_hot() then classifies a node as
- * hot iff its Counter OR Timestamp exceeds the corresponding median.
- *
- * Cost: with ZTREE_HEAT_TABLE_SIZE = 65536 entries, the scan + qsort runs
- * in roughly 1–3 ms on modern x86.  Recomputation is gated by
- * ZTREE_HEAT_RECOMPUTE_INTERVAL (16 K writes by default), so the
- * amortised overhead is well under 1% even for tight insert workloads.
- * Only one thread runs the recompute at a time; others see
- * heat_recompute_in_progress = 1 and skip until the next interval.
- *
- * Bootstrap: until at least ZTREE_HEAT_MIN_SAMPLES non-zero entries exist,
- * the medians stay at 0 and zone_is_hot() falls back to default-hot.
- * This avoids the pathological default-cold pinning observed when median
- * is undefined and every leaf would otherwise be classified cold.
+ * Scans heat_table, sorts non-zero (Counter, Timestamp) pairs, stores
+ * 50th-percentile medians.  Gated by RECOMPUTE_INTERVAL; one thread at
+ * a time.  Bootstrap: defaults to hot until MIN_SAMPLES are observed.
  * ─────────────────────────────────────────────────────────────────────── */
 
 static int cmp_u16(const void *a, const void *b)
@@ -420,9 +341,7 @@ static int cmp_u16(const void *a, const void *b)
 
 static void recompute_heat_medians(zone_alloc_t *za)
 {
-    /* Heap allocation: ZTREE_HEAT_TABLE_SIZE * 2 bytes = 128 KB per array,
-     * too large for a stack frame.  malloc/free per recompute is fine — one
-     * call every ~16 K writes is negligible. */
+    /* 128 KB per array — too large for stack; malloc is fine at ~16K-write intervals. */
     uint16_t *cnts = malloc(ZTREE_HEAT_TABLE_SIZE * sizeof(uint16_t));
     uint16_t *tss  = malloc(ZTREE_HEAT_TABLE_SIZE * sizeof(uint16_t));
     if (!cnts || !tss)
@@ -448,8 +367,7 @@ static void recompute_heat_medians(zone_alloc_t *za)
 
     if (n < ZTREE_HEAT_MIN_SAMPLES)
     {
-        /* Too few samples for a meaningful median.  Force defaults to 0
-         * so zone_is_hot() takes the bootstrap (default-hot) branch. */
+        /* Too few samples; keep defaults so zone_is_hot() → default-hot. */
         atomic_store_explicit(&za->heat_median_count, 0, memory_order_relaxed);
         atomic_store_explicit(&za->heat_median_ts,    0, memory_order_relaxed);
         free(cnts);
@@ -473,10 +391,7 @@ void zone_heat_record_write(zone_alloc_t *za, ztree_node_id_t node_id)
     if (node_id == ZTREE_INVALID_NODE_ID)
         return;
 
-    /* Hash into the fixed-size heat table.  Collisions are harmless –
-     * the heat estimate for a node may be influenced by another node
-     * that maps to the same bucket, but the outcome is just a slightly
-     * imprecise hot/cold classification.                                */
+    /* Hash into heat table; collisions only cause imprecise classification. */
     size_t idx = (size_t)(node_id % ZTREE_HEAT_TABLE_SIZE);
 
     /* Saturate access_count at uint16_t max without taking a global lock. */
@@ -499,9 +414,7 @@ void zone_heat_record_write(zone_alloc_t *za, ztree_node_id_t node_id)
                           zone_monotonic_ts_16b(),
                           memory_order_relaxed);
 
-    /* Periodic median recompute.  Every Nth write triggers a one-shot
-     * recompute pass; only the thread that successfully claims the
-     * in_progress flag runs it, the rest skip and continue. */
+    /* Periodic median recompute; one thread at a time via CAS. */
     uint64_t writes_now = atomic_fetch_add_explicit(
         &za->heat_writes_since_recompute, 1, memory_order_relaxed) + 1;
     if (writes_now >= ZTREE_HEAT_RECOMPUTE_INTERVAL)
@@ -512,9 +425,7 @@ void zone_heat_record_write(zone_alloc_t *za, ztree_node_id_t node_id)
                                                     memory_order_acq_rel,
                                                     memory_order_relaxed))
         {
-            /* Reset the rolling counter inside the critical section so
-             * concurrent writers will only re-trigger once we've finished
-             * (and the next batch of writes accumulates). */
+            /* Reset counter before recompute so re-trigger waits for next batch. */
             atomic_store_explicit(&za->heat_writes_since_recompute, 0,
                                   memory_order_relaxed);
             recompute_heat_medians(za);
@@ -532,12 +443,8 @@ void zone_heat_reset(zone_alloc_t *za, ztree_node_id_t node_id)
 
     size_t idx = (size_t)(node_id % ZTREE_HEAT_TABLE_SIZE);
 
-    /* Counter goes to 0 — paper §3.1.1 reset rule.  Timestamp is set to
-     * "now" rather than 0 so the freshly-relocated node still flags as
-     * recently-active under the OR-combined hot test; otherwise zeroing
-     * both fields would force the node into the cold pool for one full
-     * recompute interval, recreating the very pathology percentile-based
-     * heat is meant to avoid. */
+    /* Counter → 0 (paper §3.1.1 reset).  Timestamp → "now" so relocated
+     * node still flags as recently-active (avoids cold-pool misclassification). */
     atomic_store_explicit(&za->heat_table[idx].access_count, 0, memory_order_relaxed);
     atomic_store_explicit(&za->heat_table[idx].last_write_ts,
                           zone_monotonic_ts_16b(),
@@ -554,26 +461,11 @@ void zone_heat_inherit(zone_alloc_t *za,
     size_t src_idx = (size_t)(src % ZTREE_HEAT_TABLE_SIZE);
     size_t dst_idx = (size_t)(dst % ZTREE_HEAT_TABLE_SIZE);
 
-    /* Same bucket via hash collision: dst and src physically share the
-     * heat slot.  Resetting dst's counter would also wipe src's counter
-     * (we'd be zeroing the parent's heat right at the moment we're
-     * trying to use it).  Leave the bucket alone — both nodes will share
-     * the parent's full heat under hash-collision semantics, which the
-     * heat table already accepts as approximate. */
+    /* Hash collision: same bucket, so resetting dst would wipe src. No-op. */
     if (src_idx == dst_idx)
         return;
 
-    /* Inherit semantics:
-     *   • Timestamp is COPIED from src.  This is the channel through
-     *     which the parent's hot/cold character propagates to the
-     *     freshly split sibling: zone_is_hot(dst) will test ts against
-     *     the median, getting the same recently-active signal the parent
-     *     would have.
-     *   • Counter is RESET to 0.  The new node hasn't actually been
-     *     written to yet, so its access frequency starts fresh.  This
-     *     also avoids inflating the heat-table population with phantom
-     *     duplicates of the parent's count, which would bias the median
-     *     upward over time. */
+    /* Copy timestamp (propagates hot/cold character), reset counter (fresh start). */
     uint16_t src_ts = atomic_load_explicit(&za->heat_table[src_idx].last_write_ts,
                                            memory_order_relaxed);
 
@@ -599,14 +491,10 @@ int zone_is_hot(zone_alloc_t *za, ztree_node_id_t node_id)
     uint16_t med_ts  = atomic_load_explicit(&za->heat_median_ts,
                                             memory_order_relaxed);
 
-    /* Bootstrap: medians not yet computed (or workload too sparse).
-     * Default to hot — putting new leaves in the larger hot pool avoids
-     * the default-cold pinning that funnels everything into 2 zones. */
+    /* Bootstrap: default to hot (avoids cold-pool funneling). */
     if (med_cnt == 0 && med_ts == 0)
         return 1;
 
-    /* Paper §3.1.1: hot iff Counter OR Timestamp is in the top 50th
-     * percentile.  We use strict > so exactly-at-median nodes count as
-     * cold (lower-half tiebreak). */
+    /* Hot iff Counter OR Timestamp > median (strict >; at-median → cold). */
     return (cnt > med_cnt) || (ts > med_ts) ? 1 : 0;
 }

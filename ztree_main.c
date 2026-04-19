@@ -1,17 +1,10 @@
 /*
- * ztree_main.c  –  ZTree core implementation
+ * ztree_main.c  –  ZTree core: cache, NLT, zone alloc, single-pass CoW insert
 
  gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
       ztree_nlt.c ztree_zone.c ztree_main.c \
       bench_main_ztree.c \
       -o build/bin/ztree -lzbd -lnvme -lpthread
- *
- * This file wires together:
- *   • 4-way set-associative global page cache
- *   • NLT-based page loading (ztree_nlt)
- *   • ILayer / LLayer zone allocation (ztree_zone)
- *   • Single-pass CoW insert (no temp IDs / no overlay)
- *   • Latch-crabbing descent + immediate page append + immediate NLT update
  *
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -108,22 +101,8 @@ static inline void prof_update_max(_Atomic(uint64_t) *target, uint64_t sample)
 }
 
 /* Per-zone write mutex (ZWL) profile recorders, broken out by zone group.
- *
- * Routing rule (matches zone_alloc_init layout in cow_open):
- *   zone_id ∈ [ilayer_pool_base, hot_pool_base)   → IZGroup (internal)
- *   zone_id ∈ [hot_pool_base,    cold_pool_base)  → LZGroup hot
- *   zone_id ≥  cold_pool_base                     → LZGroup cold
- *
- * Meta zones (0, 1) never reach this path — they go through zone_append_page
- * which doesn't take zone_write_locks — so we don't classify them.
- *
- * Every lock attempt (successful pwrite OR loop-retry on full/sealed zone)
- * adds one to acquire_count and contributes its wait time.  Hold time is
- * recorded separately at unlock so we can distinguish brief recheck-and-
- * release acquisitions from full pwrite-spanning holds.
- *
- * Aggregated total across all groups is computed at print time
- * (sum/max of the three per-group counters). */
+ * Routing: ilayer_pool_base..hot_pool_base → IZ, hot..cold → Hot, cold+ → Cold.
+ * Meta zones (0,1) bypass this path. Aggregated at print time. */
 
 typedef enum
 {
@@ -185,17 +164,8 @@ static inline void record_zwl_hold(ztree_t *t, uint32_t zone_id, uint64_t hold_n
     atomic_fetch_add_explicit(hold_p, hold_ns, memory_order_relaxed);
 }
 
-/*
- * node_wrlock / node_rdlock are instrumented for lock-contention profiling.
- * Each call samples wall time before and after the rwlock acquisition; the
- * delta is the wait time (= contention).  We don't measure hold time on
- * node latches because (a) node_unlock is shared between rd/wr unlocks and
- * doesn't know which type was acquired, and (b) hold time for these latches
- * is dominated by leaf modification + flush, which is already captured by
- * stat_apply_ns_*.
- *
- * Overhead per call: ≈ 60-80 ns (two clock_gettime + three relaxed atomics).
- */
+/* Instrumented node locking: records wait time for contention profiling.
+ * No hold-time tracking (rd/wr share node_unlock). */
 static inline void node_wrlock(ztree_t *t, ztree_node_id_t id)
 {
     if (id == ZTREE_INVALID_NODE_ID)
@@ -467,7 +437,6 @@ static int zone_append_page(ztree_t *t, uint32_t zone_id,
 {
     uint64_t cur_wp = atomic_fetch_add_explicit(
         &t->zone_wp_bytes[zone_id], ZTREE_PAGE_SIZE, memory_order_acq_rel);
-    // printf("cur_wp=%llu\n", (unsigned long long)cur_wp);
 
     int wfd;
     const void *wbuf;
@@ -499,43 +468,6 @@ static int zone_append_page(ztree_t *t, uint32_t zone_id,
 
     /* Mark zone full if write pointer reached capacity */
     uint64_t new_wp = cur_wp + ZTREE_PAGE_SIZE;
-    uint64_t zone_end = t->zones[zone_id].start + t->zones[zone_id].capacity;
-    if (new_wp >= zone_end)
-    {
-        atomic_store_explicit(&t->zone_full[zone_id], 1, memory_order_release);
-        zone_finish_if_full(t, zone_id);
-    }
-
-    return 0;
-}
-
-/*
- * zone_append_n_pages  –  vectorised append of n_pages contiguous pages to
- * zone_id.  Atomically reserves space for the entire batch.
- * Returns 0 on success, -1 on write error.
- */
-static int zone_append_n_pages(ztree_t *t, uint32_t zone_id,
-                               const void *buf, int n_pages,
-                               uint32_t *out_base_slot,
-                               ztree_pagenum_t *out_base_pn)
-{
-    uint64_t total = (uint64_t)n_pages * ZTREE_PAGE_SIZE;
-    uint64_t base_wp = atomic_fetch_add_explicit(
-        &t->zone_wp_bytes[zone_id], total, memory_order_acq_rel);
-
-    int wfd = (t->direct_fd >= 0) ? t->direct_fd : t->fd;
-    ssize_t written = pwrite(wfd, buf, (size_t)total, (off_t)base_wp);
-    if (written != (ssize_t)total)
-        return -1;
-
-    uint32_t base_slot = (uint32_t)((base_wp - t->zones[zone_id].start) / ZTREE_PAGE_SIZE);
-    if (out_base_slot)
-        *out_base_slot = base_slot;
-    if (out_base_pn)
-        *out_base_pn = (ztree_pagenum_t)(base_wp / ZTREE_PAGE_SIZE);
-
-    /* Check zone full */
-    uint64_t new_wp = base_wp + total;
     uint64_t zone_end = t->zones[zone_id].start + t->zones[zone_id].capacity;
     if (new_wp >= zone_end)
     {
@@ -839,26 +771,11 @@ static int load_latest_node(ztree_t *t,
 }
 
 /*
- * flush_page_immediate  –  write one CoW page to the ZNS device.
- *
- *   prev_zone   The zone_id where the node currently lives, or
- *               ZTREE_INVALID_ZONE_ID for new nodes (splits / first insert).
- *
- *   avoid_zone  When allocating via round-robin (splits), skip this zone_id
- *               so that a new sibling always lands in a different zone from
- *               its existing counterpart.  Pass ZTREE_INVALID_ZONE_ID to
- *               impose no constraint.
- *
- * Zone selection follows the paper (§3.2):
- *
- *   1. Stickiness (Normal Update): if prev_zone is valid and not yet sealed
- *      (< 95% used), append to prev_zone.  The ZoneID stays constant so
- *      parent nodes need NOT be rewritten.
- *
- *   2. Dynamic_Allocation (Split / Sealed Zone): call zone_alloc_* to pick
- *      the next zone in the group via Round-robin.  If the chosen zone equals
- *      avoid_zone, skip it – enforcing the paper's "sibling in a different
- *      zone" rule.
+ * flush_page_immediate  –  write one CoW page to ZNS.
+ * prev_zone: current zone (INVALID for new nodes).
+ * avoid_zone: skip this zone during allocation (split sibling rule).
+ * Tries sticky append first (same zone → no parent rewrite), falls back
+ * to dynamic allocation via round-robin (paper §3.2).
  */
 static void flush_page_immediate(ztree_t *t,
                                  ztree_page *pg,
@@ -872,11 +789,7 @@ static void flush_page_immediate(ztree_t *t,
     uint64_t cur_wp;
     bool     sticky_ok = false;
 
-    /* zwl_hold_start: timestamp at which the currently-held zone_write_lock
-     * was acquired.  Set after every successful lock acquisition (sticky or
-     * dynamic alloc) and consumed at the post-pwrite unlock (record_zwl_hold).
-     * For early-release paths (sealed / full / no-space) we record the small
-     * hold inline before unlocking. */
+    /* Timestamp of current zone_write_lock acquisition for hold-time profiling. */
     uint64_t zwl_hold_start = 0;
 
 retry_flush:
@@ -931,9 +844,7 @@ retry_flush:
             record_zwl_wait(t, target_zone, lock_t1 - lock_t0);
             zwl_hold_start = lock_t1;
 
-            /* Re-check zone_full under the lock: the allocator's expand
-             * path may have finished this zone between our pick and our
-             * lock acquisition. */
+            /* Re-check under lock: zone may have been finished between pick and lock. */
             if (atomic_load_explicit(&t->zone_full[target_zone],
                                      memory_order_acquire))
             {
@@ -1011,8 +922,7 @@ retry_flush:
         int e = errno;
         if (e == EOVERFLOW)
         {
-            /* Too many active zones — undo WP reservation, release lock,
-             * sleep briefly, then retry the entire zone selection. */
+            /* EOVERFLOW: too many active zones — undo, sleep, retry. */
             atomic_fetch_sub_explicit(&t->zone_wp_bytes[target_zone],
                                       ZTREE_PAGE_SIZE, memory_order_relaxed);
             record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
@@ -1061,10 +971,7 @@ retry_flush:
 
     if (pg->is_leaf)
     {
-        /* Paper §3.1.1: reset heat metadata when a node is reallocated to
-         * a new zone, so the next placement decision starts from a fresh
-         * signal.  zone_heat_reset() preserves the timestamp dimension so
-         * the freshly-relocated node still flags as recently-active. */
+        /* Reset heat on zone relocation (paper §3.1.1). */
         if (prev_zone != ZTREE_INVALID_ZONE_ID && prev_zone != target_zone)
             zone_heat_reset(&t->za, pg->node_id);
         zone_heat_record_write(&t->za, pg->node_id);
@@ -1131,7 +1038,6 @@ static int try_publish_root_if_unchanged(ztree_t *t,
                                          uint32_t root_slot)
 {
     uint64_t expected = expected_seq_even;
-    uint64_t actual_seq_before = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
     int cas_success = atomic_compare_exchange_strong_explicit(&t->volatile_sb.seq_no,
                                                               &expected,
                                                               expected_seq_even + 1,
@@ -1139,13 +1045,9 @@ static int try_publish_root_if_unchanged(ztree_t *t,
                                                               memory_order_acquire);
     if (!cas_success)
     {
-        // fprintf(stderr, "[DEBUG CAS FAIL] expected_seq=%lu (even=%lu), actual_before=%lu, actual_after_fail=%lu, root_nid=%u, root_zone=%u, root_slot=%u\n",
-        //         expected_seq_even, expected_seq_even, actual_seq_before, expected,
-        //         (unsigned)root_nid, root_zone, root_slot);
         return 0;
     }
 
-    // fprintf(stderr, "[DEBUG CAS OK] seq: %lu -> %lu (succeeded)\n", expected_seq_even, expected_seq_even + 2);
     atomic_store_explicit(&t->volatile_sb.root_node_id, root_nid, memory_order_release);
     atomic_store_explicit(&t->volatile_sb.root_zone_id, root_zone, memory_order_release);
     atomic_store_explicit(&t->volatile_sb.root_slot_id, root_slot, memory_order_release);
@@ -1221,72 +1123,17 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
             continue;
         }
 
-        /* ── Descent: read-crabbing through internals, upgrade at leaf ─────
+        /* ── Descent: read-crab internals, upgrade rdlock→wrlock at leaf ──
          *
-         * Concurrency model
-         * -----------------
-         *   • Hold an rdlock on at most one node at any time during descent.
-         *     Crabbing acquires the child's rdlock and releases the parent's,
-         *     mirroring the original wrlock-crab pattern but allowing many
-         *     concurrent descenders past internal nodes (notably the root).
+         * At most 1 rdlock held during descent (crabbing).  At leaf:
+         * unlock-rd, wrlock.  Non-atomic upgrade requires two post checks:
+         *   (a) Reload leaf via NLT — confirm still a leaf (tree may have grown).
+         *   (b) If depth≥1, reload parent — confirm it still routes to this leaf
+         *       (concurrent split may have moved our key to a sibling).
          *
-         *   • At the leaf, atomically *upgrade* by releasing the rdlock and
-         *     re-acquiring as wrlock.  pthread_rwlock has no atomic upgrade,
-         *     so a window opens between rd-unlock and wr-lock in which
-         *     another writer may modify or split the leaf.  Two post-upgrade
-         *     checks make this safe:
-         *
-         *       (a) Reload the leaf via NLT and confirm it is still a leaf.
-         *           If the tree grew (a new internal root was published),
-         *           our former "root-leaf" is now an internal — restart.
-         *
-         *       (b) If we descended through a parent (depth ≥ 1), reload
-         *           the latest parent snapshot and confirm it still routes
-         *           our key to *this* leaf_id.  A concurrent split of the
-         *           leaf demotes this leaf_id to the LEFT half; if our key
-         *           now belongs to the new right sibling (key ≥ promote_key),
-         *           the parent will route to a different child and we must
-         *           restart.
-         *
-         *     Once we hold the leaf's wrlock, no other thread can split the
-         *     leaf (splitting requires wrlock on the leaf), so the parent's
-         *     pointer to leaf_id is stable for the duration of our hold.
-         *
-         * Deadlock analysis
-         * -----------------
-         *   • Descent: top-down, ≤ 1 lock held at a time (rdlock during
-         *     internals, wrlock at the leaf after upgrade).
-         *
-         *   • Ascent (parent propagation): bottom-up, ≤ 1 lock held at a
-         *     time (one wrlock per parent level, released before moving up).
-         *
-         *   • Cross-thread interaction:
-         *       - Descender(rdlock @ X) vs Ascender(wrlock @ X): ascender
-         *         waits until all readers drain.  No cycle (descender does
-         *         not need anything the ascender holds).
-         *       - Two ascenders on different paths: each grabs one wrlock at
-         *         a time on its own ancestor chain.  No nested holds, no
-         *         cycle.
-         *       - Two upgraders on the SAME leaf: both release rdlock and
-         *         contend for the wrlock; pthread_rwlock serialises them.
-         *         No deadlock — just sequencing.
-         *
-         *   • Bucket-collision handling matches the original: same
-         *     latch_for_id → no relock during descent.  In the upgrade,
-         *     unlock-then-wrlock on the SAME physical lock is a no-op for
-         *     other holders' point of view (we briefly drop and re-take).
-         *     The post-upgrade reload picks up any concurrent change.
-         *
-         * Verification load
-         * -----------------
-         *   The parent reload in check (b) takes no node latch — we already
-         *   hold the leaf's wrlock, which prevents the leaf from being split,
-         *   so the parent's child_node_id pointer to leaf_id (if present) is
-         *   stable.  We only read parent fields, never mutate them.  Any
-         *   concurrent parent-side mutation (e.g., another insert splitting
-         *   a SIBLING leaf) shows up via load_latest_node returning the new
-         *   page; either the new page still routes us to leaf_id (we
-         *   proceed) or it doesn't (we restart).
+         * Deadlock-free: descent top-down ≤1 lock, ascent bottom-up ≤1 lock,
+         * no nested holds across threads. Bucket collisions: skip relock
+         * when parent/child share the same latch.
          */
         insert_path_frame path[MAX_HEIGHT];
         int depth = 0;
@@ -1327,18 +1174,14 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                     goto retry_insert;
                 }
 
-                /* Post-upgrade check (a): the tree may have grown, replacing
-                 * the root with a new internal node.  Our former root-leaf
-                 * is then an internal node and our key may belong elsewhere. */
+                /* Check (a): tree may have grown — restart if no longer a leaf. */
                 if (!f->page.is_leaf)
                 {
                     node_unlock(t, cur_id);
                     goto retry_insert;
                 }
 
-                /* Post-upgrade check (b): if we descended through a parent,
-                 * confirm the parent's latest snapshot still routes our key
-                 * to this leaf_id.  Catches the split-during-upgrade race. */
+                /* Check (b): confirm parent still routes our key here (split race). */
                 if (depth >= 1)
                 {
                     insert_path_frame *pf = &path[depth - 1];
@@ -1375,10 +1218,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                                           ? f->page.ptr_node_id
                                           : f->page.internal[cidx].child_node_id;
 
-            /* Parent/child can hash to the same latch bucket; in that case
-             * the rdlock we hold already covers the next node, so we must
-             * not relock or re-unlock (POSIX leaves recursive rdlock as
-             * implementation-defined). */
+            /* Skip relock if parent/child share the same latch bucket. */
             if (node_latch_for_id(t, next_id) != node_latch_for_id(t, cur_id))
             {
                 node_rdlock(t, next_id);
@@ -1443,14 +1283,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                 right.is_leaf = 1;
                 right.node_id = assign_stable_node_id(t);
 
-                /* Inherit heat from the parent leaf so the new sibling's
-                 * first allocation reflects the workload character of the
-                 * data it just received (right gets the upper half of the
-                 * pre-split keys, so its future write rate mirrors the
-                 * pre-split node's).  Without this, right starts at
-                 * (cnt=0, ts=0) and zone_is_hot classifies it cold under
-                 * the percentile policy, sticking it in the small cold
-                 * pool. */
+                /* Inherit parent's heat so sibling isn't misclassified cold. */
                 zone_heat_inherit(&t->za, right.node_id, leaf->node_id);
 
                 for (uint32_t i = 0; i < sp; i++)
@@ -1639,17 +1472,6 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
 
                 }
 
-                // if (prop.split || prop.left_zone_changed)
-                // {
-                //     fprintf(stderr,
-                //             "[ZTREE PARENT WRITE] node_id=%u child_id=%u child_zone=%u split=%d zone_changed=%d depth=%d\n",
-                //             (unsigned)par->node_id,
-                //             (unsigned)prop.left_id,
-                //             (unsigned)prop.left_zone,
-                //             prop.split,
-                //             prop.left_zone_changed,
-                //             level);
-                // }
 
                 node_unlock(t, pf->node_id);
             }
@@ -1679,13 +1501,6 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                                  &zchg, &new_root_zone, &new_root_slot);
             new_root_nid = nr.node_id;
             need_root_publish = 1;
-
-                // fprintf(stderr,
-                //     "[ZTREE ROOT SPLIT] new_root_id=%u root_zone=%u root_slot=%u seq_snapshot=%lu\n",
-                //     (unsigned)new_root_nid,
-                //     (unsigned)new_root_zone,
-                //     (unsigned)new_root_slot,
-                //     seq_snapshot);
         }
         else if (prop.left_id == root_nid && prop.left_zone_changed)
         {
@@ -1694,13 +1509,6 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
             new_root_zone = prop.left_zone;
             new_root_slot = prop.left_slot;
             need_root_publish = 1;
-
-                // fprintf(stderr,
-                //     "[ZTREE ROOT MOVE] root_id=%u root_zone=%u root_slot=%u seq_snapshot=%lu\n",
-                //     (unsigned)new_root_nid,
-                //     (unsigned)new_root_zone,
-                //     (unsigned)new_root_slot,
-                //     seq_snapshot);
         }
 
         {
@@ -1896,13 +1704,7 @@ cow_tree *cow_open(const char *path)
         }
     }
 
-    /*
-     * Zone layout (paper-aligned):
-     *   Zones 0-1:   RLayer (meta ping-pong)
-     *   Zones 2-17:  ILayer pool  → initial IZGroup = zones 2-5 (4 zones)
-     *   Zones 18+:   LLayer pool  → initial LZGroup = 8 zones (hot=6, cold=2)
-     *                80% of LLayer pool → hot; 20% → cold
-     */
+    /* Zone layout: 0-1 RLayer, 2-17 ILayer, 18+ LLayer (80/20 hot/cold). */
     uint32_t ilayer_pool_base  = ZTREE_ILAYER_ZONE_START;   /* 2  */
     uint32_t ilayer_pool_size  = ZTREE_ILAYER_POOL_SIZE;    /* 16 */
     uint32_t ilayer_init       = ZTREE_ILAYER_INIT_COUNT;   /* 4  */
@@ -2012,30 +1814,17 @@ void cow_close(cow_tree *t)
             (fl_samp > 0) ? (double)fl_sum / (double)fl_samp / 1000.0 : 0.0);
 
     /* ── Lock contention profile ─────────────────────────────────────────
-     * Three buckets: NLT global wrlock, per-zone write mutex (broken down
-     * by zone group + aggregated), node latches split into rd/wr.
+     * Three buckets: NLT global wrlock, per-zone write mutex (by zone
+     * group + aggregated), node latches (rd/wr).
      *
-     * Per-acquisition fields:
-     *   acquires       — total successful lock acquisitions
-     *                    (per-zone mutex counts each retry inside the
-     *                    dynamic-alloc loop separately)
-     *   wait_total_ms  — Σ time blocked waiting for the lock
-     *   avg_wait_us    — wait_total / acquires
-     *   max_wait_us    — worst single wait observed (tail latency)
-     *   hold_total_ms  — Σ time the lock was held (NLT/ZWL only)
-     *   avg_hold_us    — hold_total / acquires
+     * Fields: acquires, wait_total_ms, avg_wait_us, max_wait_us,
+     *         hold_total_ms, avg_hold_us (NLT/ZWL only).
      *
-     * Zone-group breakdown lets you see WHICH group is the bottleneck:
-     *   IZGroup typically ≪ hot (internal nodes are rare on insert).
-     *   LZGroup-Hot is usually the dominant one — heat-aware allocator
-     *   funnels frequent leaf writes here, and stickiness keeps them.
-     *   LZGroup-Cold should be quiet unless the heat heuristic is
-     *   misclassifying.
+     * Zone groups: IZGroup (internal, usually quiet), LZGroup-Hot
+     * (dominant bottleneck), LZGroup-Cold (quiet if heat works).
      *
-     * Reading the numbers:
-     *   • avg_wait ≈ avg_hold  → highly contended; threads queue up.
-     *   • avg_wait ≪ avg_hold  → uncontended; lock free most of the time.
-     *   • Large max_wait with small avg → bursty contention (tail). */
+     * Interpretation: avg_wait ≈ avg_hold → contended;
+     * avg_wait ≪ avg_hold → uncontended; large max_wait → bursty tail. */
     uint64_t nlt_wait  = atomic_load_explicit(&t->nlt.prof_wait_ns_sum,   memory_order_relaxed);
     uint64_t nlt_hold  = atomic_load_explicit(&t->nlt.prof_hold_ns_sum,   memory_order_relaxed);
     uint64_t nlt_cnt   = atomic_load_explicit(&t->nlt.prof_acquire_count, memory_order_relaxed);
@@ -2209,7 +1998,7 @@ ztree_record *ztree_find(ztree_t *t, int64_t key)
             }
         }
 
-        /* Resolve via NLT (NLT may have a fresher slot than the page field) */
+        /* NLT may have a fresher slot than the page field */
         nlt_location_t query = {
             .zone_id = child_zone,
             .node_id = child_nid,
@@ -2222,9 +2011,7 @@ ztree_record *ztree_find(ztree_t *t, int64_t key)
         }
         else
         {
-            /* Fallback: use zone_id from parent and scan the zone's latest slot.
-             * This should only happen if the NLT hasn't been populated yet,
-             * which is resolved by the lazy-population in load_page_by_pn.   */
+            /* NLT not yet populated — should be resolved by lazy population. */
             fprintf(stderr, "ztree_find: NLT miss for child node_id=%llu "
                             "(zone_hint=%u) – NLT not yet populated?\n",
                     (unsigned long long)child_nid, child_zone);

@@ -22,16 +22,8 @@
 
 #include "ztree_main.h"
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Internal constants
- * ═══════════════════════════════════════════════════════════════════════════ */
-
 #define MAX_HEIGHT 32
 #define RIGHTMOST_IDX UINT32_MAX
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Single-pass CoW insert path state
- * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct
 {
@@ -59,10 +51,6 @@ typedef struct
 #define MAX_BATCH_PAGES ZTREE_MAX_BATCH_PAGES
 #define MAX_NVME_PAGES ZTREE_MAX_NVME_PAGES
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Utility
- * ═══════════════════════════════════════════════════════════════════════════ */
-
 static inline uint64_t monotonic_ns(void)
 {
     struct timespec ts;
@@ -81,14 +69,12 @@ static inline uint64_t ztree_hash64(ztree_node_id_t id)
     return x;
 }
 
-/* Per-node latch mapping (hashed lock table). */
 static inline pthread_rwlock_t *node_latch_for_id(ztree_t *t, ztree_node_id_t id)
 {
     size_t idx = (size_t)(ztree_hash64(id) & (ZTREE_NODE_LATCH_BUCKETS - 1));
     return &t->node_latches[idx];
 }
 
-/* Atomic monotonic-max — used by all three lock-profile buckets. */
 static inline void prof_update_max(_Atomic(uint64_t) *target, uint64_t sample)
 {
     uint64_t cur = atomic_load_explicit(target, memory_order_relaxed);
@@ -100,10 +86,6 @@ static inline void prof_update_max(_Atomic(uint64_t) *target, uint64_t sample)
             return;
     }
 }
-
-/* Per-zone write mutex (ZWL) profile recorders, broken out by zone group.
- * Routing: ilayer_pool_base..hot_pool_base → IZ, hot..cold → Hot, cold+ → Cold.
- * Meta zones (0,1) bypass this path. Aggregated at print time. */
 
 typedef enum
 {
@@ -165,17 +147,6 @@ static inline void record_zwl_hold(ztree_t *t, uint32_t zone_id, uint64_t hold_n
     atomic_fetch_add_explicit(hold_p, hold_ns, memory_order_relaxed);
 }
 
-/*
- * node_wrlock / node_rdlock are instrumented for lock-contention profiling.
- * Each call samples wall time before and after the rwlock acquisition; the
- * delta is the wait time (= contention).  We don't measure hold time on
- * node latches because (a) node_unlock is shared between rd/wr unlocks and
- * doesn't know which type was acquired, and (b) hold time for these latches
- * is dominated by leaf modification + flush, which is already captured by
- * stat_apply_ns_*.
- *
- * Overhead per call: ≈ 60-80 ns (two clock_gettime + three relaxed atomics).
- */
 static inline void node_wrlock(ztree_t *t, ztree_node_id_t id)
 {
     if (id == ZTREE_INVALID_NODE_ID)
@@ -209,7 +180,6 @@ static inline void node_unlock(ztree_t *t, ztree_node_id_t id)
     pthread_rwlock_unlock(node_latch_for_id(t, id));
 }
 
-/* Helper: compute physical page number from zone + slot */
 static inline ztree_pagenum_t zone_slot_to_pn(ztree_t *t,
                                               uint32_t zone_id,
                                               uint32_t slot_id)
@@ -218,7 +188,6 @@ static inline ztree_pagenum_t zone_slot_to_pn(ztree_t *t,
     return (ztree_pagenum_t)(off / ZTREE_PAGE_SIZE);
 }
 
-/* Helper: compute byte offset from zone + slot */
 static inline uint64_t zone_slot_to_offset(ztree_t *t,
                                            uint32_t zone_id,
                                            uint32_t slot_id)
@@ -226,10 +195,7 @@ static inline uint64_t zone_slot_to_offset(ztree_t *t,
     return t->zones[zone_id].start + (uint64_t)slot_id * ZTREE_PAGE_SIZE;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * 4-Way Set-Associative Global Page Cache
- * (keyed by physical page number; unchanged from cow_gtx_cache_p design)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* 4-way set-associative page cache */
 
 static void cache_init(ztree_t *t)
 {
@@ -276,8 +242,7 @@ static int cache_lookup(ztree_t *t, ztree_pagenum_t pn, ztree_page *dst)
     {
         if (set->ways[i].valid && set->ways[i].tag == pn)
         {
-            /* Cache hit: bump LRU counter */
-            set->ways[i].lru_counter = atomic_fetch_add_explicit(
+                set->ways[i].lru_counter = atomic_fetch_add_explicit(
                 &t->cache_lru_clock, 1, memory_order_relaxed);
             *dst = set->ways[i].data;
             pthread_mutex_unlock(&set->lock);
@@ -297,7 +262,6 @@ static void cache_insert(ztree_t *t, ztree_pagenum_t pn, const ztree_page *src)
                                                memory_order_relaxed);
     pthread_mutex_lock(&set->lock);
 
-    /* Find an empty slot or the LRU victim */
     int victim = 0;
     uint64_t min_lru = set->ways[0].lru_counter;
     for (int i = 0; i < ZTREE_CACHE_WAYS; i++)
@@ -322,23 +286,13 @@ static void cache_insert(ztree_t *t, ztree_pagenum_t pn, const ztree_page *src)
     pthread_mutex_unlock(&set->lock);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Page I/O (NLT-aware load)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* Page I/O: cache → disk, with lazy NLT population on miss */
 
-/*
- * load_page_by_pn  –  read a page from the global cache or disk.
- * Also populates the NLT lazily: when a page is first read from disk, its
- * embedded (zone_id, slot_id, node_id) fields are registered in the NLT so
- * that subsequent lookups avoid disk I/O.
- */
 static void load_page_by_pn(ztree_t *t, ztree_pagenum_t pn, ztree_page *dst)
 {
-    /* 1. Try the global cache */
     if (cache_lookup(t, pn, dst))
         return;
 
-    /* 2. Cache miss → read from device */
     atomic_fetch_add_explicit(&t->stat_cache_miss, 1, memory_order_relaxed);
 
     off_t off = (off_t)pn * ZTREE_PAGE_SIZE;
@@ -346,7 +300,6 @@ static void load_page_by_pn(ztree_t *t, ztree_pagenum_t pn, ztree_page *dst)
 
     if (t->direct_fd >= 0)
     {
-        /* O_DIRECT requires aligned buffer */
         void *raw;
         if (posix_memalign(&raw, ZTREE_PAGE_SIZE, ZTREE_PAGE_SIZE) != 0)
         {
@@ -373,10 +326,8 @@ static void load_page_by_pn(ztree_t *t, ztree_pagenum_t pn, ztree_page *dst)
         }
     }
 
-    /* 3. Warm the cache */
     cache_insert(t, pn, dst);
 
-    /* 4. Lazy NLT population: register this node's stable location */
     if (dst->node_id != ZTREE_INVALID_NODE_ID)
     {
         nlt_location_t loc = {
@@ -388,11 +339,6 @@ static void load_page_by_pn(ztree_t *t, ztree_pagenum_t pn, ztree_page *dst)
     }
 }
 
-/*
- * load_page_by_nlt  –  resolve a node's physical location via the NLT,
- * then delegate to load_page_by_pn.
- * Returns 1 on success, 0 if the node_id is not in the NLT.
- */
 static int load_page_by_nlt(ztree_t *t, const nlt_location_t *loc,
                             ztree_page *dst)
 {
@@ -407,14 +353,6 @@ static int load_page_by_nlt(ztree_t *t, const nlt_location_t *loc,
     return 1;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Zone write helpers
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/*
- * zone_finish_if_full  –  call zbd_finish_zones() on a full zone so the
- * device can reclaim its active-zone slot.
- */
 static void zone_finish_if_full(ztree_t *t, uint32_t zone_id)
 {
     if (zone_id >= t->info.nr_zones)
@@ -433,13 +371,6 @@ static void zone_finish_if_full(ztree_t *t, uint32_t zone_id)
                 rc, errno, strerror(errno));
 }
 
-/*
- * zone_append_page  –  append one page to zone_id at the current write
- * pointer.  Atomically advances the in-memory WP tracking.
- *
- * On success returns 0 and sets *out_slot_id and *out_pn.
- * Returns -1 if the zone is full after this write.
- */
 static int zone_append_page(ztree_t *t, uint32_t zone_id,
                             const void *buf,
                             uint32_t *out_slot_id,
@@ -454,7 +385,6 @@ static int zone_append_page(ztree_t *t, uint32_t zone_id,
     _Alignas(ZTREE_PAGE_SIZE) char local_bounce[ZTREE_PAGE_SIZE];
     if (t->direct_fd >= 0)
     {
-        /* O_DIRECT requires page-aligned buffer; use per-call stack buffer. */
         memcpy(local_bounce, buf, ZTREE_PAGE_SIZE);
         wfd = t->direct_fd;
         wbuf = local_bounce;
@@ -470,14 +400,12 @@ static int zone_append_page(ztree_t *t, uint32_t zone_id,
         return -1;
     }
 
-    /* Compute slot ID from the offset */
     uint32_t slot = (uint32_t)((cur_wp - t->zones[zone_id].start) / ZTREE_PAGE_SIZE);
     if (out_slot_id)
         *out_slot_id = slot;
     if (out_pn)
         *out_pn = (ztree_pagenum_t)(cur_wp / ZTREE_PAGE_SIZE);
 
-    /* Mark zone full if write pointer reached capacity */
     uint64_t new_wp = cur_wp + ZTREE_PAGE_SIZE;
     uint64_t zone_end = t->zones[zone_id].start + t->zones[zone_id].capacity;
     if (new_wp >= zone_end)
@@ -489,46 +417,7 @@ static int zone_append_page(ztree_t *t, uint32_t zone_id,
     return 0;
 }
 
-/*
- * zone_append_n_pages  –  vectorised append of n_pages contiguous pages to
- * zone_id.  Atomically reserves space for the entire batch.
- * Returns 0 on success, -1 on write error.
- */
-static int zone_append_n_pages(ztree_t *t, uint32_t zone_id,
-                               const void *buf, int n_pages,
-                               uint32_t *out_base_slot,
-                               ztree_pagenum_t *out_base_pn)
-{
-    uint64_t total = (uint64_t)n_pages * ZTREE_PAGE_SIZE;
-    uint64_t base_wp = atomic_fetch_add_explicit(
-        &t->zone_wp_bytes[zone_id], total, memory_order_acq_rel);
-
-    int wfd = (t->direct_fd >= 0) ? t->direct_fd : t->fd;
-    ssize_t written = pwrite(wfd, buf, (size_t)total, (off_t)base_wp);
-    if (written != (ssize_t)total)
-        return -1;
-
-    uint32_t base_slot = (uint32_t)((base_wp - t->zones[zone_id].start) / ZTREE_PAGE_SIZE);
-    if (out_base_slot)
-        *out_base_slot = base_slot;
-    if (out_base_pn)
-        *out_base_pn = (ztree_pagenum_t)(base_wp / ZTREE_PAGE_SIZE);
-
-    /* Check zone full */
-    uint64_t new_wp = base_wp + total;
-    uint64_t zone_end = t->zones[zone_id].start + t->zones[zone_id].capacity;
-    if (new_wp >= zone_end)
-    {
-        atomic_store_explicit(&t->zone_full[zone_id], 1, memory_order_release);
-        zone_finish_if_full(t, zone_id);
-    }
-
-    return 0;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Meta zone management (RLayer – superblock ping-pong)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* Meta zone ping-pong (RLayer) */
 
 static inline uint32_t other_meta_zone(uint32_t z)
 {
@@ -550,7 +439,6 @@ static void activate_meta_zone(ztree_t *t, uint32_t zone_id, uint64_t version)
                           t->zones[zone_id].start, memory_order_release);
     atomic_store_explicit(&t->zone_full[zone_id], 0, memory_order_release);
 
-    /* Write zone header in slot 0 */
     ztree_zone_header zh;
     memset(&zh, 0, sizeof zh);
     zh.magic = ZTREE_ZH_MAGIC;
@@ -565,7 +453,7 @@ static void activate_meta_zone(ztree_t *t, uint32_t zone_id, uint64_t version)
     }
 
     t->active_meta_zone = zone_id;
-    t->meta_wp = 1; /* slot 0 used by zone header */
+    t->meta_wp = 1;
     t->meta_version = version;
 }
 
@@ -626,7 +514,6 @@ static void load_superblock(ztree_t *t)
 
     if (sbwp0 == 0 && sbwp1 == 0)
     {
-        /* Fresh device – format superblock */
         memset(&t->durable_sb, 0, sizeof t->durable_sb);
         t->durable_sb.root_node_id = ZTREE_INVALID_NODE_ID;
         t->durable_sb.root_zone_id = ZTREE_INVALID_ZONE_ID;
@@ -640,8 +527,7 @@ static void load_superblock(ztree_t *t)
     {
         ztree_superblock_entry *best;
         uint32_t best_zone;
-        uint64_t best_wp;
-        uint64_t best_meta_version;
+        uint64_t best_wp, best_meta_version;
 
         if (sbwp0 > 0 && sbwp1 > 0)
         {
@@ -894,13 +780,14 @@ retry_flush:
 
         while (bq->count > 0)
         {
-            /* If batch is small, briefly wait for more entries to arrive.
-             * This trades ~50us latency for larger batches (→ fewer
-             * pwrite syscalls → higher device BW utilization). */
-            if (bq->count < ZTREE_BATCH_MAX)
+            /* Brief wait if previous batch had >1 entries (=other threads
+             * are actively enqueueing).  At 1T, last_batch_size stays 1
+             * → never waits → zero overhead.  At 16T+, last_batch_size
+             * grows → waits → larger batches → fewer pwrite calls. */
+            if (bq->count < ZTREE_BATCH_MAX && bq->last_batch_size > 1)
             {
                 pthread_mutex_unlock(&bq->mu);
-                usleep(50);
+                usleep(20);
                 pthread_mutex_lock(&bq->mu);
                 if (bq->count == 0)
                     continue;
@@ -1066,6 +953,7 @@ retry_flush:
 
             /* Signal all entries as done. */
             pthread_mutex_lock(&bq->mu);
+            bq->last_batch_size = N;
             for (uint32_t i = 0; i < N; i++)
                 atomic_store_explicit(&batch[i]->done, 1, memory_order_release);
             pthread_cond_broadcast(&bq->cv);
@@ -1261,73 +1149,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
             continue;
         }
 
-        /* ── Descent: read-crabbing through internals, upgrade at leaf ─────
-         *
-         * Concurrency model
-         * -----------------
-         *   • Hold an rdlock on at most one node at any time during descent.
-         *     Crabbing acquires the child's rdlock and releases the parent's,
-         *     mirroring the original wrlock-crab pattern but allowing many
-         *     concurrent descenders past internal nodes (notably the root).
-         *
-         *   • At the leaf, atomically *upgrade* by releasing the rdlock and
-         *     re-acquiring as wrlock.  pthread_rwlock has no atomic upgrade,
-         *     so a window opens between rd-unlock and wr-lock in which
-         *     another writer may modify or split the leaf.  Two post-upgrade
-         *     checks make this safe:
-         *
-         *       (a) Reload the leaf via NLT and confirm it is still a leaf.
-         *           If the tree grew (a new internal root was published),
-         *           our former "root-leaf" is now an internal — restart.
-         *
-         *       (b) If we descended through a parent (depth ≥ 1), reload
-         *           the latest parent snapshot and confirm it still routes
-         *           our key to *this* leaf_id.  A concurrent split of the
-         *           leaf demotes this leaf_id to the LEFT half; if our key
-         *           now belongs to the new right sibling (key ≥ promote_key),
-         *           the parent will route to a different child and we must
-         *           restart.
-         *
-         *     Once we hold the leaf's wrlock, no other thread can split the
-         *     leaf (splitting requires wrlock on the leaf), so the parent's
-         *     pointer to leaf_id is stable for the duration of our hold.
-         *
-         * Deadlock analysis
-         * -----------------
-         *   • Descent: top-down, ≤ 1 lock held at a time (rdlock during
-         *     internals, wrlock at the leaf after upgrade).
-         *
-         *   • Ascent (parent propagation): bottom-up, ≤ 1 lock held at a
-         *     time (one wrlock per parent level, released before moving up).
-         *
-         *   • Cross-thread interaction:
-         *       - Descender(rdlock @ X) vs Ascender(wrlock @ X): ascender
-         *         waits until all readers drain.  No cycle (descender does
-         *         not need anything the ascender holds).
-         *       - Two ascenders on different paths: each grabs one wrlock at
-         *         a time on its own ancestor chain.  No nested holds, no
-         *         cycle.
-         *       - Two upgraders on the SAME leaf: both release rdlock and
-         *         contend for the wrlock; pthread_rwlock serialises them.
-         *         No deadlock — just sequencing.
-         *
-         *   • Bucket-collision handling matches the original: same
-         *     latch_for_id → no relock during descent.  In the upgrade,
-         *     unlock-then-wrlock on the SAME physical lock is a no-op for
-         *     other holders' point of view (we briefly drop and re-take).
-         *     The post-upgrade reload picks up any concurrent change.
-         *
-         * Verification load
-         * -----------------
-         *   The parent reload in check (b) takes no node latch — we already
-         *   hold the leaf's wrlock, which prevents the leaf from being split,
-         *   so the parent's child_node_id pointer to leaf_id (if present) is
-         *   stable.  We only read parent fields, never mutate them.  Any
-         *   concurrent parent-side mutation (e.g., another insert splitting
-         *   a SIBLING leaf) shows up via load_latest_node returning the new
-         *   page; either the new page still routes us to leaf_id (we
-         *   proceed) or it doesn't (we restart).
-         */
+        /* ── Descent: read-crabbing through internals, upgrade at leaf ───── */
         insert_path_frame path[MAX_HEIGHT];
         int depth = 0;
 
@@ -1679,18 +1501,6 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
 
                 }
 
-                // if (prop.split || prop.left_zone_changed)
-                // {
-                //     fprintf(stderr,
-                //             "[ZTREE PARENT WRITE] node_id=%u child_id=%u child_zone=%u split=%d zone_changed=%d depth=%d\n",
-                //             (unsigned)par->node_id,
-                //             (unsigned)prop.left_id,
-                //             (unsigned)prop.left_zone,
-                //             prop.split,
-                //             prop.left_zone_changed,
-                //             level);
-                // }
-
                 node_unlock(t, pf->node_id);
             }
         }
@@ -1734,13 +1544,6 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
             new_root_zone = prop.left_zone;
             new_root_slot = prop.left_slot;
             need_root_publish = 1;
-
-                // fprintf(stderr,
-                //     "[ZTREE ROOT MOVE] root_id=%u root_zone=%u root_slot=%u seq_snapshot=%lu\n",
-                //     (unsigned)new_root_nid,
-                //     (unsigned)new_root_zone,
-                //     (unsigned)new_root_slot,
-                //     seq_snapshot);
         }
 
         {
@@ -2081,31 +1884,7 @@ void cow_close(cow_tree *t)
             (unsigned long long)par_rew,
             (fl_samp > 0) ? (double)fl_sum / (double)fl_samp / 1000.0 : 0.0);
 
-    /* ── Lock contention profile ─────────────────────────────────────────
-     * Three buckets: NLT global wrlock, per-zone write mutex (broken down
-     * by zone group + aggregated), node latches split into rd/wr.
-     *
-     * Per-acquisition fields:
-     *   acquires       — total successful lock acquisitions
-     *                    (per-zone mutex counts each retry inside the
-     *                    dynamic-alloc loop separately)
-     *   wait_total_ms  — Σ time blocked waiting for the lock
-     *   avg_wait_us    — wait_total / acquires
-     *   max_wait_us    — worst single wait observed (tail latency)
-     *   hold_total_ms  — Σ time the lock was held (NLT/ZWL only)
-     *   avg_hold_us    — hold_total / acquires
-     *
-     * Zone-group breakdown lets you see WHICH group is the bottleneck:
-     *   IZGroup typically ≪ hot (internal nodes are rare on insert).
-     *   LZGroup-Hot is usually the dominant one — heat-aware allocator
-     *   funnels frequent leaf writes here, and stickiness keeps them.
-     *   LZGroup-Cold should be quiet unless the heat heuristic is
-     *   misclassifying.
-     *
-     * Reading the numbers:
-     *   • avg_wait ≈ avg_hold  → highly contended; threads queue up.
-     *   • avg_wait ≪ avg_hold  → uncontended; lock free most of the time.
-     *   • Large max_wait with small avg → bursty contention (tail). */
+    /* ── Lock contention profile ───────────────────────────────────────── */
     uint64_t nlt_wait  = atomic_load_explicit(&t->nlt.prof_wait_ns_sum,   memory_order_relaxed);
     uint64_t nlt_hold  = atomic_load_explicit(&t->nlt.prof_hold_ns_sum,   memory_order_relaxed);
     uint64_t nlt_cnt   = atomic_load_explicit(&t->nlt.prof_acquire_count, memory_order_relaxed);

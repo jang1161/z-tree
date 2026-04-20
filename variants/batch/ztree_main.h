@@ -32,6 +32,7 @@ typedef struct {
     pthread_cond_t   cv;
     zbatch_entry_t  *entries[ZTREE_BATCH_MAX];
     uint32_t         count;
+    uint32_t         last_batch_size;  /* previous drain's batch size */
     bool             flushing;
 } zbatch_queue_t;
 

@@ -92,29 +92,10 @@ struct ztree_s {
     _Atomic(uint64_t) stat_flush_ns_samples;
 
     /* ── Lock contention profile ──────────────────────────────────────
-     * Three independent buckets corresponding to the three main lock
-     * categories on the insert hot path:
-     *
-     *   prof_zwl_{iz,hot,cold}_* : per-zone write mutex, broken out by
-     *                  the target zone's group:
-     *                    _iz_   = IZGroup (internal-node zones)
-     *                    _hot_  = LZGroup hot zones (frequent leaf writes)
-     *                    _cold_ = LZGroup cold zones (rare leaf writes)
-     *                  Aggregated total (sum/max of the three) is
-     *                  computed at print time.  This breakdown isolates
-     *                  per-group contention pressure — typically hot
-     *                  dominates while iz/cold sit nearly idle.
-     *
-     *   prof_nl_rd_*: hashed node latches taken in shared (read) mode
-     *                 during the read-crab descent.  Should be near zero
-     *                 if the read-crab change is paying off.
-     *
-     *   prof_nl_wr_*: hashed node latches taken in exclusive (write) mode.
-     *                 Includes the leaf upgrade and every parent wrlock
-     *                 during ascent.  Wait here = leaf hot-spot or
-     *                 split-storm contention.
-     *
-     * (NLT global wrlock stats live on nlt_t directly — see ztree_nlt.h.) */
+     * prof_zwl_{iz,hot,cold}_*: per-zone write mutex by zone group.
+     * prof_nl_rd_*: node latch shared (read-crab descent).
+     * prof_nl_wr_*: node latch exclusive (leaf upgrade + ascent).
+     * NLT wrlock stats on nlt_t (see ztree_nlt.h). */
     _Atomic(uint64_t) prof_zwl_iz_wait_ns_sum;
     _Atomic(uint64_t) prof_zwl_iz_hold_ns_sum;
     _Atomic(uint64_t) prof_zwl_iz_acquire_count;

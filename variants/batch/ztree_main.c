@@ -1,18 +1,11 @@
 /*
- * ztree_main.c  –  ZTree core implementation
+ * ztree_main.c  –  ZTree core: cache, NLT, zone alloc, single-pass CoW insert
 
  gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
       ztree_nlt.c ztree_zone.c variants/batch/ztree_main.c \
       bench_main_ztree.c \
       -I variants/batch -I . \
       -o build/bin/ztree_batch4 -lzbd -lnvme -lpthread
- *
- * This file wires together:
- *   • 4-way set-associative global page cache
- *   • NLT-based page loading (ztree_nlt)
- *   • ILayer / LLayer zone allocation (ztree_zone)
- *   • Single-pass CoW insert (no temp IDs / no overlay)
- *   • Latch-crabbing descent + immediate page append + immediate NLT update
  *
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -109,22 +102,8 @@ static inline void prof_update_max(_Atomic(uint64_t) *target, uint64_t sample)
 }
 
 /* Per-zone write mutex (ZWL) profile recorders, broken out by zone group.
- *
- * Routing rule (matches zone_alloc_init layout in cow_open):
- *   zone_id ∈ [ilayer_pool_base, hot_pool_base)   → IZGroup (internal)
- *   zone_id ∈ [hot_pool_base,    cold_pool_base)  → LZGroup hot
- *   zone_id ≥  cold_pool_base                     → LZGroup cold
- *
- * Meta zones (0, 1) never reach this path — they go through zone_append_page
- * which doesn't take zone_write_locks — so we don't classify them.
- *
- * Every lock attempt (successful pwrite OR loop-retry on full/sealed zone)
- * adds one to acquire_count and contributes its wait time.  Hold time is
- * recorded separately at unlock so we can distinguish brief recheck-and-
- * release acquisitions from full pwrite-spanning holds.
- *
- * Aggregated total across all groups is computed at print time
- * (sum/max of the three per-group counters). */
+ * Routing: ilayer_pool_base..hot_pool_base → IZ, hot..cold → Hot, cold+ → Cold.
+ * Meta zones (0,1) bypass this path. Aggregated at print time. */
 
 typedef enum
 {
@@ -915,6 +894,18 @@ retry_flush:
 
         while (bq->count > 0)
         {
+            /* If batch is small, briefly wait for more entries to arrive.
+             * This trades ~50us latency for larger batches (→ fewer
+             * pwrite syscalls → higher device BW utilization). */
+            if (bq->count < ZTREE_BATCH_MAX)
+            {
+                pthread_mutex_unlock(&bq->mu);
+                usleep(50);
+                pthread_mutex_lock(&bq->mu);
+                if (bq->count == 0)
+                    continue;
+            }
+
             uint32_t N = bq->count;
             if (N > ZTREE_BATCH_MAX)
                 N = ZTREE_BATCH_MAX;

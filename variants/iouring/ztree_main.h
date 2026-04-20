@@ -30,6 +30,7 @@ struct ztree_s {
 
     _Atomic(uint64_t) *zone_wp_bytes;
     _Atomic(uint8_t)  *zone_full;
+    _Atomic(uint32_t) *zone_inflight;  /* per-zone in-flight write count */
 
     /* Superblock / root state */
     ztree_superblock_entry  durable_sb;

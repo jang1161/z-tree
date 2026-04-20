@@ -48,43 +48,51 @@ static inline struct io_uring *get_thread_ring(ztree_t *t)
     return &t->rings[tl_ring_idx];
 }
 
-/* io_uring write: submit one write and wait for completion */
-static int uring_write(ztree_t *t, const void *buf, size_t len, off_t offset)
+/*
+ * uring_submit_write: prep + submit (called under zone lock).
+ * uring_wait_write:   wait for CQE (called after zone unlock).
+ *
+ * Split so zone lock covers only WP reservation + submit (ordering),
+ * while the actual I/O completion wait runs lock-free.
+ */
+static int uring_submit_write(ztree_t *t, const void *buf, size_t len, off_t offset)
 {
     struct io_uring *ring = get_thread_ring(t);
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
     if (!sqe)
     {
-        /* SQ full — reap one CQE first */
         struct io_uring_cqe *cqe;
         io_uring_wait_cqe(ring, &cqe);
         io_uring_cqe_seen(ring, cqe);
         sqe = io_uring_get_sqe(ring);
         if (!sqe)
         {
-            fprintf(stderr, "uring_write: failed to get SQE\n");
+            fprintf(stderr, "uring_submit_write: failed to get SQE\n");
             return -1;
         }
     }
 
     io_uring_prep_write(sqe, t->direct_fd, buf, (unsigned)len, offset);
-    sqe->flags |= IOSQE_FIXED_FILE ? 0 : 0; /* no fixed file */
 
     int ret = io_uring_submit(ring);
     if (ret < 0)
     {
-        fprintf(stderr, "uring_write: submit failed: %s\n", strerror(-ret));
+        fprintf(stderr, "uring_submit_write: submit failed: %s\n", strerror(-ret));
         return ret;
     }
+    return 0;
+}
 
+static int uring_wait_write(ztree_t *t)
+{
+    struct io_uring *ring = get_thread_ring(t);
     struct io_uring_cqe *cqe;
-    ret = io_uring_wait_cqe(ring, &cqe);
+    int ret = io_uring_wait_cqe(ring, &cqe);
     if (ret < 0)
     {
-        fprintf(stderr, "uring_write: wait_cqe failed: %s\n", strerror(-ret));
+        fprintf(stderr, "uring_wait_write: wait_cqe failed: %s\n", strerror(-ret));
         return ret;
     }
-
     int res = cqe->res;
     io_uring_cqe_seen(ring, cqe);
     return res;
@@ -730,7 +738,7 @@ static void write_superblock_sync(ztree_t *t)
     /* Rotate meta zone if it is almost full */
     if (t->meta_wp >= t->zones[t->active_meta_zone].capacity / ZTREE_PAGE_SIZE)
     {
-        fprintf(stderr, "[ztree] meta zone full, rotating\n");
+        fprintf(stderr, "[ztree_iouring] meta zone full, rotating\n");
         rotate_meta_zone(t);
     }
 
@@ -833,13 +841,16 @@ static int load_latest_node(ztree_t *t,
 }
 
 /*
- * flush_page_immediate  –  io_uring variant.
+ * flush_page_immediate  –  io_uring variant (submit-under-lock).
  *
- * Same zone_write_lock for per-zone WP serialization (ZNS requires
- * sequential writes within a zone), but uses io_uring instead of pwrite.
- * Benefit: cross-zone I/O pipelining — while one thread holds zone A's
- * lock and awaits CQE, another thread's write to zone B is already
- * in the NVMe submission queue, increasing effective device iodepth.
+ * Zone lock covers WP reservation + io_uring submit (ensures ordering).
+ * Unlock BEFORE waiting for CQE (I/O completion runs lock-free).
+ *
+ *   lock → WP reserve → memcpy → submit → unlock → wait_cqe
+ *   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *        lock hold ≈ 1-2us (no I/O wait)
+ *
+ * Requires: echo mq-deadline > /sys/block/nvmeXnY/queue/scheduler
  */
 static void flush_page_immediate(ztree_t *t,
                                  ztree_page *pg,
@@ -932,7 +943,7 @@ retry_flush:
             cur_wp = wp;
             atomic_store_explicit(&t->zone_wp_bytes[target_zone],
                                    wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
-            break;
+            break;  /* lock still held */
         }
     }
 
@@ -942,22 +953,44 @@ retry_flush:
     pg->zone_id = target_zone;
     pg->slot_id = slot_id;
 
-    /* Write via io_uring instead of pwrite.
-     * Zone lock is still held — same serialization as base — but the
-     * io_uring submission allows the NVMe driver to overlap this zone's
-     * I/O with other zones' in-flight writes from other threads. */
+    /* ── Phase 2: submit under lock, wait after unlock ───────────────── */
     _Alignas(ZTREE_PAGE_SIZE) char local_bounce[ZTREE_PAGE_SIZE];
     memcpy(local_bounce, pg, ZTREE_PAGE_SIZE);
 
-    int res = uring_write(t, local_bounce, ZTREE_PAGE_SIZE, (off_t)cur_wp);
+    /* Mark in-flight BEFORE submit so seal won't race */
+    atomic_fetch_add_explicit(&t->zone_inflight[target_zone], 1, memory_order_release);
+
+    int submit_ret = uring_submit_write(t, local_bounce, ZTREE_PAGE_SIZE, (off_t)cur_wp);
+
+    /* Unlock after submit — write is in the kernel queue, ordering guaranteed */
+    record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
+    pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+
+    if (submit_ret < 0)
+    {
+        atomic_fetch_sub_explicit(&t->zone_inflight[target_zone], 1, memory_order_relaxed);
+        atomic_fetch_sub_explicit(&t->zone_wp_bytes[target_zone],
+                                  ZTREE_PAGE_SIZE, memory_order_relaxed);
+        usleep(500);
+        goto retry_flush;
+    }
+
+    /* Wait for completion — lock-free */
+    int res = uring_wait_write(t);
+
+    /* Write landed (or failed) — no longer in-flight */
+    atomic_fetch_sub_explicit(&t->zone_inflight[target_zone], 1, memory_order_release);
+
     if (res != (int)ZTREE_PAGE_SIZE)
     {
-        if (res == -EOVERFLOW || (res < 0 && errno == EOVERFLOW))
+        /* EIO (-5): likely max_active_zones exceeded — new zone can't open
+         * while old zone's in-flight writes keep it OPEN at device level.
+         * EOVERFLOW (-75): same root cause via different error path.
+         * Both are transient — retry after seal completes. */
+        if (res == -EIO || res == -EOVERFLOW)
         {
             atomic_fetch_sub_explicit(&t->zone_wp_bytes[target_zone],
                                       ZTREE_PAGE_SIZE, memory_order_relaxed);
-            record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-            pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
             usleep(500);
             goto retry_flush;
         }
@@ -968,14 +1001,14 @@ retry_flush:
         exit(EXIT_FAILURE);
     }
 
-    record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-    pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
-
-    /* Post-write bookkeeping */
+    /* Post-write bookkeeping — wait for all in-flight writes before seal */
     uint64_t new_wp = cur_wp + ZTREE_PAGE_SIZE;
     uint64_t zone_end = t->zones[target_zone].start + t->zones[target_zone].capacity;
     if (new_wp >= zone_end)
     {
+        while (atomic_load_explicit(&t->zone_inflight[target_zone],
+                                     memory_order_acquire) > 0)
+            usleep(10);
         atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
         zone_seal_and_replace(&t->za, target_zone);
     }
@@ -994,6 +1027,9 @@ retry_flush:
     {
         atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
         nlt_set_zone_sealed(&t->nlt, target_zone, true);
+        while (atomic_load_explicit(&t->zone_inflight[target_zone],
+                                     memory_order_acquire) > 0)
+            usleep(10);
         zone_seal_and_replace(&t->za, target_zone);
     }
 
@@ -1577,8 +1613,43 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
 
 cow_tree *cow_open(const char *path)
 {
-    fprintf(stderr, "[ztree] opening %s  cache_sets=%d ways=%d\n",
+    fprintf(stderr, "[ztree_iouring] opening %s  cache_sets=%d ways=%d\n",
             path, ZTREE_CACHE_NUM_SETS, ZTREE_CACHE_WAYS);
+
+    /* Check mq-deadline scheduler — required for per-zone write ordering */
+    {
+        /* Extract block device name from path (e.g. /dev/nvme3n2 → nvme3n2) */
+        const char *devname = strrchr(path, '/');
+        devname = devname ? devname + 1 : path;
+        char sched_path[256];
+        snprintf(sched_path, sizeof sched_path,
+                 "/sys/block/%s/queue/scheduler", devname);
+        FILE *fp = fopen(sched_path, "r");
+        if (fp)
+        {
+            char buf[256];
+            if (fgets(buf, sizeof buf, fp))
+            {
+                if (!strstr(buf, "[mq-deadline]"))
+                {
+                    fprintf(stderr,
+                            "[ztree_iouring] ERROR: mq-deadline scheduler required!\n"
+                            "  current: %s"
+                            "  run: echo mq-deadline | sudo tee %s\n",
+                            buf, sched_path);
+                    fclose(fp);
+                    return NULL;
+                }
+                fprintf(stderr, "[ztree_iouring] scheduler: mq-deadline (OK)\n");
+            }
+            fclose(fp);
+        }
+        else
+        {
+            fprintf(stderr, "[ztree_iouring] WARNING: cannot read %s, "
+                    "mq-deadline not verified\n", sched_path);
+        }
+    }
 
     ztree_t *t = calloc(1, sizeof *t);
     if (!t)
@@ -1616,12 +1687,14 @@ cow_tree *cow_open(const char *path)
     t->zones = calloc(t->info.nr_zones, sizeof *t->zones);
     t->zone_wp_bytes = calloc(t->info.nr_zones, sizeof *t->zone_wp_bytes);
     t->zone_full = calloc(t->info.nr_zones, sizeof *t->zone_full);
-    if (!t->zones || !t->zone_wp_bytes || !t->zone_full)
+    t->zone_inflight = calloc(t->info.nr_zones, sizeof *t->zone_inflight);
+    if (!t->zones || !t->zone_wp_bytes || !t->zone_full || !t->zone_inflight)
     {
         perror("calloc zones");
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
+        free(t->zone_inflight);
         zbd_close(t->fd);
         free(t);
         return NULL;
@@ -1634,6 +1707,7 @@ cow_tree *cow_open(const char *path)
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
+        free(t->zone_inflight);
         zbd_close(t->fd);
         free(t);
         return NULL;
@@ -1747,7 +1821,7 @@ cow_tree *cow_open(const char *path)
             exit(EXIT_FAILURE);
         }
     }
-    fprintf(stderr, "[ztree] io_uring: %d rings, depth=%d\n",
+    fprintf(stderr, "[ztree_iouring] io_uring: %d rings, depth=%d\n",
             t->ring_count, ZTREE_RING_DEPTH);
 
     /* Zone layout: 0-1 RLayer, 2-17 ILayer, 18+ LLayer (80/20 hot/cold). */
@@ -1777,10 +1851,10 @@ cow_tree *cow_open(const char *path)
                     t->zone_write_locks);
 
     fprintf(stderr,
-            "[ztree] ILayer pool [%u, %u)  init_group=%u\n",
+            "[ztree_iouring] ILayer pool [%u, %u)  init_group=%u\n",
             ilayer_pool_base, ilayer_pool_base + ilayer_pool_size, ilayer_init);
     fprintf(stderr,
-            "[ztree] LLayer hot-pool [%u, %u)  init_group=%u"
+            "[ztree_iouring] LLayer hot-pool [%u, %u)  init_group=%u"
             "  cold-pool [%u, %u)  init_group=%u\n",
             hot_pool_base,  hot_pool_base  + hot_pool_size,  ZTREE_LZGROUP_HOT_INIT,
             cold_pool_base, cold_pool_base + cold_pool_size, ZTREE_LZGROUP_COLD_INIT);
@@ -1806,6 +1880,7 @@ cow_tree *cow_open(const char *path)
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
+        free(t->zone_inflight);
         zbd_close(t->fd);
         free(t);
         return NULL;
@@ -1962,6 +2037,7 @@ void cow_close(cow_tree *t)
     free(t->zones);
     free(t->zone_wp_bytes);
     free(t->zone_full);
+    free(t->zone_inflight);
 
     zbd_close(t->fd);
     if (t->direct_fd >= 0)

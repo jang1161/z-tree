@@ -1869,101 +1869,73 @@ void cow_close(cow_tree *t)
      * Zone groups: IZGroup (internal, usually quiet), LZGroup-Hot
      * (dominant bottleneck), LZGroup-Cold (quiet if heat works).
      *
-     * Interpretation: avg_wait ≈ avg_hold → contended;
-     * avg_wait ≪ avg_hold → uncontended; large max_wait → bursty tail. */
+     */
     uint64_t nlt_wait  = atomic_load_explicit(&t->nlt.prof_wait_ns_sum,   memory_order_relaxed);
     uint64_t nlt_hold  = atomic_load_explicit(&t->nlt.prof_hold_ns_sum,   memory_order_relaxed);
     uint64_t nlt_cnt   = atomic_load_explicit(&t->nlt.prof_acquire_count, memory_order_relaxed);
-    uint64_t nlt_max   = atomic_load_explicit(&t->nlt.prof_max_wait_ns,   memory_order_relaxed);
 
-    /* Per-group ZWL stats. */
     uint64_t iz_wait   = atomic_load_explicit(&t->prof_zwl_iz_wait_ns_sum,   memory_order_relaxed);
     uint64_t iz_hold   = atomic_load_explicit(&t->prof_zwl_iz_hold_ns_sum,   memory_order_relaxed);
     uint64_t iz_cnt    = atomic_load_explicit(&t->prof_zwl_iz_acquire_count, memory_order_relaxed);
-    uint64_t iz_max    = atomic_load_explicit(&t->prof_zwl_iz_max_wait_ns,   memory_order_relaxed);
 
     uint64_t hot_wait  = atomic_load_explicit(&t->prof_zwl_hot_wait_ns_sum,   memory_order_relaxed);
     uint64_t hot_hold  = atomic_load_explicit(&t->prof_zwl_hot_hold_ns_sum,   memory_order_relaxed);
     uint64_t hot_cnt   = atomic_load_explicit(&t->prof_zwl_hot_acquire_count, memory_order_relaxed);
-    uint64_t hot_max   = atomic_load_explicit(&t->prof_zwl_hot_max_wait_ns,   memory_order_relaxed);
 
     uint64_t cold_wait = atomic_load_explicit(&t->prof_zwl_cold_wait_ns_sum,   memory_order_relaxed);
     uint64_t cold_hold = atomic_load_explicit(&t->prof_zwl_cold_hold_ns_sum,   memory_order_relaxed);
     uint64_t cold_cnt  = atomic_load_explicit(&t->prof_zwl_cold_acquire_count, memory_order_relaxed);
-    uint64_t cold_max  = atomic_load_explicit(&t->prof_zwl_cold_max_wait_ns,   memory_order_relaxed);
 
-    /* Aggregated: sum the totals/counts, take max of the maxes. */
     uint64_t zwl_wait  = iz_wait + hot_wait + cold_wait;
     uint64_t zwl_hold  = iz_hold + hot_hold + cold_hold;
     uint64_t zwl_cnt   = iz_cnt  + hot_cnt  + cold_cnt;
-    uint64_t zwl_max   = iz_max;
-    if (hot_max  > zwl_max) zwl_max = hot_max;
-    if (cold_max > zwl_max) zwl_max = cold_max;
 
     uint64_t nlrd_wait = atomic_load_explicit(&t->prof_nl_rd_wait_ns_sum,   memory_order_relaxed);
     uint64_t nlrd_cnt  = atomic_load_explicit(&t->prof_nl_rd_acquire_count, memory_order_relaxed);
-    uint64_t nlrd_max  = atomic_load_explicit(&t->prof_nl_rd_max_wait_ns,   memory_order_relaxed);
 
     uint64_t nlwr_wait = atomic_load_explicit(&t->prof_nl_wr_wait_ns_sum,   memory_order_relaxed);
     uint64_t nlwr_cnt  = atomic_load_explicit(&t->prof_nl_wr_acquire_count, memory_order_relaxed);
-    uint64_t nlwr_max  = atomic_load_explicit(&t->prof_nl_wr_max_wait_ns,   memory_order_relaxed);
 
 #define _AVG_US(sum, cnt) ((cnt) > 0 ? (double)(sum) / (double)(cnt) / 1000.0 : 0.0)
 #define _MS(ns)           ((double)(ns) / 1.0e6)
-#define _US(ns)           ((double)(ns) / 1.0e3)
+#define _PCT(part, total) ((total) > 0 ? 100.0 * (double)(part) / (double)(total) : 0.0)
 
     fprintf(stderr,
             "\n[ztree lock profile]\n"
-            "  NLT global wrlock:\n"
-            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
-            "    hold_total=%.2f ms (avg %.2f us)\n"
-            "  Per-zone write mutex — TOTAL:\n"
-            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
-            "    hold_total=%.2f ms (avg %.2f us)\n"
-            "  Per-zone write mutex — IZGroup (zones [%u, %u)):\n"
-            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
-            "    hold_total=%.2f ms (avg %.2f us)\n"
-            "  Per-zone write mutex — LZGroup-Hot (zones [%u, %u)):\n"
-            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
-            "    hold_total=%.2f ms (avg %.2f us)\n"
-            "  Per-zone write mutex — LZGroup-Cold (zones [%u, %u)):\n"
-            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
-            "    hold_total=%.2f ms (avg %.2f us)\n"
-            "  Node latch rdlock (descent crab):\n"
-            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n"
-            "  Node latch wrlock (leaf upgrade + ascent):\n"
-            "    acquires=%llu  wait_total=%.2f ms (avg %.2f us, max %.2f us)\n",
-            (unsigned long long)nlt_cnt,
-            _MS(nlt_wait), _AVG_US(nlt_wait, nlt_cnt), _US(nlt_max),
-            _MS(nlt_hold), _AVG_US(nlt_hold, nlt_cnt),
-
-            (unsigned long long)zwl_cnt,
-            _MS(zwl_wait), _AVG_US(zwl_wait, zwl_cnt), _US(zwl_max),
-            _MS(zwl_hold), _AVG_US(zwl_hold, zwl_cnt),
-
-            t->za.ilayer_pool_base, t->za.hot_pool_base,
-            (unsigned long long)iz_cnt,
-            _MS(iz_wait), _AVG_US(iz_wait, iz_cnt), _US(iz_max),
-            _MS(iz_hold), _AVG_US(iz_hold, iz_cnt),
-
-            t->za.hot_pool_base, t->za.cold_pool_base,
-            (unsigned long long)hot_cnt,
-            _MS(hot_wait), _AVG_US(hot_wait, hot_cnt), _US(hot_max),
-            _MS(hot_hold), _AVG_US(hot_hold, hot_cnt),
-
-            t->za.cold_pool_base, t->za.cold_pool_base + t->za.cold_pool_size,
-            (unsigned long long)cold_cnt,
-            _MS(cold_wait), _AVG_US(cold_wait, cold_cnt), _US(cold_max),
-            _MS(cold_hold), _AVG_US(cold_hold, cold_cnt),
-
-            (unsigned long long)nlrd_cnt,
-            _MS(nlrd_wait), _AVG_US(nlrd_wait, nlrd_cnt), _US(nlrd_max),
-            (unsigned long long)nlwr_cnt,
-            _MS(nlwr_wait), _AVG_US(nlwr_wait, nlwr_cnt), _US(nlwr_max));
+            "  %-16s %10s %12s %12s %12s\n",
+            "", "acquires", "wait", "avg_wait", "avg_hold");
+    fprintf(stderr,
+            "  %-16s %10llu %10.1f ms %10.2f us %10.2f us\n",
+            "NLT wrlock", (unsigned long long)nlt_cnt,
+            _MS(nlt_wait), _AVG_US(nlt_wait, nlt_cnt), _AVG_US(nlt_hold, nlt_cnt));
+    fprintf(stderr,
+            "  %-16s %10llu %10.1f ms %10.2f us %10.2f us\n",
+            "Zone wrlock", (unsigned long long)zwl_cnt,
+            _MS(zwl_wait), _AVG_US(zwl_wait, zwl_cnt), _AVG_US(zwl_hold, zwl_cnt));
+    fprintf(stderr,
+            "    IZ   (%5.1f%%) %10llu %10.1f ms %10.2f us %10.2f us\n",
+            _PCT(iz_wait, zwl_wait), (unsigned long long)iz_cnt,
+            _MS(iz_wait), _AVG_US(iz_wait, iz_cnt), _AVG_US(iz_hold, iz_cnt));
+    fprintf(stderr,
+            "    Hot  (%5.1f%%) %10llu %10.1f ms %10.2f us %10.2f us\n",
+            _PCT(hot_wait, zwl_wait), (unsigned long long)hot_cnt,
+            _MS(hot_wait), _AVG_US(hot_wait, hot_cnt), _AVG_US(hot_hold, hot_cnt));
+    fprintf(stderr,
+            "    Cold (%5.1f%%) %10llu %10.1f ms %10.2f us %10.2f us\n",
+            _PCT(cold_wait, zwl_wait), (unsigned long long)cold_cnt,
+            _MS(cold_wait), _AVG_US(cold_wait, cold_cnt), _AVG_US(cold_hold, cold_cnt));
+    fprintf(stderr,
+            "  %-16s %10llu %10.1f ms %10.2f us\n",
+            "Node rdlock", (unsigned long long)nlrd_cnt,
+            _MS(nlrd_wait), _AVG_US(nlrd_wait, nlrd_cnt));
+    fprintf(stderr,
+            "  %-16s %10llu %10.1f ms %10.2f us\n",
+            "Node wrlock", (unsigned long long)nlwr_cnt,
+            _MS(nlwr_wait), _AVG_US(nlwr_wait, nlwr_cnt));
 
 #undef _AVG_US
 #undef _MS
-#undef _US
+#undef _PCT
 
     /* Destroy subsystems */
     cache_destroy(t);

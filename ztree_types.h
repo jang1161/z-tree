@@ -172,7 +172,7 @@ typedef struct ztree_insert_req {
 /* ═══════════════════════════════════════════════════════════════════════════
  * Global page cache (4-way set-associative, LRU eviction)
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define ZTREE_CACHE_NUM_SETS   (4096)
+#define ZTREE_CACHE_NUM_SETS   (1024)
 #define ZTREE_CACHE_WAYS       4
 
 typedef struct {

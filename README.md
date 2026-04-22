@@ -31,7 +31,7 @@ ZNS (Zoned Namespace) SSD의 순차 쓰기 제약에 최적화된 Copy-on-Write 
 ```bash
 gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
     ztree_nlt.c ztree_zone.c ztree_main.c bench_main_ztree.c \
-    -o build/bin/ztree -lzbd -lnvme -lpthread
+    -o build/ztree -lzbd -lnvme -lpthread
 ```
 
 의존성: `libzbd`, `libnvme`, `pthread`
@@ -40,10 +40,10 @@ gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
 
 ```bash
 # 10M 키, 16스레드
-sudo ./build/bin/ztree 10000000 16 /dev/nvme3n2
+sudo ./build/ztree 10000000 16 /dev/nvme3n2
 
 # 1M 키, 모든 스레드 수 (1,2,4,8,16,32,64) 자동 테스트
-sudo ./build/bin/ztree 1000000 0 /dev/nvme3n2
+sudo ./build/ztree 1000000 0 /dev/nvme3n2
 ```
 
 ## 존 모니터링

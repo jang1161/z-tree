@@ -16,11 +16,11 @@ gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
     ztree_nlt.c ztree_zone.c variants/batch/ztree_main.c \
     bench_main_ztree.c \
     -I variants/batch -I . \
-    -o build/bin/ztree_batch4 -lzbd -lnvme -lpthread
+    -o build/ztree_batch4 -lzbd -lnvme -lpthread
 ```
 
 ## 실행
 
 ```bash
-sudo ./build/bin/ztree_batch4 10000000 16 /dev/nvme3n2
+sudo ./build/ztree_batch4 10000000 16 /dev/nvme3n2
 ```

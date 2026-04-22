@@ -6,7 +6,7 @@
       ztree_nlt.c ztree_zone.c ztree_main.c \
       variants/shard/ztree_shard.c variants/shard/bench_shard.c \
       -I. -Ivariants/shard \
-      -o build/bin/ztree_shard -lzbd -lnvme -lpthread
+      -o build/ztree_shard -lzbd -lnvme -lpthread
  */
 
 #define _POSIX_C_SOURCE 200809L

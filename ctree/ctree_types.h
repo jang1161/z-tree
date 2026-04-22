@@ -46,7 +46,6 @@
  */
 #define CTREE_CNS_DEV_PATH         "/dev/nvme3n1"
 #define CTREE_CNS_ZONE_ID          ((uint32_t)0xFFFFFFFEU)  /* sentinel: page lives on CNS */
-#define CTREE_CNS_INITIAL_OFFSET   0ULL   /* first usable byte on CNS device */
 
 /* Magic numbers for on-disk structures */
 #define ZTREE_ZH_MAGIC   0x5A545245455A4E53ULL  /* "ZTREEZNS" */

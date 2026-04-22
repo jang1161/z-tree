@@ -30,7 +30,6 @@ struct ztree_s {
 
     /* ── CNS fallback ──────────────────────────────────────────────────── */
     int              cns_fd;          /* fd for /dev/nvme3n1 (O_RDWR|O_DIRECT) */
-    _Atomic(uint64_t) cns_wp;        /* next write offset on CNS (bump allocator) */
     _Atomic(uint64_t) stat_cns_writes; /* pages written to CNS due to contention */
 
     /* Superblock / root state */

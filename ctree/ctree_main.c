@@ -928,9 +928,10 @@ retry_flush:
             if (t->cns_fd >= 0)
             {
                 cns_path = true;
-                /* Atomic bump-allocate a slot on the CNS device. */
-                cur_wp = atomic_fetch_add_explicit(&t->cns_wp, ZTREE_PAGE_SIZE,
-                                                   memory_order_relaxed);
+                /* CNS offset = node_id * PAGE_SIZE.  node_id is unique per
+                 * node, so no coordination needed.  Repeated writes to the
+                 * same node just overwrite the same LBA (FTL handles it). */
+                cur_wp = (uint64_t)pg->node_id * ZTREE_PAGE_SIZE;
                 target_zone = CTREE_CNS_ZONE_ID;
             }
             else
@@ -988,9 +989,9 @@ retry_flush:
     }
     else
     {
-        /* CNS: slot_id = byte offset / page size on CNS device */
-        slot_id = (uint32_t)(cur_wp / ZTREE_PAGE_SIZE);
-        pn = (ztree_pagenum_t)(cur_wp / ZTREE_PAGE_SIZE);  /* CNS-local page number */
+        /* CNS: slot_id = node_id (offset = node_id * PAGE_SIZE) */
+        slot_id = pg->node_id;
+        pn = (ztree_pagenum_t)pg->node_id;
     }
 
     /* Stamp zone_id and slot_id before the write. */
@@ -1738,7 +1739,6 @@ cow_tree *cow_open(const char *path)
                 CTREE_CNS_DEV_PATH, strerror(errno));
         /* Non-fatal: we can still operate (degrades to ztree behavior). */
     }
-    atomic_store_explicit(&t->cns_wp, CTREE_CNS_INITIAL_OFFSET, memory_order_relaxed);
     atomic_store_explicit(&t->stat_cns_writes, 0, memory_order_relaxed);
 
     /* Allocate per-zone arrays */

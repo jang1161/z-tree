@@ -918,51 +918,111 @@ retry_flush:
         /* else: trylock failed (contention) — fall through to Step 3 (CNS) */
     }
 
-    /* ── Step 1.5: CNS node trying to return to ZNS (trylock, non-blocking) ─
-     * If prev_zone was CNS, try one zone with trylock.
-     * Success → ZNS (zone_changed=1, parent rewrite).
-     * Failure → back to CNS (Step 3).                                       */
+    /* ── Step 1.5: CNS node trying to return to ZNS ─────────────────────
+     * pg->zone_id still holds the "home zone" (preserved during CNS spill).
+     * 1a) trylock(home_zone): contention → CNS (no alloc attempt)
+     *                         full       → try Step 1.5b
+     *                         success    → home zone, NO parent rewrite
+     * 1b) trylock(zone_alloc): one attempt for a new zone
+     *                          success → new zone, parent rewrite (legitimate)
+     *                          fail    → CNS                                  */
+    bool cns_returned_home = false;
     if (!sticky_ok && !cns_path && prev_zone == CTREE_CNS_ZONE_ID)
     {
-        target_zone = pg->is_leaf
-                          ? zone_alloc_llayer(&t->za, pg->node_id, avoid_zone)
-                          : zone_alloc_ilayer(&t->za, avoid_zone);
-        int rc = pthread_mutex_trylock(&t->zone_write_locks[target_zone]);
-        if (rc == 0)
-        {
-            uint64_t lock_t1 = monotonic_ns();
-            record_zwl_wait(t, target_zone, 0);
-            zwl_hold_start = lock_t1;
+        uint32_t home_zone = pg->zone_id;  /* preserved from before CNS spill */
+        /* Validate home_zone: must be in ILayer or LLayer range.
+         * New nodes (memset → zone_id=0) or corrupted values are invalid. */
+        bool home_valid = (home_zone >= ZTREE_ILAYER_ZONE_START)
+                       && (home_zone < t->info.nr_zones);
+        bool home_full = !home_valid
+                      || atomic_load_explicit(&t->zone_full[home_zone],
+                                             memory_order_acquire);
 
-            if (!atomic_load_explicit(&t->zone_full[target_zone], memory_order_acquire))
+        if (!home_full)
+        {
+            /* 1a) Try home zone — contention → straight to CNS */
+            int rc = pthread_mutex_trylock(&t->zone_write_locks[home_zone]);
+            if (rc == 0)
             {
-                uint64_t zone_end = t->zones[target_zone].start
-                                    + t->zones[target_zone].capacity;
-                uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target_zone],
+                uint64_t lock_t1 = monotonic_ns();
+                record_zwl_wait(t, home_zone, 0);
+                zwl_hold_start = lock_t1;
+
+                uint64_t zone_end = t->zones[home_zone].start
+                                    + t->zones[home_zone].capacity;
+                uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[home_zone],
                                                    memory_order_relaxed);
+
                 if (wp + ZTREE_PAGE_SIZE <= zone_end)
                 {
                     cur_wp = wp;
-                    atomic_store_explicit(&t->zone_wp_bytes[target_zone],
+                    target_zone = home_zone;
+                    atomic_store_explicit(&t->zone_wp_bytes[home_zone],
                                            wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
                     sticky_ok = true;
-                    /* This is a real zone migration (CNS → ZNS) */
+                    cns_returned_home = true;  /* parent is already correct */
+                }
+                else
+                {
+                    /* Home zone full under lock — seal it */
+                    home_full = true;
+                }
+
+                if (!sticky_ok)
+                {
+                    record_zwl_hold(t, home_zone, monotonic_ns() - zwl_hold_start);
+                    pthread_mutex_unlock(&t->zone_write_locks[home_zone]);
                 }
             }
-            if (!sticky_ok)
-            {
-                record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-                pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
-            }
+            /* else: trylock failed (contention) → straight to CNS (Step 3) */
         }
-        /* else: trylock failed → fall through to Step 3 (CNS) */
+
+        if (!sticky_ok && home_full)
+        {
+            /* 1b) Home zone full — try one new zone via allocator */
+            target_zone = pg->is_leaf
+                              ? zone_alloc_llayer(&t->za, pg->node_id, avoid_zone)
+                              : zone_alloc_ilayer(&t->za, avoid_zone);
+            int rc = pthread_mutex_trylock(&t->zone_write_locks[target_zone]);
+            if (rc == 0)
+            {
+                uint64_t lock_t1 = monotonic_ns();
+                record_zwl_wait(t, target_zone, 0);
+                zwl_hold_start = lock_t1;
+
+                if (!atomic_load_explicit(&t->zone_full[target_zone],
+                                          memory_order_acquire))
+                {
+                    uint64_t zone_end = t->zones[target_zone].start
+                                        + t->zones[target_zone].capacity;
+                    uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target_zone],
+                                                       memory_order_relaxed);
+                    if (wp + ZTREE_PAGE_SIZE <= zone_end)
+                    {
+                        cur_wp = wp;
+                        atomic_store_explicit(&t->zone_wp_bytes[target_zone],
+                                               wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
+                        sticky_ok = true;
+                        /* Real zone migration — parent rewrite will be needed */
+                    }
+                }
+                if (!sticky_ok)
+                {
+                    record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
+                    pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+                }
+            }
+            /* else: trylock failed → fall through to Step 3 (CNS) */
+        }
     }
 
     /* ── Step 2: dynamic allocation (trylock, zone-full / new node) ──────
      * Only reached when prev_zone is INVALID (new node) or zone is full.
      * NOT for CNS nodes — they use Step 1.5 above.
      * Trylock: success → real zone migration (parent rewrite).
-     *          failure → fall through to Step 3 (CNS).                  */
+     *          failure → fall through to Step 3 (CNS).
+     * Either way, set pg->zone_id to the allocated zone as home_zone
+     * so that if this node later goes to CNS, it has a valid home.       */
     if (!sticky_ok && !cns_path
         && (prev_zone == ZTREE_INVALID_ZONE_ID
             || (prev_zone != CTREE_CNS_ZONE_ID
@@ -971,6 +1031,8 @@ retry_flush:
         target_zone = pg->is_leaf
                           ? zone_alloc_llayer(&t->za, pg->node_id, avoid_zone)
                           : zone_alloc_ilayer(&t->za, avoid_zone);
+        /* Pre-set home zone so CNS fallback has a valid target for return */
+        pg->zone_id = target_zone;
 
         int rc = pthread_mutex_trylock(&t->zone_write_locks[target_zone]);
         if (rc == 0)
@@ -1060,7 +1122,11 @@ retry_flush:
         pn = (ztree_pagenum_t)pg->node_id | (1ULL << 63);
     }
 
-    pg->zone_id = target_zone;
+    /* CNS: preserve pg->zone_id as "home zone" for future return.
+     * ZNS: stamp the actual zone.  Bitmap tells read path if node is on CNS. */
+    if (!cns_path)
+        pg->zone_id = target_zone;
+    /* else: keep pg->zone_id unchanged (home zone) */
     pg->slot_id = slot_id;
 
     /* ── Write to device ───────────────────────────────────────────── */
@@ -1185,11 +1251,22 @@ retry_flush:
 
     atomic_fetch_add_explicit(&t->stat_page_appends, 1, memory_order_relaxed);
 
-    /* ── zone_changed: CNS spills are NOT zone changes (no parent rewrite).
-     * Only real ZNS zone migrations trigger parent rewrite.              */
+    /* ── zone_changed determination ────────────────────────────────────
+     * No parent rewrite needed:
+     *   - CNS spill (bitmap tracks it)
+     *   - Same zone stickiness
+     *   - CNS → home zone return (parent already has correct zone_id)
+     * Parent rewrite needed:
+     *   - Real zone migration (zone-full → new zone, or new node)       */
     if (cns_path)
     {
-        /* CNS fallback — parent does NOT need updating */
+        if (out_zone_changed)
+            *out_zone_changed = 0;
+        atomic_fetch_add_explicit(&t->stat_nlt_only_updates, 1, memory_order_relaxed);
+    }
+    else if (cns_returned_home)
+    {
+        /* Returned to home zone — parent's child_zone_id is already correct */
         if (out_zone_changed)
             *out_zone_changed = 0;
         atomic_fetch_add_explicit(&t->stat_nlt_only_updates, 1, memory_order_relaxed);
@@ -1198,14 +1275,14 @@ retry_flush:
              && prev_zone != CTREE_CNS_ZONE_ID
              && prev_zone == target_zone)
     {
-        /* Same zone (stickiness) — no parent rewrite */
+        /* Same zone stickiness */
         if (out_zone_changed)
             *out_zone_changed = 0;
         atomic_fetch_add_explicit(&t->stat_nlt_only_updates, 1, memory_order_relaxed);
     }
     else
     {
-        /* Real zone migration (zone-full / new node) — parent rewrite needed */
+        /* Real zone migration — parent rewrite needed */
         if (out_zone_changed)
             *out_zone_changed = 1;
         atomic_fetch_add_explicit(&t->stat_zone_changes, 1, memory_order_relaxed);

@@ -100,6 +100,22 @@ static inline int cns_bitmap_test(ztree_t *t, ztree_node_id_t nid)
     return (atomic_load_explicit(&t->cns_bitmap[byte], memory_order_relaxed) & bit) != 0;
 }
 
+/* ── Zone busy counter ──────────────────────────────────────────────────── */
+static inline void zones_busy_inc(ztree_t *t)
+{
+    atomic_fetch_add_explicit(&t->cns_zones_busy, 1, memory_order_relaxed);
+}
+static inline void zones_busy_dec(ztree_t *t)
+{
+    atomic_fetch_sub_explicit(&t->cns_zones_busy, 1, memory_order_relaxed);
+}
+static inline void zones_busy_sample(ztree_t *t)
+{
+    uint32_t cur = atomic_load_explicit(&t->cns_zones_busy, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_zones_busy_sum, cur, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_zones_busy_samples, 1, memory_order_relaxed);
+}
+
 static inline uint64_t ztree_hash64(ztree_node_id_t id)
 {
     uint64_t x = id;
@@ -885,6 +901,7 @@ retry_flush:
         {
             uint64_t lock_t1 = monotonic_ns();
             record_zwl_wait(t, prev_zone, 0);
+            zones_busy_inc(t);
             zwl_hold_start = lock_t1;
 
             uint64_t zone_start = t->zones[prev_zone].start;
@@ -908,6 +925,7 @@ retry_flush:
             {
                 /* Zone full — need dynamic alloc (Step 2). */
                 record_zwl_hold(t, prev_zone, monotonic_ns() - zwl_hold_start);
+                zones_busy_dec(t);
                 pthread_mutex_unlock(&t->zone_write_locks[prev_zone]);
                 /* Mark zone full and seal. */
                 atomic_store_explicit(&t->zone_full[prev_zone], 1, memory_order_release);
@@ -946,6 +964,7 @@ retry_flush:
             {
                 uint64_t lock_t1 = monotonic_ns();
                 record_zwl_wait(t, home_zone, 0);
+                zones_busy_inc(t);
                 zwl_hold_start = lock_t1;
 
                 uint64_t zone_end = t->zones[home_zone].start
@@ -960,21 +979,30 @@ retry_flush:
                     atomic_store_explicit(&t->zone_wp_bytes[home_zone],
                                            wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
                     sticky_ok = true;
-                    cns_returned_home = true;  /* parent is already correct */
+                    cns_returned_home = true;
+                    atomic_fetch_add_explicit(&t->stat_cns_return_home, 1, memory_order_relaxed);
                 }
                 else
                 {
-                    /* Home zone full under lock — seal it */
                     home_full = true;
+                    atomic_fetch_add_explicit(&t->stat_cns_home_full, 1, memory_order_relaxed);
                 }
 
                 if (!sticky_ok)
                 {
                     record_zwl_hold(t, home_zone, monotonic_ns() - zwl_hold_start);
+                    zones_busy_dec(t);
                     pthread_mutex_unlock(&t->zone_write_locks[home_zone]);
                 }
             }
-            /* else: trylock failed (contention) → straight to CNS (Step 3) */
+            else
+            {
+                atomic_fetch_add_explicit(&t->stat_cns_home_contend, 1, memory_order_relaxed);
+            }
+        }
+        else
+        {
+            atomic_fetch_add_explicit(&t->stat_cns_home_full, 1, memory_order_relaxed);
         }
 
         if (!sticky_ok && home_full)
@@ -983,6 +1011,7 @@ retry_flush:
             target_zone = pg->is_leaf
                               ? zone_alloc_llayer(&t->za, pg->node_id, avoid_zone)
                               : zone_alloc_ilayer(&t->za, avoid_zone);
+            pg->zone_id = target_zone;  /* update home zone for future CNS returns */
             int rc = pthread_mutex_trylock(&t->zone_write_locks[target_zone]);
             if (rc == 0)
             {
@@ -1003,16 +1032,16 @@ retry_flush:
                         atomic_store_explicit(&t->zone_wp_bytes[target_zone],
                                                wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
                         sticky_ok = true;
-                        /* Real zone migration — parent rewrite will be needed */
+                        atomic_fetch_add_explicit(&t->stat_cns_return_new, 1, memory_order_relaxed);
                     }
                 }
                 if (!sticky_ok)
                 {
                     record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
+                    zones_busy_dec(t);
                     pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
                 }
             }
-            /* else: trylock failed → fall through to Step 3 (CNS) */
         }
     }
 
@@ -1059,7 +1088,8 @@ retry_flush:
             if (!sticky_ok)
             {
                 record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-                pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+                zones_busy_dec(t);
+                    pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
             }
         }
         /* else: trylock failed → fall through to Step 3 (CNS) */
@@ -1074,6 +1104,8 @@ retry_flush:
             cns_path = true;
             cur_wp = (uint64_t)pg->node_id * ZTREE_PAGE_SIZE;
             target_zone = CTREE_CNS_ZONE_ID;
+            zones_busy_sample(t);
+            atomic_fetch_add_explicit(&t->stat_cns_stay, 1, memory_order_relaxed);
         }
         else
         {
@@ -1093,6 +1125,7 @@ retry_flush:
                                          memory_order_acquire))
                 {
                     record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
+                    zones_busy_dec(t);
                     pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
                     continue;
                 }
@@ -1181,7 +1214,8 @@ retry_flush:
             atomic_fetch_sub_explicit(&t->zone_wp_bytes[target_zone],
                                       ZTREE_PAGE_SIZE, memory_order_relaxed);
             record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-            pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+            zones_busy_dec(t);
+                    pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
             usleep(500);
             goto retry_flush;
         }
@@ -1198,7 +1232,8 @@ retry_flush:
     if (!cns_path)
     {
         record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-        pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+        zones_busy_dec(t);
+                    pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
 
         uint64_t new_wp = cur_wp + ZTREE_PAGE_SIZE;
         uint64_t zone_end = t->zones[target_zone].start + t->zones[target_zone].capacity;
@@ -2130,10 +2165,31 @@ void cow_close(cow_tree *t)
             (unsigned long long)zone_chg,
             (unsigned long long)par_rew,
             (fl_samp > 0) ? (double)fl_sum / (double)fl_samp / 1000.0 : 0.0);
+    uint64_t cns_ret_home = atomic_load_explicit(&t->stat_cns_return_home, memory_order_relaxed);
+    uint64_t cns_ret_new  = atomic_load_explicit(&t->stat_cns_return_new, memory_order_relaxed);
+    uint64_t cns_stay     = atomic_load_explicit(&t->stat_cns_stay, memory_order_relaxed);
+    uint64_t cns_h_contend= atomic_load_explicit(&t->stat_cns_home_contend, memory_order_relaxed);
+    uint64_t cns_h_full   = atomic_load_explicit(&t->stat_cns_home_full, memory_order_relaxed);
+    uint64_t busy_sum     = atomic_load_explicit(&t->stat_zones_busy_sum, memory_order_relaxed);
+    uint64_t busy_samp    = atomic_load_explicit(&t->stat_zones_busy_samples, memory_order_relaxed);
+
     fprintf(stderr,
-            "  cns_fallback_writes = %llu  (%.1f%% of page_appends)\n",
+            "  cns_fallback_writes = %llu  (%.1f%% of page_appends)\n"
+            "  cns breakdown:\n"
+            "    return_home   = %llu  (parent rewrite skipped)\n"
+            "    return_new    = %llu  (home full, parent rewrite)\n"
+            "    stay_on_cns   = %llu  (trylock failed)\n"
+            "    home_contend  = %llu  (home trylock failed)\n"
+            "    home_full     = %llu\n"
+            "    avg_zones_busy_at_cns = %.1f\n",
             (unsigned long long)cns_writes,
-            (appends > 0) ? 100.0 * (double)cns_writes / (double)appends : 0.0);
+            (appends > 0) ? 100.0 * (double)cns_writes / (double)appends : 0.0,
+            (unsigned long long)cns_ret_home,
+            (unsigned long long)cns_ret_new,
+            (unsigned long long)cns_stay,
+            (unsigned long long)cns_h_contend,
+            (unsigned long long)cns_h_full,
+            (busy_samp > 0) ? (double)busy_sum / (double)busy_samp : 0.0);
 
     uint64_t nlt_wait  = atomic_load_explicit(&t->nlt.prof_wait_ns_sum,   memory_order_relaxed);
     uint64_t nlt_hold  = atomic_load_explicit(&t->nlt.prof_hold_ns_sum,   memory_order_relaxed);

@@ -58,14 +58,17 @@ static void reset_device(const char *dev_path)
     snprintf(cmd, sizeof(cmd), "sudo nvme zns reset-zone -a %s", dev_path);
     int rc = system(cmd);
     if (rc == -1)
-    {
         perror("system(nvme reset-zone)");
-    }
+
+    /* Discard CNS device to reset FTL state */
+    rc = system("sudo blkdiscard /dev/nvme3n1");
+    if (rc == -1)
+        perror("system(blkdiscard nvme3n1)");
 }
 
 static void run_test(const char *dev_path, int num_threads)
 {
-    printf("Resetting ZNS device...\n");
+    printf("Resetting devices...\n");
     reset_device(dev_path);
     sleep(1);
 

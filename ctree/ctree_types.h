@@ -32,9 +32,9 @@
 #define ZTREE_META_ZONE_0          0U
 #define ZTREE_META_ZONE_1          1U
 #define ZTREE_ILAYER_ZONE_START    2U   /* first zone of ILayer pool        */
-#define ZTREE_ILAYER_POOL_SIZE    16U   /* ILayer pool size (zones 2-17)    */
+#define ZTREE_ILAYER_POOL_SIZE    32U   /* ILayer pool size (zones 2-33)    */
 #define ZTREE_ILAYER_INIT_COUNT    3U   /* initial IZGroup size (paper: 4)  */
-#define ZTREE_LLAYER_ZONE_START   18U   /* first zone of LLayer pool        */
+#define ZTREE_LLAYER_ZONE_START   34U   /* first zone of LLayer pool        */
 #define ZTREE_LZGROUP_INIT_SIZE   10U   /* initial LZGroup total size       */
 #define ZTREE_LZGROUP_HOT_INIT     8U   /* initial hot  zones (paper: 6)    */
 #define ZTREE_LZGROUP_COLD_INIT    2U   /* initial cold zones (paper: 2)    */
@@ -46,6 +46,7 @@
  */
 #define CTREE_CNS_DEV_PATH         "/dev/nvme3n1"
 #define CTREE_CNS_ZONE_ID          ((uint32_t)0xFFFFFFFEU)  /* sentinel: page lives on CNS */
+#define CTREE_CNS_BITMAP_MAX_NODES (1U << 22)               /* 4M nodes → 512KB bitmap */
 
 /* Magic numbers for on-disk structures */
 #define ZTREE_ZH_MAGIC   0x5A545245455A4E53ULL  /* "ZTREEZNS" */

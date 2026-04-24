@@ -1,7 +1,9 @@
 /*
- * ctree_main.c  –  CTree core: cache, NLT, zone alloc, single-pass CoW insert
- *                  + CNS fallback on zone write-lock contention
-
+ * ctree_main.c  –  CTree core with CNS bitmap fallback
+ *
+ * Same-zone trylock fail → CNS fallback with bitmap tracking.
+ * Home zone return on next CoW; parent rewrite only on zone-full / split.
+ *
  gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
       ctree/ctree_nlt.c ctree/ctree_zone.c ctree/ctree_main.c \
       ctree/bench_main_ctree.c \
@@ -68,6 +70,48 @@ static inline uint64_t monotonic_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* ── CNS bitmap helpers ──────────────────────────────────────────────────── */
+static inline void cns_bitmap_set(ztree_t *t, ztree_node_id_t nid)
+{
+    uint32_t byte = nid / 8;
+    uint8_t  bit  = 1U << (nid % 8);
+    if (byte < t->cns_bitmap_bytes)
+        atomic_fetch_or_explicit(&t->cns_bitmap[byte], bit, memory_order_relaxed);
+}
+
+static inline void cns_bitmap_clear(ztree_t *t, ztree_node_id_t nid)
+{
+    uint32_t byte = nid / 8;
+    uint8_t  bit  = 1U << (nid % 8);
+    if (byte < t->cns_bitmap_bytes)
+        atomic_fetch_and_explicit(&t->cns_bitmap[byte], ~bit, memory_order_relaxed);
+}
+
+static inline int cns_bitmap_test(ztree_t *t, ztree_node_id_t nid)
+{
+    uint32_t byte = nid / 8;
+    uint8_t  bit  = 1U << (nid % 8);
+    if (byte >= t->cns_bitmap_bytes)
+        return 0;
+    return (atomic_load_explicit(&t->cns_bitmap[byte], memory_order_relaxed) & bit) != 0;
+}
+
+/* ── Zone busy counter ──────────────────────────────────────────────────── */
+static inline void zones_busy_inc(ztree_t *t)
+{
+    atomic_fetch_add_explicit(&t->cns_zones_busy, 1, memory_order_relaxed);
+}
+static inline void zones_busy_dec(ztree_t *t)
+{
+    atomic_fetch_sub_explicit(&t->cns_zones_busy, 1, memory_order_relaxed);
+}
+static inline void zones_busy_sample(ztree_t *t)
+{
+    uint32_t cur = atomic_load_explicit(&t->cns_zones_busy, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_zones_busy_sum, cur, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_zones_busy_samples, 1, memory_order_relaxed);
 }
 
 static inline uint64_t ztree_hash64(ztree_node_id_t id)
@@ -390,6 +434,15 @@ static void load_page_by_pn(ztree_t *t, ztree_pagenum_t pn, ztree_page *dst)
  */
 static void load_page_from_cns(ztree_t *t, uint32_t slot_id, ztree_page *dst)
 {
+    /* CNS cache tag: bit 63 set + slot_id (= node_id) */
+    ztree_pagenum_t pn = (ztree_pagenum_t)slot_id | (1ULL << 63);
+
+    /* Try cache first */
+    if (cache_lookup(t, pn, dst))
+        return;
+
+    atomic_fetch_add_explicit(&t->stat_cache_miss, 1, memory_order_relaxed);
+
     off_t off = (off_t)slot_id * ZTREE_PAGE_SIZE;
 
     /* CNS fd is always O_DIRECT → need aligned buffer */
@@ -409,6 +462,9 @@ static void load_page_from_cns(ztree_t *t, uint32_t slot_id, ztree_page *dst)
     }
     memcpy(dst, raw, ZTREE_PAGE_SIZE);
     free(raw);
+
+    /* Warm cache */
+    cache_insert(t, pn, dst);
 }
 
 static int load_page_by_nlt(ztree_t *t, const nlt_location_t *loc,
@@ -822,18 +878,18 @@ static void flush_page_immediate(ztree_t *t,
     uint32_t target_zone;
     uint64_t cur_wp;
     bool     sticky_ok = false;
-    bool     cns_path  = false;  /* true if we spill to CNS */
+    bool     cns_path  = false;
 
-    /* Timestamp of current zone_write_lock acquisition for hold-time profiling. */
     uint64_t zwl_hold_start = 0;
 
 retry_flush:
     sticky_ok = false;
     cns_path  = false;
 
-    /* ── Phase 1a: try stickiness (trylock — never block) ──────────────
-     * Skip if prev_zone is CNS — no zone_full[]/zone_write_locks[] entry.
-     * CNS pages always go to Phase 1b to try migrating back to ZNS.       */
+    /* ── Step 1: try stickiness (trylock on same zone) ─────────────────
+     * Skip if prev_zone is CNS or INVALID.
+     * If the zone is full, fall through to Step 2 (dynamic alloc).
+     * If trylock fails (contention), fall through to Step 3 (CNS).     */
     if (prev_zone != ZTREE_INVALID_ZONE_ID
         && prev_zone != CTREE_CNS_ZONE_ID
         && !atomic_load_explicit(&t->zone_full[prev_zone], memory_order_acquire))
@@ -842,7 +898,8 @@ retry_flush:
         if (rc == 0)
         {
             uint64_t lock_t1 = monotonic_ns();
-            record_zwl_wait(t, prev_zone, 0);  /* no wait — trylock succeeded */
+            record_zwl_wait(t, prev_zone, 0);
+            zones_busy_inc(t);
             zwl_hold_start = lock_t1;
 
             uint64_t zone_start = t->zones[prev_zone].start;
@@ -864,121 +921,228 @@ retry_flush:
             }
             else
             {
+                /* Zone full — need dynamic alloc (Step 2). */
                 record_zwl_hold(t, prev_zone, monotonic_ns() - zwl_hold_start);
+                zones_busy_dec(t);
                 pthread_mutex_unlock(&t->zone_write_locks[prev_zone]);
+                /* Mark zone full and seal. */
+                atomic_store_explicit(&t->zone_full[prev_zone], 1, memory_order_release);
+                nlt_set_zone_sealed(&t->nlt, prev_zone, true);
+                zone_seal_and_replace(&t->za, prev_zone);
             }
         }
-        /* else: trylock failed (contention) — fall through to Phase 1b/1c */
+        /* else: trylock failed (contention) — fall through to Step 3 (CNS) */
     }
 
-    /* ── Phase 1b: Dynamic_Allocation with trylock ─────────────────────── */
-    if (!sticky_ok)
+    /* ── Step 1.5: CNS node trying to return to ZNS ─────────────────────
+     * pg->zone_id still holds the "home zone" (preserved during CNS spill).
+     * 1a) trylock(home_zone): contention → CNS (no alloc attempt)
+     *                         full       → try Step 1.5b
+     *                         success    → home zone, NO parent rewrite
+     * 1b) trylock(zone_alloc): one attempt for a new zone
+     *                          success → new zone, parent rewrite (legitimate)
+     *                          fail    → CNS                                  */
+    bool cns_returned_home = false;
+    if (!sticky_ok && !cns_path && prev_zone == CTREE_CNS_ZONE_ID)
     {
-        int attempts = 0;
-        const int max_trylock_attempts = 3;
+        uint32_t home_zone = pg->zone_id;  /* preserved from before CNS spill */
+        /* Validate home_zone: must be in ILayer or LLayer range.
+         * New nodes (memset → zone_id=0) or corrupted values are invalid. */
+        bool home_valid = (home_zone >= ZTREE_ILAYER_ZONE_START)
+                       && (home_zone < t->info.nr_zones);
+        bool home_full = !home_valid
+                      || atomic_load_explicit(&t->zone_full[home_zone],
+                                             memory_order_acquire);
 
-        for (; attempts < max_trylock_attempts; attempts++)
+        if (!home_full)
         {
-            target_zone = pg->is_leaf
-                              ? zone_alloc_llayer(&t->za, pg->node_id, avoid_zone)
-                              : zone_alloc_ilayer(&t->za, avoid_zone);
-
-            int rc = pthread_mutex_trylock(&t->zone_write_locks[target_zone]);
-            if (rc != 0)
-                continue;  /* contended — try another zone */
-
-            uint64_t lock_t1 = monotonic_ns();
-            record_zwl_wait(t, target_zone, 0);
-            zwl_hold_start = lock_t1;
-
-            /* Re-check under lock: zone may have been finished between pick and lock. */
-            if (atomic_load_explicit(&t->zone_full[target_zone],
-                                     memory_order_acquire))
+            /* 1a) Try home zone — contention → straight to CNS */
+            int rc = pthread_mutex_trylock(&t->zone_write_locks[home_zone]);
+            if (rc == 0)
             {
-                record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-                pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
-                continue;
-            }
+                uint64_t lock_t1 = monotonic_ns();
+                record_zwl_wait(t, home_zone, 0);
+                zones_busy_inc(t);
+                zwl_hold_start = lock_t1;
 
-            uint64_t zone_start = t->zones[target_zone].start;
-            uint64_t zone_end   = zone_start + t->zones[target_zone].capacity;
-            uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target_zone],
-                                               memory_order_relaxed);
+                uint64_t zone_end = t->zones[home_zone].start
+                                    + t->zones[home_zone].capacity;
+                uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[home_zone],
+                                                   memory_order_relaxed);
 
-            if (wp + ZTREE_PAGE_SIZE > zone_end)
-            {
-                record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-                pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
-                atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
-                nlt_set_zone_sealed(&t->nlt, target_zone, true);
-                zone_seal_and_replace(&t->za, target_zone);
-                continue;
-            }
+                if (wp + ZTREE_PAGE_SIZE <= zone_end)
+                {
+                    cur_wp = wp;
+                    target_zone = home_zone;
+                    atomic_store_explicit(&t->zone_wp_bytes[home_zone],
+                                           wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
+                    sticky_ok = true;
+                    cns_returned_home = true;
+                    atomic_fetch_add_explicit(&t->stat_cns_return_home, 1, memory_order_relaxed);
+                }
+                else
+                {
+                    home_full = true;
+                    atomic_fetch_add_explicit(&t->stat_cns_home_full, 1, memory_order_relaxed);
+                }
 
-            cur_wp = wp;
-            atomic_store_explicit(&t->zone_wp_bytes[target_zone],
-                                   wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
-            sticky_ok = true;
-            break;
-        }
-
-        /* ── Phase 1c: CNS fallback — all trylocks failed ─────────────── */
-        if (!sticky_ok)
-        {
-            if (t->cns_fd >= 0)
-            {
-                cns_path = true;
-                /* CNS offset = node_id * PAGE_SIZE.  node_id is unique per
-                 * node, so no coordination needed.  Repeated writes to the
-                 * same node just overwrite the same LBA (FTL handles it). */
-                cur_wp = (uint64_t)pg->node_id * ZTREE_PAGE_SIZE;
-                target_zone = CTREE_CNS_ZONE_ID;
+                if (!sticky_ok)
+                {
+                    record_zwl_hold(t, home_zone, monotonic_ns() - zwl_hold_start);
+                    zones_busy_dec(t);
+                    pthread_mutex_unlock(&t->zone_write_locks[home_zone]);
+                }
             }
             else
             {
-                /* CNS unavailable — degrade to blocking lock (ztree behavior) */
-                for (;;)
-                {
-                    target_zone = pg->is_leaf
-                                      ? zone_alloc_llayer(&t->za, pg->node_id, avoid_zone)
-                                      : zone_alloc_ilayer(&t->za, avoid_zone);
-                    uint64_t lock_t0 = monotonic_ns();
-                    pthread_mutex_lock(&t->zone_write_locks[target_zone]);
-                    uint64_t lock_t1 = monotonic_ns();
-                    record_zwl_wait(t, target_zone, lock_t1 - lock_t0);
-                    zwl_hold_start = lock_t1;
+                atomic_fetch_add_explicit(&t->stat_cns_home_contend, 1, memory_order_relaxed);
+            }
+        }
+        else
+        {
+            atomic_fetch_add_explicit(&t->stat_cns_home_full, 1, memory_order_relaxed);
+        }
 
-                    if (atomic_load_explicit(&t->zone_full[target_zone],
-                                             memory_order_acquire))
-                    {
-                        record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-                        pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
-                        continue;
-                    }
+        if (!sticky_ok && home_full)
+        {
+            /* 1b) Home zone full — try one new zone via allocator */
+            target_zone = pg->is_leaf
+                              ? zone_alloc_llayer(&t->za, pg->node_id, avoid_zone)
+                              : zone_alloc_ilayer(&t->za, avoid_zone);
+            pg->zone_id = target_zone;  /* update home zone for future CNS returns */
+            int rc = pthread_mutex_trylock(&t->zone_write_locks[target_zone]);
+            if (rc == 0)
+            {
+                uint64_t lock_t1 = monotonic_ns();
+                record_zwl_wait(t, target_zone, 0);
+                zones_busy_inc(t);
+                zwl_hold_start = lock_t1;
+
+                if (!atomic_load_explicit(&t->zone_full[target_zone],
+                                          memory_order_acquire))
+                {
                     uint64_t zone_end = t->zones[target_zone].start
                                         + t->zones[target_zone].capacity;
                     uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target_zone],
                                                        memory_order_relaxed);
-                    if (wp + ZTREE_PAGE_SIZE > zone_end)
+                    if (wp + ZTREE_PAGE_SIZE <= zone_end)
                     {
-                        record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-                        pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
-                        atomic_store_explicit(&t->zone_full[target_zone], 1,
-                                             memory_order_release);
-                        nlt_set_zone_sealed(&t->nlt, target_zone, true);
-                        zone_seal_and_replace(&t->za, target_zone);
-                        continue;
+                        cur_wp = wp;
+                        atomic_store_explicit(&t->zone_wp_bytes[target_zone],
+                                               wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
+                        sticky_ok = true;
+                        atomic_fetch_add_explicit(&t->stat_cns_return_new, 1, memory_order_relaxed);
                     }
-                    cur_wp = wp;
-                    atomic_store_explicit(&t->zone_wp_bytes[target_zone],
-                                           wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
-                    sticky_ok = true;  /* use normal ZNS write path */
-                    break;
+                }
+                if (!sticky_ok)
+                {
+                    record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
+                    zones_busy_dec(t);
+                    pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
                 }
             }
         }
     }
 
+    /* ── Step 2: dynamic allocation (trylock, zone-full / new node) ──────
+     * Only reached when prev_zone is INVALID (new node) or zone is full.
+     * NOT for CNS nodes — they use Step 1.5 above.
+     * Trylock: success → real zone migration (parent rewrite).
+     *          failure → fall through to Step 3 (CNS).
+     * Either way, set pg->zone_id to the allocated zone as home_zone
+     * so that if this node later goes to CNS, it has a valid home.       */
+    if (!sticky_ok && !cns_path
+        && (prev_zone == ZTREE_INVALID_ZONE_ID
+            || (prev_zone != CTREE_CNS_ZONE_ID
+                && atomic_load_explicit(&t->zone_full[prev_zone], memory_order_acquire))))
+    {
+        target_zone = pg->is_leaf
+                          ? zone_alloc_llayer(&t->za, pg->node_id, avoid_zone)
+                          : zone_alloc_ilayer(&t->za, avoid_zone);
+        /* Pre-set home zone so CNS fallback has a valid target for return */
+        pg->zone_id = target_zone;
+
+        int rc = pthread_mutex_trylock(&t->zone_write_locks[target_zone]);
+        if (rc == 0)
+        {
+            uint64_t lock_t1 = monotonic_ns();
+            record_zwl_wait(t, target_zone, 0);
+            zones_busy_inc(t);
+            zwl_hold_start = lock_t1;
+
+            if (!atomic_load_explicit(&t->zone_full[target_zone],
+                                      memory_order_acquire))
+            {
+                uint64_t zone_end = t->zones[target_zone].start
+                                    + t->zones[target_zone].capacity;
+                uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target_zone],
+                                                   memory_order_relaxed);
+                if (wp + ZTREE_PAGE_SIZE <= zone_end)
+                {
+                    cur_wp = wp;
+                    atomic_store_explicit(&t->zone_wp_bytes[target_zone],
+                                           wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
+                    sticky_ok = true;
+                }
+            }
+            if (!sticky_ok)
+            {
+                record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
+                zones_busy_dec(t);
+                pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+            }
+        }
+        /* else: trylock failed → fall through to Step 3 (CNS) */
+    }
+
+    /* ── Step 3: CNS fallback (contention on a non-full zone) ─────────
+     * No parent rewrite needed — bitmap tracks the CNS location.        */
+    if (!sticky_ok)
+    {
+        if (t->cns_fd >= 0)
+        {
+            cns_path = true;
+            cur_wp = (uint64_t)pg->node_id * ZTREE_PAGE_SIZE;
+            target_zone = CTREE_CNS_ZONE_ID;
+            zones_busy_sample(t);
+            if (prev_zone == CTREE_CNS_ZONE_ID)
+                atomic_fetch_add_explicit(&t->stat_cns_stay, 1, memory_order_relaxed);
+        }
+        else
+        {
+            /* CNS unavailable — degrade to blocking lock */
+            for (;;)
+            {
+                target_zone = pg->is_leaf
+                                  ? zone_alloc_llayer(&t->za, pg->node_id, avoid_zone)
+                                  : zone_alloc_ilayer(&t->za, avoid_zone);
+                uint64_t lock_t0 = monotonic_ns();
+                pthread_mutex_lock(&t->zone_write_locks[target_zone]);
+                uint64_t lock_t1 = monotonic_ns();
+                record_zwl_wait(t, target_zone, lock_t1 - lock_t0);
+                zones_busy_inc(t);
+                zwl_hold_start = lock_t1;
+
+                if (atomic_load_explicit(&t->zone_full[target_zone],
+                                         memory_order_acquire))
+                {
+                    record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
+                    zones_busy_dec(t);
+                    pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+                    continue;
+                }
+                uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target_zone],
+                                                   memory_order_relaxed);
+                cur_wp = wp;
+                atomic_store_explicit(&t->zone_wp_bytes[target_zone],
+                                       wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
+                sticky_ok = true;
+                break;
+            }
+        }
+    }
+
+    /* ── Compute slot_id and cache page number ─────────────────────── */
     uint32_t slot_id;
     ztree_pagenum_t pn;
 
@@ -989,29 +1153,30 @@ retry_flush:
     }
     else
     {
-        /* CNS: slot_id = node_id (offset = node_id * PAGE_SIZE) */
         slot_id = pg->node_id;
-        pn = (ztree_pagenum_t)pg->node_id;
+        pn = (ztree_pagenum_t)pg->node_id | (1ULL << 63);
     }
 
-    /* Stamp zone_id and slot_id before the write. */
-    pg->zone_id = target_zone;
+    /* CNS: preserve pg->zone_id as "home zone" for future return.
+     * ZNS: stamp the actual zone.  Bitmap tells read path if node is on CNS. */
+    if (!cns_path)
+        pg->zone_id = target_zone;
+    /* else: keep pg->zone_id unchanged (home zone) */
     pg->slot_id = slot_id;
 
+    /* ── Write to device ───────────────────────────────────────────── */
     int wfd;
     const void *wbuf;
     _Alignas(ZTREE_PAGE_SIZE) char local_bounce[ZTREE_PAGE_SIZE];
 
     if (cns_path)
     {
-        /* CNS path: always O_DIRECT aligned write to CNS fd */
         memcpy(local_bounce, pg, ZTREE_PAGE_SIZE);
         wfd = t->cns_fd;
         wbuf = local_bounce;
     }
     else if (t->direct_fd >= 0)
     {
-        /* O_DIRECT requires page-aligned buffer; use per-call stack buffer. */
         memcpy(local_bounce, pg, ZTREE_PAGE_SIZE);
         wfd = t->direct_fd;
         wbuf = local_bounce;
@@ -1032,13 +1197,12 @@ retry_flush:
                     "flush_page_immediate: cur_wp out of range "
                     "target_zone=%u prev_zone=%u avoid=%u is_leaf=%u "
                     "node_id=%llu cur_wp=0x%llx "
-                    "zone_start=0x%llx zone_end=0x%llx sticky=%d\n",
+                    "zone_start=0x%llx zone_end=0x%llx\n",
                     target_zone, prev_zone, avoid_zone, pg->is_leaf,
                     (unsigned long long)pg->node_id,
                     (unsigned long long)cur_wp,
                     (unsigned long long)zs,
-                    (unsigned long long)ze,
-                    sticky_ok ? 1 : 0);
+                    (unsigned long long)ze);
             exit(EXIT_FAILURE);
         }
     }
@@ -1049,30 +1213,30 @@ retry_flush:
         int e = errno;
         if (!cns_path && e == EOVERFLOW)
         {
-            /* EOVERFLOW: too many active zones — undo, sleep, retry. */
             atomic_fetch_sub_explicit(&t->zone_wp_bytes[target_zone],
                                       ZTREE_PAGE_SIZE, memory_order_relaxed);
             record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-            pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+            zones_busy_dec(t);
+                    pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
             usleep(500);
             goto retry_flush;
         }
         fprintf(stderr,
                 "flush_page_immediate: pwrite at 0x%llx ret=%zd errno=%d (%s) "
-                "target_zone=%u prev_zone=%u avoid=%u is_leaf=%u sticky=%d cns=%d\n",
+                "target_zone=%u prev_zone=%u avoid=%u is_leaf=%u cns=%d\n",
                 (unsigned long long)cur_wp, pwr, e, strerror(e),
                 target_zone, prev_zone, avoid_zone, pg->is_leaf,
-                sticky_ok ? 1 : 0, cns_path ? 1 : 0);
+                cns_path ? 1 : 0);
         exit(EXIT_FAILURE);
     }
 
+    /* ── Post-write bookkeeping ────────────────────────────────────── */
     if (!cns_path)
     {
-        /* Successful pwrite — record full hold time spanning the pwrite. */
         record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
-        pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+        zones_busy_dec(t);
+                    pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
 
-        /* Zone-full detection + seal threshold. */
         uint64_t new_wp = cur_wp + ZTREE_PAGE_SIZE;
         uint64_t zone_end = t->zones[target_zone].start + t->zones[target_zone].capacity;
         if (new_wp >= zone_end)
@@ -1080,16 +1244,18 @@ retry_flush:
             atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
             zone_seal_and_replace(&t->za, target_zone);
         }
+
+        /* Node returned to ZNS — clear bitmap */
+        cns_bitmap_clear(t, pg->node_id);
     }
     else
     {
-        /* CNS write succeeded — bump stats */
         atomic_fetch_add_explicit(&t->stat_cns_writes, 1, memory_order_relaxed);
+        /* Mark node as living on CNS */
+        cns_bitmap_set(t, pg->node_id);
     }
 
-    if (!cns_path)
-        cache_insert(t, pn, pg);
-    /* else: CNS pages are not cached (they use a separate pn space) */
+    cache_insert(t, pn, pg);
 
     nlt_location_t loc = {
         .zone_id = target_zone,
@@ -1113,22 +1279,47 @@ retry_flush:
 
     if (pg->is_leaf)
     {
-        /* Reset heat on zone relocation (paper §3.1.1). */
-        if (prev_zone != ZTREE_INVALID_ZONE_ID && prev_zone != target_zone)
+        if (prev_zone != ZTREE_INVALID_ZONE_ID
+            && prev_zone != CTREE_CNS_ZONE_ID
+            && prev_zone != target_zone)
             zone_heat_reset(&t->za, pg->node_id);
         zone_heat_record_write(&t->za, pg->node_id);
     }
 
     atomic_fetch_add_explicit(&t->stat_page_appends, 1, memory_order_relaxed);
 
-    if (prev_zone != ZTREE_INVALID_ZONE_ID && prev_zone == target_zone)
+    /* ── zone_changed determination ────────────────────────────────────
+     * No parent rewrite needed:
+     *   - CNS spill (bitmap tracks it)
+     *   - Same zone stickiness
+     *   - CNS → home zone return (parent already has correct zone_id)
+     * Parent rewrite needed:
+     *   - Real zone migration (zone-full → new zone, or new node)       */
+    if (cns_path)
     {
+        if (out_zone_changed)
+            *out_zone_changed = 0;
+        atomic_fetch_add_explicit(&t->stat_nlt_only_updates, 1, memory_order_relaxed);
+    }
+    else if (cns_returned_home)
+    {
+        /* Returned to home zone — parent's child_zone_id is already correct */
+        if (out_zone_changed)
+            *out_zone_changed = 0;
+        atomic_fetch_add_explicit(&t->stat_nlt_only_updates, 1, memory_order_relaxed);
+    }
+    else if (prev_zone != ZTREE_INVALID_ZONE_ID
+             && prev_zone != CTREE_CNS_ZONE_ID
+             && prev_zone == target_zone)
+    {
+        /* Same zone stickiness */
         if (out_zone_changed)
             *out_zone_changed = 0;
         atomic_fetch_add_explicit(&t->stat_nlt_only_updates, 1, memory_order_relaxed);
     }
     else
     {
+        /* Real zone migration — parent rewrite needed */
         if (out_zone_changed)
             *out_zone_changed = 1;
         atomic_fetch_add_explicit(&t->stat_zone_changes, 1, memory_order_relaxed);
@@ -1462,15 +1653,14 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
 
         node_unlock(t, leaff->node_id);
 
-        /* Propagate to parents only on split.
-         * CTree: zone migration does NOT trigger parent rewrite — the NLT
-         * holds the authoritative location, so the parent's stale
-         * child_zone_id is harmless (read path resolves via NLT). */
-        if (prop.split)
+        /* Propagate to parents on split OR real zone migration.
+         * CNS spills set zone_changed=0 so they never trigger parent rewrite.
+         * Only zone-full / new-node migrations set zone_changed=1.          */
+        if (prop.split || prop.left_zone_changed)
         {
             for (int level = depth - 2; level >= 0; level--)
             {
-                if (!prop.split)
+                if (!prop.split && !prop.left_zone_changed)
                     break;
 
                 insert_path_frame *pf = &path[level];
@@ -1739,6 +1929,14 @@ cow_tree *cow_open(const char *path)
                 CTREE_CNS_DEV_PATH, strerror(errno));
         /* Non-fatal: we can still operate (degrades to ztree behavior). */
     }
+    /* Allocate CNS bitmap */
+    t->cns_bitmap_bytes = CTREE_CNS_BITMAP_MAX_NODES / 8;
+    t->cns_bitmap = calloc(t->cns_bitmap_bytes, sizeof(*t->cns_bitmap));
+    if (!t->cns_bitmap)
+    {
+        fprintf(stderr, "[ctree] WARNING: cannot allocate CNS bitmap (%u bytes)\n",
+                t->cns_bitmap_bytes);
+    }
     atomic_store_explicit(&t->stat_cns_writes, 0, memory_order_relaxed);
 
     /* Allocate per-zone arrays */
@@ -1969,10 +2167,31 @@ void cow_close(cow_tree *t)
             (unsigned long long)zone_chg,
             (unsigned long long)par_rew,
             (fl_samp > 0) ? (double)fl_sum / (double)fl_samp / 1000.0 : 0.0);
+    uint64_t cns_ret_home = atomic_load_explicit(&t->stat_cns_return_home, memory_order_relaxed);
+    uint64_t cns_ret_new  = atomic_load_explicit(&t->stat_cns_return_new, memory_order_relaxed);
+    uint64_t cns_stay     = atomic_load_explicit(&t->stat_cns_stay, memory_order_relaxed);
+    uint64_t cns_h_contend= atomic_load_explicit(&t->stat_cns_home_contend, memory_order_relaxed);
+    uint64_t cns_h_full   = atomic_load_explicit(&t->stat_cns_home_full, memory_order_relaxed);
+    uint64_t busy_sum     = atomic_load_explicit(&t->stat_zones_busy_sum, memory_order_relaxed);
+    uint64_t busy_samp    = atomic_load_explicit(&t->stat_zones_busy_samples, memory_order_relaxed);
+
     fprintf(stderr,
-            "  cns_fallback_writes = %llu  (%.1f%% of page_appends)\n",
+            "  cns_fallback_writes = %llu  (%.1f%% of page_appends)\n"
+            "  cns breakdown:\n"
+            "    return_home   = %llu  (parent rewrite skipped)\n"
+            "    return_new    = %llu  (home full, parent rewrite)\n"
+            "    stay_on_cns   = %llu  (trylock failed)\n"
+            "    home_contend  = %llu  (home trylock failed)\n"
+            "    home_full     = %llu\n"
+            "    avg_zones_busy_at_cns = %.1f\n",
             (unsigned long long)cns_writes,
-            (appends > 0) ? 100.0 * (double)cns_writes / (double)appends : 0.0);
+            (appends > 0) ? 100.0 * (double)cns_writes / (double)appends : 0.0,
+            (unsigned long long)cns_ret_home,
+            (unsigned long long)cns_ret_new,
+            (unsigned long long)cns_stay,
+            (unsigned long long)cns_h_contend,
+            (unsigned long long)cns_h_full,
+            (busy_samp > 0) ? (double)busy_sum / (double)busy_samp : 0.0);
 
     uint64_t nlt_wait  = atomic_load_explicit(&t->nlt.prof_wait_ns_sum,   memory_order_relaxed);
     uint64_t nlt_hold  = atomic_load_explicit(&t->nlt.prof_hold_ns_sum,   memory_order_relaxed);
@@ -2069,6 +2288,8 @@ void cow_close(cow_tree *t)
         close(t->direct_fd);
     if (t->cns_fd >= 0)
         close(t->cns_fd);
+    if (t->cns_bitmap)
+        free(t->cns_bitmap);
 
     pthread_mutex_destroy(&t->sb_lock);
 

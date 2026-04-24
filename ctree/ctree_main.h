@@ -30,7 +30,17 @@ struct ztree_s {
 
     /* ── CNS fallback ──────────────────────────────────────────────────── */
     int              cns_fd;          /* fd for /dev/nvme3n1 (O_RDWR|O_DIRECT) */
-    _Atomic(uint64_t) stat_cns_writes; /* pages written to CNS due to contention */
+    _Atomic(uint8_t) *cns_bitmap;    /* 1 bit per node_id: 1=on CNS, 0=on ZNS */
+    uint32_t          cns_bitmap_bytes;
+    _Atomic(uint32_t) cns_zones_busy;        /* current # of zone locks held */
+    _Atomic(uint64_t) stat_zones_busy_sum;   /* sum of busy count at each flush */
+    _Atomic(uint64_t) stat_zones_busy_samples;
+    _Atomic(uint64_t) stat_cns_writes;       /* total pages written to CNS */
+    _Atomic(uint64_t) stat_cns_return_home;  /* CNS → home zone success */
+    _Atomic(uint64_t) stat_cns_return_new;   /* CNS → new zone (home full) */
+    _Atomic(uint64_t) stat_cns_stay;         /* CNS → CNS again (trylock fail) */
+    _Atomic(uint64_t) stat_cns_home_contend; /* home zone trylock failed */
+    _Atomic(uint64_t) stat_cns_home_full;    /* home zone was full */
 
     /* Superblock / root state */
     ztree_superblock_entry  durable_sb;

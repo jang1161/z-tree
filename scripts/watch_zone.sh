@@ -19,10 +19,10 @@ watch -n 1 'sudo nvme zns report-zone /dev/nvme3n2 | awk '\''{
                 if(zone==0 || zone==1){
                     r[++r_idx] = line
                 }
-                else if(zone>=2 && zone<=17){
+                else if(zone>=2 && zone<=33){
                     i_layer[++i_idx] = line
                 }
-                else if(zone>=18 && zone<2902){
+                else if(zone>=34 && zone<2902){
                     l_hot[++h_idx] = line
                 }
                 else if(zone>=2902){

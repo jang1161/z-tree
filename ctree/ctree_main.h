@@ -35,7 +35,11 @@ struct ztree_s {
     _Atomic(uint32_t) cns_zones_busy;        /* current # of zone locks held */
     _Atomic(uint64_t) stat_zones_busy_sum;   /* sum of busy count at each flush */
     _Atomic(uint64_t) stat_zones_busy_samples;
-    _Atomic(uint64_t) stat_cns_writes;       /* total pages written to CNS */
+    FILE             *trace_fp;              /* write trace for ZNS/CNS graph */
+    uint64_t          trace_start_ns;       /* monotonic start time for trace */
+    _Atomic(uint32_t) tree_height;          /* current tree height (root split increments) */
+    _Atomic(int64_t)  stat_cns_current;      /* current # valid nodes on CNS */
+    _Atomic(uint64_t) stat_cns_writes;       /* cumulative pages written to CNS */
     _Atomic(uint64_t) stat_cns_return_home;  /* CNS → home zone success */
     _Atomic(uint64_t) stat_cns_return_new;   /* CNS → new zone (home full) */
     _Atomic(uint64_t) stat_cns_stay;         /* CNS → CNS again (trylock fail) */

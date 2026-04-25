@@ -1245,14 +1245,45 @@ retry_flush:
             zone_seal_and_replace(&t->za, target_zone);
         }
 
-        /* Node returned to ZNS — clear bitmap */
+        /* Node written to ZNS */
+        if (cns_bitmap_test(t, pg->node_id))
+        {
+            /* CNS → ZNS */
+            atomic_fetch_sub_explicit(&t->stat_cns_current, 1, memory_order_relaxed);
+        }
         cns_bitmap_clear(t, pg->node_id);
     }
     else
     {
         atomic_fetch_add_explicit(&t->stat_cns_writes, 1, memory_order_relaxed);
-        /* Mark node as living on CNS */
+        if (!cns_bitmap_test(t, pg->node_id))
+        {
+            /* New or ZNS → CNS */
+            atomic_fetch_add_explicit(&t->stat_cns_current, 1, memory_order_relaxed);
+        }
+        /* else: CNS → CNS (same node, no change) */
         cns_bitmap_set(t, pg->node_id);
+    }
+
+    /* ── Trace sampling ────────────────────────────────────────────── */
+    {
+        uint64_t total = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed) + 1;
+        if (t->trace_fp && (total % 10000 == 0))
+        {
+            double elapsed = (double)(monotonic_ns() - t->trace_start_ns) / 1e9;
+            int64_t cns_cur = atomic_load_explicit(&t->stat_cns_current, memory_order_relaxed);
+            uint32_t total_nodes = atomic_load_explicit(&t->next_node_id, memory_order_relaxed) - 1;
+            int64_t zns_cur = (int64_t)total_nodes - cns_cur;
+            uint64_t cns_w = atomic_load_explicit(&t->stat_cns_writes, memory_order_relaxed);
+            uint32_t height = atomic_load_explicit(&t->tree_height, memory_order_relaxed);
+            fprintf(t->trace_fp, "%.3f,%lld,%lld,%llu,%llu,%u\n",
+                    elapsed,
+                    (long long)zns_cur,
+                    (long long)cns_cur,
+                    (unsigned long long)total,
+                    (unsigned long long)cns_w,
+                    height);
+        }
     }
 
     cache_insert(t, pn, pg);
@@ -1836,6 +1867,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                                  &zchg, &new_root_zone, &new_root_slot);
             new_root_nid = nr.node_id;
             need_root_publish = 1;
+            atomic_fetch_add_explicit(&t->tree_height, 1, memory_order_relaxed);
         }
         else if (prop.left_id == root_nid && prop.left_zone_changed)
         {
@@ -1938,6 +1970,12 @@ cow_tree *cow_open(const char *path)
                 t->cns_bitmap_bytes);
     }
     atomic_store_explicit(&t->stat_cns_writes, 0, memory_order_relaxed);
+    atomic_store_explicit(&t->stat_cns_current, 0, memory_order_relaxed);
+    t->trace_fp = fopen("/tmp/ctree_trace.csv", "w");
+    t->trace_start_ns = monotonic_ns();
+    atomic_store_explicit(&t->tree_height, 1, memory_order_relaxed);
+    if (t->trace_fp)
+        fprintf(t->trace_fp, "time_sec,zns_current,cns_current,appends,cns_writes,height\n");
 
     /* Allocate per-zone arrays */
     t->zones = calloc(t->info.nr_zones, sizeof *t->zones);
@@ -2290,6 +2328,8 @@ void cow_close(cow_tree *t)
         close(t->cns_fd);
     if (t->cns_bitmap)
         free(t->cns_bitmap);
+    if (t->trace_fp)
+        fclose(t->trace_fp);
 
     pthread_mutex_destroy(&t->sb_lock);
 

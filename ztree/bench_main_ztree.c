@@ -12,15 +12,13 @@
 typedef struct
 {
     ztree_t *t;
-    int *keys;
-    int start;
-    int end;
 } thread_arg;
 
 static int *all_keys;
 static int total_keys;
 
 static _Atomic int progress_count = 0;
+static _Atomic int work_cursor = 0;
 
 static void *worker(void *arg)
 {
@@ -33,9 +31,10 @@ static void *worker(void *arg)
         interval = 1;
     }
 
-    for (int i = a->start; i < a->end; i++)
+    int idx;
+    while ((idx = atomic_fetch_add(&work_cursor, 1)) < total)
     {
-        int key = a->keys[i];
+        int key = all_keys[idx];
         char buf[120];
         snprintf(buf, sizeof(buf), "value-%d", key);
         cow_insert(a->t, key, buf);
@@ -70,6 +69,7 @@ static void run_test(const char *dev_path, int num_threads)
     sleep(1);
 
     atomic_store(&progress_count, 0);
+    atomic_store(&work_cursor, 0);
     printf("\n===== Running with %d threads =====\n", num_threads);
 
     cow_tree *t = cow_open(dev_path);
@@ -90,8 +90,6 @@ static void run_test(const char *dev_path, int num_threads)
         exit(1);
     }
 
-    int chunk = total_keys / num_threads;
-
     struct timespec start;
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &start);
@@ -99,9 +97,6 @@ static void run_test(const char *dev_path, int num_threads)
     for (int i = 0; i < num_threads; i++)
     {
         args[i].t = t;
-        args[i].keys = all_keys;
-        args[i].start = i * chunk;
-        args[i].end = (i == num_threads - 1) ? total_keys : (i + 1) * chunk;
 
         pthread_create(&threads[i], NULL, worker, &args[i]);
     }

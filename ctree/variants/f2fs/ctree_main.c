@@ -4,10 +4,11 @@
  * Same-zone trylock fail → CNS fallback with bitmap tracking.
  * Home zone return on next CoW; parent rewrite only on zone-full / split.
  *
- gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
-      ctree/ctree_nlt.c ctree/ctree_zone.c ctree/ctree_main.c \
-      ctree/bench_main_ctree.c \
-      -o build/ctree -lzbd -lnvme -lpthread
+ gcc -O2 -g -Wall -Wextra -std=c11 -pthread -I ctree \
+      ctree/ctree_nlt.c ctree/ctree_zone.c \
+      ctree/variants/f2fs/ctree_main.c \
+      ctree/variants/f2fs/bench_main_ctree.c \
+      -o build/ctree_f2fs -lzbd -lnvme -lpthread
  *
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -15,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/falloc.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,6 +102,104 @@ static inline int cns_bitmap_test(ztree_t *t, ztree_node_id_t nid)
     if (byte >= t->cns_bitmap_bytes)
         return 0;
     return (atomic_load_explicit(&t->cns_bitmap[byte], memory_order_relaxed) & bit) != 0;
+}
+
+/* ── Background punch_hole reaper ─────────────────────────────────────────
+ * Hot path marks node_id in punch_pending bitmap; reaper thread drains it
+ * via fallocate(PUNCH_HOLE), keeping F2FS inode-lock latency off the
+ * insert critical path.  Single-tree assumption; uses file-static state. */
+static _Atomic(uint8_t) *g_punch_pending;
+static uint32_t          g_punch_pending_bytes;
+static int               g_punch_cns_fd = -1;
+static pthread_t         g_punch_reaper_tid;
+static _Atomic(int)      g_punch_reaper_stop;
+static _Atomic(int)      g_punch_reaper_running;
+
+static void punch_drain_once(void)
+{
+    if (!g_punch_pending || g_punch_cns_fd < 0)
+        return;
+    for (uint32_t byte = 0; byte < g_punch_pending_bytes; byte++)
+    {
+        uint8_t b = atomic_exchange_explicit(&g_punch_pending[byte],
+                                             0, memory_order_acq_rel);
+        while (b)
+        {
+            int bit_idx = __builtin_ctz((unsigned)b);
+            ztree_node_id_t nid = ((ztree_node_id_t)byte << 3)
+                                + (ztree_node_id_t)bit_idx;
+            (void)nid;
+            /* DIAGNOSTIC: fallocate disabled — testing if reaper drain alone is OK */
+            /* off_t off = (off_t)nid * (off_t)ZTREE_PAGE_SIZE;
+            (void)fallocate(g_punch_cns_fd,
+                            FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                            off, ZTREE_PAGE_SIZE); */
+            b &= (uint8_t)(b - 1U);
+        }
+    }
+}
+
+static void *punch_reaper_thread(void *arg)
+{
+    (void)arg;
+    while (!atomic_load_explicit(&g_punch_reaper_stop, memory_order_acquire))
+    {
+        punch_drain_once();
+        struct timespec ts = { 0, 10 * 1000 * 1000 }; /* 10ms */
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+static void punch_reaper_start(int cns_fd, uint32_t bitmap_bytes)
+{
+    g_punch_cns_fd = cns_fd;
+    g_punch_pending_bytes = bitmap_bytes;
+    g_punch_pending = calloc(bitmap_bytes, sizeof(*g_punch_pending));
+    if (!g_punch_pending)
+    {
+        fprintf(stderr, "[ctree_f2fs] WARN: punch_pending alloc failed; reaper disabled\n");
+        return;
+    }
+    atomic_store(&g_punch_reaper_stop, 0);
+    if (pthread_create(&g_punch_reaper_tid, NULL, punch_reaper_thread, NULL) == 0)
+    {
+        atomic_store(&g_punch_reaper_running, 1);
+    }
+    else
+    {
+        fprintf(stderr, "[ctree_f2fs] WARN: punch reaper thread create failed\n");
+        free(g_punch_pending);
+        g_punch_pending = NULL;
+    }
+}
+
+static void punch_reaper_stop(void)
+{
+    if (atomic_load(&g_punch_reaper_running))
+    {
+        atomic_store_explicit(&g_punch_reaper_stop, 1, memory_order_release);
+        pthread_join(g_punch_reaper_tid, NULL);
+        atomic_store(&g_punch_reaper_running, 0);
+    }
+    /* Drain remaining pending punches synchronously before fd close */
+    punch_drain_once();
+    if (g_punch_pending)
+    {
+        free(g_punch_pending);
+        g_punch_pending = NULL;
+    }
+    g_punch_cns_fd = -1;
+}
+
+static inline void punch_pending_set(ztree_node_id_t nid)
+{
+    if (!g_punch_pending)
+        return;
+    uint32_t byte = nid / 8;
+    uint8_t  bit  = (uint8_t)(1U << (nid % 8));
+    if (byte < g_punch_pending_bytes)
+        atomic_fetch_or_explicit(&g_punch_pending[byte], bit, memory_order_relaxed);
 }
 
 /* ── Zone busy counter ──────────────────────────────────────────────────── */
@@ -762,7 +862,7 @@ static void write_superblock_sync(ztree_t *t)
     /* Rotate meta zone if it is almost full */
     if (t->meta_wp >= t->zones[t->active_meta_zone].capacity / ZTREE_PAGE_SIZE)
     {
-        fprintf(stderr, "[ctree] meta zone full, rotating\n");
+        fprintf(stderr, "[ctree_f2fs] meta zone full, rotating\n");
         rotate_meta_zone(t);
     }
 
@@ -1252,8 +1352,9 @@ retry_flush:
         /* Node written to ZNS */
         if (cns_bitmap_test(t, pg->node_id))
         {
-            /* CNS → ZNS */
+            /* CNS → ZNS: release CNS slot + queue F2FS block for reaper */
             atomic_fetch_sub_explicit(&t->stat_cns_current, 1, memory_order_relaxed);
+            punch_pending_set(pg->node_id);
         }
         cns_bitmap_clear(t, pg->node_id);
     }
@@ -1921,7 +2022,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
 
 cow_tree *cow_open(const char *path)
 {
-    fprintf(stderr, "[ctree] opening %s  cache_sets=%d ways=%d\n",
+    fprintf(stderr, "[ctree_f2fs] opening %s  cache_sets=%d ways=%d\n",
             path, ZTREE_CACHE_NUM_SETS, ZTREE_CACHE_WAYS);
 
     ztree_t *t = calloc(1, sizeof *t);
@@ -1960,7 +2061,7 @@ cow_tree *cow_open(const char *path)
     t->cns_fd = open(CTREE_CNS_FILE_PATH, O_RDWR | O_CREAT | O_DIRECT, 0644);
     if (t->cns_fd < 0)
     {
-        fprintf(stderr, "[ctree] WARNING: cannot open CNS file %s: %s\n"
+        fprintf(stderr, "[ctree_f2fs] WARNING: cannot open CNS file %s: %s\n"
                         "        CNS fallback disabled — will block on contention.\n",
                 CTREE_CNS_FILE_PATH, strerror(errno));
         /* Non-fatal: we can still operate (degrades to ztree behavior). */
@@ -1970,9 +2071,11 @@ cow_tree *cow_open(const char *path)
     t->cns_bitmap = calloc(t->cns_bitmap_bytes, sizeof(*t->cns_bitmap));
     if (!t->cns_bitmap)
     {
-        fprintf(stderr, "[ctree] WARNING: cannot allocate CNS bitmap (%u bytes)\n",
+        fprintf(stderr, "[ctree_f2fs] WARNING: cannot allocate CNS bitmap (%u bytes)\n",
                 t->cns_bitmap_bytes);
     }
+    if (t->cns_fd >= 0)
+        punch_reaper_start(t->cns_fd, t->cns_bitmap_bytes);
     atomic_store_explicit(&t->stat_cns_writes, 0, memory_order_relaxed);
     atomic_store_explicit(&t->stat_cns_current, 0, memory_order_relaxed);
     t->trace_fp = fopen("/tmp/ctree_trace.csv", "w");
@@ -2127,10 +2230,10 @@ cow_tree *cow_open(const char *path)
                     t->zone_write_locks);
 
     fprintf(stderr,
-            "[ctree] ILayer pool [%u, %u)  init_group=%u\n",
+            "[ctree_f2fs] ILayer pool [%u, %u)  init_group=%u\n",
             ilayer_pool_base, ilayer_pool_base + ilayer_pool_size, ilayer_init);
     fprintf(stderr,
-            "[ctree] LLayer hot-pool [%u, %u)  init_group=%u"
+            "[ctree_f2fs] LLayer hot-pool [%u, %u)  init_group=%u"
             "  cold-pool [%u, %u)  init_group=%u\n",
             hot_pool_base,  hot_pool_base  + hot_pool_size,  ZTREE_LZGROUP_HOT_INIT,
             cold_pool_base, cold_pool_base + cold_pool_size, ZTREE_LZGROUP_COLD_INIT);
@@ -2328,6 +2431,8 @@ void cow_close(cow_tree *t)
     zbd_close(t->fd);
     if (t->direct_fd >= 0)
         close(t->direct_fd);
+    /* Stop reaper before closing cns_fd; drains remaining punches */
+    punch_reaper_stop();
     if (t->cns_fd >= 0)
         close(t->cns_fd);
     if (t->cns_bitmap)

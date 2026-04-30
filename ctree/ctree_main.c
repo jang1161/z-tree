@@ -332,20 +332,34 @@ static void cache_insert(ztree_t *t, ztree_pagenum_t pn, const ztree_page *src)
                                                memory_order_relaxed);
     pthread_mutex_lock(&set->lock);
 
-    /* Find an empty slot or the LRU victim */
-    int victim = 0;
-    uint64_t min_lru = set->ways[0].lru_counter;
+    /* Dedupe by tag: same pn must occupy at most one way (otherwise
+     * cache_lookup may return a stale duplicate). */
+    int victim = -1;
     for (int i = 0; i < ZTREE_CACHE_WAYS; i++)
     {
-        if (!set->ways[i].valid)
+        if (set->ways[i].valid && set->ways[i].tag == pn)
         {
             victim = i;
             break;
         }
-        if (set->ways[i].lru_counter < min_lru)
+    }
+
+    if (victim < 0)
+    {
+        victim = 0;
+        uint64_t min_lru = set->ways[0].lru_counter;
+        for (int i = 0; i < ZTREE_CACHE_WAYS; i++)
         {
-            min_lru = set->ways[i].lru_counter;
-            victim = i;
+            if (!set->ways[i].valid)
+            {
+                victim = i;
+                break;
+            }
+            if (set->ways[i].lru_counter < min_lru)
+            {
+                min_lru = set->ways[i].lru_counter;
+                victim = i;
+            }
         }
     }
 

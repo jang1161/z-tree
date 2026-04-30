@@ -25,16 +25,16 @@
 #define ZTREE_PAGE_SIZE         4096U
 
 /*
- * Zone layout: zones 0-1 RLayer, 2-17 ILayer, 18+ LLayer (80/20 hot/cold).
+ * Zone layout: zones 0-1 RLayer, 2-49 ILayer, 50+ LLayer (80/20 hot/cold).
  * Active-zone budget (device limit=14): IZ(3)+Hot(8)+Cold(2)+Meta(1)=14.
  * Original paper split (IZ=4, Hot=6, Cold=2) in comments per #define.
  */
 #define ZTREE_META_ZONE_0          0U
 #define ZTREE_META_ZONE_1          1U
 #define ZTREE_ILAYER_ZONE_START    2U   /* first zone of ILayer pool        */
-#define ZTREE_ILAYER_POOL_SIZE    32U   /* ILayer pool size (zones 2-33)    */
+#define ZTREE_ILAYER_POOL_SIZE    48U   /* ILayer pool size (zones 2-49)    */
 #define ZTREE_ILAYER_INIT_COUNT    3U   /* initial IZGroup size (paper: 4)  */
-#define ZTREE_LLAYER_ZONE_START   34U   /* first zone of LLayer pool        */
+#define ZTREE_LLAYER_ZONE_START   50U   /* first zone of LLayer pool        */
 #define ZTREE_LZGROUP_INIT_SIZE   10U   /* initial LZGroup total size       */
 #define ZTREE_LZGROUP_HOT_INIT     8U   /* initial hot  zones (paper: 6)    */
 #define ZTREE_LZGROUP_COLD_INIT    2U   /* initial cold zones (paper: 2)    */

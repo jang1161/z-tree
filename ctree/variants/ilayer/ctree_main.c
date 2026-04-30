@@ -42,15 +42,6 @@
 #undef  ZTREE_LZGROUP_COLD_INIT
 #define ZTREE_LZGROUP_COLD_INIT    3U
 
-/* ── Diagnostic counters (non-atomic accumulators in ztree_t struct via
- *    repurposing unused stat_cns_* fields) ───────────────────────────────── */
-static _Atomic(uint64_t) g_dbg_leaf_split_attempts = 0;
-static _Atomic(uint64_t) g_dbg_internal_split_attempts = 0;
-static _Atomic(uint64_t) g_dbg_root_publish_success = 0;
-static _Atomic(uint64_t) g_dbg_root_publish_fail = 0;
-static _Atomic(uint64_t) g_dbg_retry_descent = 0;
-static _Atomic(uint64_t) g_dbg_max_descent_depth = 0;
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * Internal constants
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -324,11 +315,8 @@ static void cache_insert(ztree_t *t, ztree_pagenum_t pn, const ztree_page *src)
                                                memory_order_relaxed);
     pthread_mutex_lock(&set->lock);
 
-    /* CRITICAL: dedupe by tag first.  Without this, repeated cache_insert with
-     * the same pn (e.g. fixed-slot CNS internal CoW where pn=node_id|HIGH_BIT
-     * is invariant across CoW versions) writes to DIFFERENT ways, leaving
-     * multiple ways with the same tag holding stale versions.  cache_lookup
-     * returns the first match, so a stale version can be served. */
+    /* Dedupe by tag: same pn must occupy at most one way (otherwise
+     * cache_lookup may return a stale duplicate). */
     int victim = -1;
     for (int i = 0; i < ZTREE_CACHE_WAYS; i++)
     {
@@ -1247,15 +1235,6 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                 }
 
                 depth++;
-                {
-                    uint64_t cur_max = atomic_load_explicit(&g_dbg_max_descent_depth, memory_order_relaxed);
-                    while ((uint64_t)depth > cur_max) {
-                        if (atomic_compare_exchange_weak_explicit(&g_dbg_max_descent_depth,
-                                &cur_max, (uint64_t)depth,
-                                memory_order_relaxed, memory_order_relaxed))
-                            break;
-                    }
-                }
                 break;
             }
 
@@ -1322,8 +1301,6 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                     tmp[i + 1] = leaf->leaf[i];
                 tmp[pos].key = (uint64_t)key;
                 memcpy(tmp[pos].record.value, value, 120);
-
-                atomic_fetch_add_explicit(&g_dbg_leaf_split_attempts, 1, memory_order_relaxed);
 
                 uint32_t sp = ZTREE_LEAF_ORDER / 2;
                 ztree_page right;
@@ -1431,8 +1408,6 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                     }
                     else
                     {
-                        atomic_fetch_add_explicit(&g_dbg_internal_split_attempts, 1, memory_order_relaxed);
-
                         int64_t tkeys[ZTREE_INTERNAL_ORDER];
                         ztree_node_id_t tchld[ZTREE_INTERNAL_ORDER + 1];
                         uint32_t tchld_zone[ZTREE_INTERNAL_ORDER + 1];
@@ -1574,15 +1549,11 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
         if (try_publish_root_if_unchanged(t, seq_snapshot,
                                           new_root_nid, new_root_zone, new_root_slot))
         {
-            atomic_fetch_add_explicit(&g_dbg_root_publish_success, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&t->stat_inserts, 1, memory_order_relaxed);
             return;
         }
-        atomic_fetch_add_explicit(&g_dbg_root_publish_fail, 1, memory_order_relaxed);
 
-    retry_insert:
-        atomic_fetch_add_explicit(&g_dbg_retry_descent, 1, memory_order_relaxed);
-        ;
+    retry_insert:;
     }
 }
 
@@ -1861,13 +1832,6 @@ void cow_close(cow_tree *t)
     uint64_t fl_samp = atomic_load_explicit(&t->stat_flush_ns_samples, memory_order_relaxed);
     uint64_t cns_writes = atomic_load_explicit(&t->stat_cns_writes, memory_order_relaxed);
 
-    uint64_t dbg_leaf_split = atomic_load_explicit(&g_dbg_leaf_split_attempts, memory_order_relaxed);
-    uint64_t dbg_int_split  = atomic_load_explicit(&g_dbg_internal_split_attempts, memory_order_relaxed);
-    uint64_t dbg_pub_ok     = atomic_load_explicit(&g_dbg_root_publish_success, memory_order_relaxed);
-    uint64_t dbg_pub_fail   = atomic_load_explicit(&g_dbg_root_publish_fail, memory_order_relaxed);
-    uint64_t dbg_retry      = atomic_load_explicit(&g_dbg_retry_descent, memory_order_relaxed);
-    uint64_t dbg_max_depth  = atomic_load_explicit(&g_dbg_max_descent_depth, memory_order_relaxed);
-
     fprintf(stderr,
             "\n[ctree_ilayer profile]\n"
             "  inserts        = %llu\n"
@@ -1878,14 +1842,7 @@ void cow_close(cow_tree *t)
             "    nlt_only_updates  = %llu  (parent skipped, same zone OR internal CoW)\n"
             "    zone_changes      = %llu  (leaf moved to new zone)\n"
             "    parent_rewrites   = %llu\n"
-            "  avg_flush_us   = %.1f\n"
-            "  *** structural diagnostics ***\n"
-            "    leaf_split_attempts     = %llu\n"
-            "    internal_split_attempts = %llu\n"
-            "    root_publish_success    = %llu\n"
-            "    root_publish_fail (CAS) = %llu\n"
-            "    retry_descent           = %llu\n"
-            "    max_descent_depth       = %llu  (= tree height)\n",
+            "  avg_flush_us   = %.1f\n",
             (unsigned long long)inserts,
             (unsigned long long)ch,
             (unsigned long long)cm,
@@ -1896,13 +1853,7 @@ void cow_close(cow_tree *t)
             (unsigned long long)nlt_only,
             (unsigned long long)zone_chg,
             (unsigned long long)par_rew,
-            (fl_samp > 0) ? (double)fl_sum / (double)fl_samp / 1000.0 : 0.0,
-            (unsigned long long)dbg_leaf_split,
-            (unsigned long long)dbg_int_split,
-            (unsigned long long)dbg_pub_ok,
-            (unsigned long long)dbg_pub_fail,
-            (unsigned long long)dbg_retry,
-            (unsigned long long)dbg_max_depth);
+            (fl_samp > 0) ? (double)fl_sum / (double)fl_samp / 1000.0 : 0.0);
 
     uint64_t nlt_wait  = atomic_load_explicit(&t->nlt.prof_wait_ns_sum,   memory_order_relaxed);
     uint64_t nlt_hold  = atomic_load_explicit(&t->nlt.prof_hold_ns_sum,   memory_order_relaxed);

@@ -42,6 +42,9 @@
 #undef  ZTREE_LZGROUP_COLD_INIT
 #define ZTREE_LZGROUP_COLD_INIT    3U
 
+/* CNS I/O mode toggle (env var CNS_ODIRECT=1 to enable). */
+static int g_cns_odirect = 0;
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Internal constants
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -409,7 +412,7 @@ static void load_page_by_pn(ztree_t *t, ztree_pagenum_t pn, ztree_page *dst)
     }
 }
 
-/* Read a page from CNS (buffered I/O, served from page cache when warm). */
+/* Read a page from CNS.  O_DIRECT path uses an aligned bounce buffer. */
 static void load_page_from_cns(ztree_t *t, uint32_t slot_id, ztree_page *dst)
 {
     ztree_pagenum_t pn = cns_cache_tag(slot_id);
@@ -419,7 +422,18 @@ static void load_page_from_cns(ztree_t *t, uint32_t slot_id, ztree_page *dst)
 
     atomic_fetch_add_explicit(&t->stat_cache_miss, 1, memory_order_relaxed);
 
-    ssize_t n = pread(t->cns_fd, dst, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+    ssize_t n;
+    if (g_cns_odirect)
+    {
+        _Alignas(ZTREE_PAGE_SIZE) char raw[ZTREE_PAGE_SIZE];
+        n = pread(t->cns_fd, raw, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+        if (n == (ssize_t)ZTREE_PAGE_SIZE)
+            memcpy(dst, raw, ZTREE_PAGE_SIZE);
+    }
+    else
+    {
+        n = pread(t->cns_fd, dst, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+    }
     if (n != (ssize_t)ZTREE_PAGE_SIZE)
     {
         fprintf(stderr, "load_page_from_cns: pread ret=%ld err=%d slot=%u\n",
@@ -821,10 +835,19 @@ static void flush_page_immediate(ztree_t *t,
         pg->zone_id = CTREE_CNS_ZONE_ID;
         pg->slot_id = slot_id;
 
-        /* Buffered pwrite (no O_DIRECT): kernel page cache coalesces hot-LBA
-         * rewrites of repeatedly CoW'd internals. */
-        if (pwrite(t->cns_fd, pg, ZTREE_PAGE_SIZE,
-                   cns_slot_offset(slot_id)) != (ssize_t)ZTREE_PAGE_SIZE)
+        /* O_DIRECT requires page-aligned buffer; buffered mode can use pg directly. */
+        ssize_t pwr;
+        if (g_cns_odirect)
+        {
+            _Alignas(ZTREE_PAGE_SIZE) char bounce[ZTREE_PAGE_SIZE];
+            memcpy(bounce, pg, ZTREE_PAGE_SIZE);
+            pwr = pwrite(t->cns_fd, bounce, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+        }
+        else
+        {
+            pwr = pwrite(t->cns_fd, pg, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+        }
+        if (pwr != (ssize_t)ZTREE_PAGE_SIZE)
         {
             fprintf(stderr,
                     "flush_page_immediate: pwrite CNS slot=%u node_id=%u errno=%d (%s)\n",
@@ -1599,9 +1622,17 @@ cow_tree *cow_open(const char *path)
     t->direct_fd = open(path, O_RDWR | O_DIRECT);
 
     /* CNS device is REQUIRED — internal nodes have no ZNS fallback.
-     * Buffered I/O (no O_DIRECT): kernel page cache absorbs hot-LBA rewrites
-     * for repeatedly CoW'd internal nodes (root, upper internals). */
-    t->cns_fd = open(CTREE_CNS_DEV_PATH, O_RDWR);
+     * Default: buffered I/O (page cache absorbs hot-LBA rewrites).
+     * Override with env CNS_ODIRECT=1 for O_DIRECT (no kernel cache). */
+    {
+        const char *od = getenv("CNS_ODIRECT");
+        g_cns_odirect = (od && atoi(od) != 0) ? 1 : 0;
+    }
+    int cns_flags = O_RDWR | (g_cns_odirect ? O_DIRECT : 0);
+    t->cns_fd = open(CTREE_CNS_DEV_PATH, cns_flags);
+    fprintf(stderr,
+            "[ctree_ilayer] CNS mode: %s\n",
+            g_cns_odirect ? "O_DIRECT (page cache bypassed)" : "buffered I/O");
     if (t->cns_fd < 0)
     {
         fprintf(stderr,

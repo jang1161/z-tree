@@ -45,6 +45,9 @@
 /* CNS I/O mode toggle (env var CNS_ODIRECT=1 to enable). */
 static int g_cns_odirect = 0;
 
+/* Trace every TRACE_SAMPLE_INTERVAL page_appends to /tmp/ctree_ilayer_trace.csv */
+#define TRACE_SAMPLE_INTERVAL 10000U
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Internal constants
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -91,6 +94,28 @@ static inline uint64_t monotonic_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static inline void maybe_trace_sample(ztree_t *t)
+{
+    if (!t->trace_fp)
+        return;
+    uint64_t total = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed);
+    if (total % TRACE_SAMPLE_INTERVAL != 0)
+        return;
+    double elapsed = (double)(monotonic_ns() - t->trace_start_ns) / 1e9;
+    int64_t internals = atomic_load_explicit(&t->stat_cns_current, memory_order_relaxed);
+    uint32_t total_nodes = atomic_load_explicit(&t->next_node_id, memory_order_relaxed) - 1;
+    int64_t leaves = (int64_t)total_nodes - internals;
+    uint64_t cns_w = atomic_load_explicit(&t->stat_cns_writes, memory_order_relaxed);
+    uint32_t height = atomic_load_explicit(&t->tree_height, memory_order_relaxed);
+    fprintf(t->trace_fp, "%.3f,%lld,%lld,%llu,%llu,%u\n",
+            elapsed,
+            (long long)leaves,
+            (long long)internals,
+            (unsigned long long)total,
+            (unsigned long long)cns_w,
+            height);
 }
 
 static inline uint64_t ztree_hash64(ztree_node_id_t id)
@@ -867,6 +892,7 @@ static void flush_page_immediate(ztree_t *t,
         atomic_fetch_add_explicit(&t->stat_cns_writes, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&t->stat_nlt_only_updates, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&t->stat_page_appends, 1, memory_order_relaxed);
+        maybe_trace_sample(t);
 
         if (out_zone_changed)
             *out_zone_changed = 0;
@@ -1058,6 +1084,7 @@ retry_flush:
     zone_heat_record_write(&t->za, pg->node_id);
 
     atomic_fetch_add_explicit(&t->stat_page_appends, 1, memory_order_relaxed);
+    maybe_trace_sample(t);
 
     if (prev_zone != ZTREE_INVALID_ZONE_ID && prev_zone == target_zone)
     {
@@ -1481,6 +1508,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                         memset(&right, 0, sizeof right);
                         right.is_leaf = 0;
                         right.node_id = assign_stable_node_id(t);
+                        atomic_fetch_add_explicit(&t->stat_cns_current, 1, memory_order_relaxed);
                         right.num_keys = ZTREE_INTERNAL_ORDER - sp;
                         for (uint32_t j = sp; j < ZTREE_INTERNAL_ORDER; j++)
                         {
@@ -1525,6 +1553,8 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
             memset(&nr, 0, sizeof nr);
             nr.is_leaf = 0;
             nr.node_id = assign_stable_node_id(t);
+            atomic_fetch_add_explicit(&t->stat_cns_current, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&t->tree_height, 1, memory_order_relaxed);
             nr.num_keys = 1;
             nr.internal[0].key = (uint64_t)prop.promote_key;
             nr.internal[0].child_node_id = prop.left_id;
@@ -1649,6 +1679,16 @@ cow_tree *cow_open(const char *path)
     /* No CNS bitmap in this variant — location is determined by pg->is_leaf. */
     t->cns_bitmap = NULL;
     t->cns_bitmap_bytes = 0;
+
+    /* Trace: per-time-step ZNS leaf vs CNS internal valid page counts.
+     * Columns match plot_zns_cns_trace.py schema. */
+    t->trace_fp = fopen("/tmp/ctree_ilayer_trace.csv", "w");
+    t->trace_start_ns = monotonic_ns();
+    if (t->trace_fp)
+        fprintf(t->trace_fp, "time_sec,zns_current,cns_current,appends,cns_writes,height\n");
+    atomic_store_explicit(&t->stat_cns_current, 0, memory_order_relaxed);
+    atomic_store_explicit(&t->stat_cns_writes, 0, memory_order_relaxed);
+    atomic_store_explicit(&t->tree_height, 1, memory_order_relaxed);
 
     t->zones = calloc(t->info.nr_zones, sizeof *t->zones);
     t->zone_wp_bytes = calloc(t->info.nr_zones, sizeof *t->zone_wp_bytes);
@@ -1980,6 +2020,8 @@ void cow_close(cow_tree *t)
         close(t->direct_fd);
     if (t->cns_fd >= 0)
         close(t->cns_fd);
+    if (t->trace_fp)
+        fclose(t->trace_fp);
 
     pthread_mutex_destroy(&t->sb_lock);
 

@@ -887,7 +887,7 @@ static void flush_page_immediate(ztree_t *t,
             .node_id = pg->node_id,
             .slot_id = slot_id,
         };
-        nlt_update(&t->nlt, &loc);
+        nlt_update_migrate(&t->nlt, &loc, prev_zone);
 
         atomic_fetch_add_explicit(&t->stat_cns_writes, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&t->stat_nlt_only_updates, 1, memory_order_relaxed);
@@ -1067,7 +1067,9 @@ retry_flush:
         .node_id = pg->node_id,
         .slot_id = slot_id,
     };
-    nlt_update(&t->nlt, &loc);
+    /* Atomic insert-new + remove-stale-from-prev so each node has exactly
+     * one bucket entry (paper §3.1.2 "latest valid" invariant). */
+    nlt_update_migrate(&t->nlt, &loc, prev_zone);
 
     uint64_t zone_bytes_used = new_wp - t->zones[target_zone].start;
     uint64_t seal_threshold = (t->zones[target_zone].capacity * 95ULL) / 100ULL;

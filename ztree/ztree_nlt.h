@@ -53,6 +53,13 @@ typedef struct
     _Atomic(uint64_t) generation; /* detects concurrent resize/update   */
     pthread_rwlock_t grow_lock;   /* protects grow/rehash + updates     */
 
+    /* Compact list of bucket indices that have a tracker allocated.
+     * Maintained under wrlock; read under rdlock.  Lets the fallback scan
+     * in nlt_lookup iterate ~N_active_zones (~150) instead of capacity (~65K). */
+    size_t *active_buckets;
+    size_t  active_buckets_count;
+    size_t  active_buckets_cap;
+
     /* ── Lock contention profile (global wrlock) ───────────────────── */
     _Atomic(uint64_t) prof_wait_ns_sum;     /* Σ time blocked waiting for wrlock */
     _Atomic(uint64_t) prof_hold_ns_sum;     /* Σ time wrlock was held            */
@@ -78,6 +85,12 @@ int nlt_lookup(nlt_t *nlt, const nlt_location_t *query, nlt_location_t *out);
 
 /* nlt_update  –  insert or update location; auto-grows at 70% load. */
 void nlt_update(nlt_t *nlt, const nlt_location_t *entry);
+
+/* nlt_update_migrate  –  atomic insert-new + remove-stale on zone migration.
+ * Maintains the "at most one bucket per node" invariant under one wrlock. */
+void nlt_update_migrate(nlt_t *nlt,
+                        const nlt_location_t *new_entry,
+                        uint32_t prev_zone);
 
 /*
  * nlt_remove  –  remove the entry for node_id (e.g. after a merge / delete).

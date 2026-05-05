@@ -9,7 +9,7 @@
 #include "ctree_nlt.h"
 
 /* ───────────────────────────────────────────────────────────────────────────
- * Lock contention profiling helpers (wrlock wait/hold/count/max)
+ * Lock contention profiling (alloc_lock only — hot path is lock-free)
  * ─────────────────────────────────────────────────────────────────────────── */
 
 static inline uint64_t nlt_monotonic_ns(void)
@@ -42,10 +42,10 @@ static inline void nlt_record_lock(nlt_t *nlt,
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
- * Internal helpers
+ * Hashing & helpers
  * ─────────────────────────────────────────────────────────────────────────── */
 
-static inline uint64_t nlt_hash(ztree_node_id_t id)
+static inline uint64_t nlt_hash_node(ztree_node_id_t id)
 {
     uint64_t x = id;
     x ^= x >> 30;
@@ -58,15 +58,13 @@ static inline uint64_t nlt_hash(ztree_node_id_t id)
 
 static inline uint64_t nlt_hash_zone(uint32_t zone_id)
 {
-    return nlt_hash((ztree_node_id_t)zone_id ^ 0x9e3779b9U);
+    return nlt_hash_node((ztree_node_id_t)zone_id ^ 0x9e3779b9U);
 }
 
 static size_t next_pow2(size_t n)
 {
     if (n == 0)
-    {
         return 1;
-    }
     n--;
     n |= n >> 1;
     n |= n >> 2;
@@ -77,297 +75,316 @@ static size_t next_pow2(size_t n)
     return n + 1;
 }
 
-static void nlt_tracker_reset(nlt_tracker_t *tracker, size_t capacity)
+static inline nlt_slot_t *nlt_zone_tracker(const nlt_zone_entry_t *zone)
 {
-    size_t cap = next_pow2(capacity < 16 ? 16 : capacity);
-    tracker->entries = calloc(cap, sizeof(*tracker->entries));
-    if (!tracker->entries)
-    {
-        perror("nlt_tracker_reset: calloc");
-        exit(EXIT_FAILURE);
-    }
-    tracker->capacity = cap;
-    atomic_store_explicit(&tracker->used, 0, memory_order_relaxed);
+    return (nlt_slot_t *)atomic_load_explicit(&zone->tracker,
+                                              memory_order_acquire);
 }
 
-static void nlt_tracker_destroy(nlt_tracker_t *tracker)
-{
-    free(tracker->entries);
-    tracker->entries = NULL;
-    tracker->capacity = 0;
-    atomic_store_explicit(&tracker->used, 0, memory_order_relaxed);
-}
+/* ───────────────────────────────────────────────────────────────────────────
+ * Zone-bucket probing
+ * ─────────────────────────────────────────────────────────────────────────── */
 
-static size_t nlt_probe_zone(const nlt_zone_entry_t *zones, size_t cap,
-                             uint32_t zone_id)
-{
-    size_t mask = cap - 1;
-    size_t pos = (size_t)(nlt_hash_zone(zone_id) & (uint64_t)mask);
-
-    for (;;)
-    {
-        uint32_t cur = zones[pos].zone_id;
-        if (cur == ZTREE_INVALID_ZONE_ID || cur == zone_id)
-        {
-            return pos;
-        }
-        pos = (pos + 1) & mask;
-    }
-}
-
-static size_t nlt_probe_tracker(const nlt_tracker_t *tracker, size_t cap,
-                                ztree_node_id_t node_id)
-{
-    size_t mask = cap - 1;
-    size_t pos = (size_t)(nlt_hash(node_id) & (uint64_t)mask);
-
-    for (;;)
-    {
-        ztree_node_id_t cur = tracker->entries[pos].node_id;
-        if (cur == ZTREE_INVALID_NODE_ID || cur == node_id)
-        {
-            return pos;
-        }
-        pos = (pos + 1) & mask;
-    }
-}
-
-static void nlt_active_buckets_add(nlt_t *nlt, size_t pos);
-
-static void nlt_zone_init_empty(nlt_zone_entry_t *zone)
-{
-    zone->zone_id = ZTREE_INVALID_ZONE_ID;
-    zone->sealed = 0;
-    zone->_pad[0] = 0;
-    zone->_pad[1] = 0;
-    zone->_pad[2] = 0;
-    zone->tracker.entries = NULL;
-    zone->tracker.capacity = 0;
-    atomic_store_explicit(&zone->tracker.used, 0, memory_order_relaxed);
-}
-
-static void nlt_grow_zones(nlt_t *nlt, size_t new_cap)
-{
-    size_t cap = next_pow2(new_cap < 16 ? 16 : new_cap);
-    nlt_zone_entry_t *new_zones = calloc(cap, sizeof(*new_zones));
-    if (!new_zones)
-    {
-        perror("nlt_grow_zones: calloc");
-        exit(EXIT_FAILURE);
-    }
-    for (size_t i = 0; i < cap; i++)
-    {
-        nlt_zone_init_empty(&new_zones[i]);
-    }
-
-    for (size_t i = 0; i < nlt->capacity; i++)
-    {
-        if (nlt->zones[i].zone_id == ZTREE_INVALID_ZONE_ID)
-        {
-            continue;
-        }
-
-        size_t pos = nlt_probe_zone(new_zones, cap, nlt->zones[i].zone_id);
-        new_zones[pos].zone_id = nlt->zones[i].zone_id;
-        new_zones[pos].sealed = nlt->zones[i].sealed;
-        nlt_tracker_reset(&new_zones[pos].tracker,
-                          nlt->zones[i].tracker.capacity);
-
-        for (size_t j = 0; j < nlt->zones[i].tracker.capacity; j++)
-        {
-            ztree_node_id_t node_id = nlt->zones[i].tracker.entries[j].node_id;
-            if (node_id == ZTREE_INVALID_NODE_ID)
-            {
-                continue;
-            }
-            size_t tpos = nlt_probe_tracker(&new_zones[pos].tracker,
-                                            new_zones[pos].tracker.capacity,
-                                            node_id);
-            new_zones[pos].tracker.entries[tpos] = nlt->zones[i].tracker.entries[j];
-        }
-        atomic_store_explicit(&new_zones[pos].tracker.used,
-                              atomic_load_explicit(&nlt->zones[i].tracker.used,
-                                                   memory_order_relaxed),
-                              memory_order_relaxed);
-    }
-
-    for (size_t i = 0; i < nlt->capacity; i++)
-    {
-        if (nlt->zones[i].zone_id == ZTREE_INVALID_ZONE_ID)
-        {
-            continue;
-        }
-        nlt_tracker_destroy(&nlt->zones[i].tracker);
-    }
-
-    free(nlt->zones);
-    nlt->zones = new_zones;
-    nlt->capacity = cap;
-
-    /* Bucket positions changed (rehash); rebuild the active list. */
-    nlt->active_buckets_count = 0;
-    for (size_t i = 0; i < cap; i++)
-    {
-        if (new_zones[i].zone_id != ZTREE_INVALID_ZONE_ID)
-            nlt_active_buckets_add(nlt, i);
-    }
-
-    atomic_fetch_add_explicit(&nlt->generation, 1, memory_order_release);
-}
-
-static nlt_zone_entry_t *nlt_find_zone_entry(nlt_t *nlt, uint32_t zone_id,
-                                             int create)
+/* Locate or claim the bucket for zone_id.  Reader-friendly:
+ *   - returns the bucket if zone_id is already attached (no lock)
+ *   - if create_alloc_lock is held by caller, may publish a new bucket */
+static nlt_zone_entry_t *nlt_probe_zone_atomic(nlt_t *nlt, uint32_t zone_id)
 {
     if (zone_id == ZTREE_INVALID_ZONE_ID)
-    {
         return NULL;
-    }
 
-    size_t pos = nlt_probe_zone(nlt->zones, nlt->capacity, zone_id);
-    if (nlt->zones[pos].zone_id == zone_id)
+    size_t cap  = nlt->capacity;
+    size_t mask = cap - 1;
+    size_t pos  = (size_t)(nlt_hash_zone(zone_id) & (uint64_t)mask);
+
+    /* Bound the probe at capacity to be safe even under heavy collision. */
+    for (size_t i = 0; i < cap; i++)
     {
-        return &nlt->zones[pos];
+        uint32_t cur = atomic_load_explicit(&nlt->zones[pos].zone_id,
+                                            memory_order_acquire);
+        if (cur == zone_id)
+            return &nlt->zones[pos];
+        if (cur == ZTREE_INVALID_ZONE_ID)
+            return NULL;
+        pos = (pos + 1) & mask;
     }
-
-    if (!create)
-    {
-        return NULL;
-    }
-
-    size_t used = atomic_load_explicit(&nlt->used, memory_order_relaxed);
-    if ((used + 1) * 10 >= nlt->capacity * 7)
-    {
-        nlt_grow_zones(nlt, nlt->capacity * 2);
-        pos = nlt_probe_zone(nlt->zones, nlt->capacity, zone_id);
-    }
-
-    if (nlt->zones[pos].zone_id == ZTREE_INVALID_ZONE_ID)
-    {
-        nlt->zones[pos].zone_id = zone_id;
-        nlt->zones[pos].sealed = 0;
-        nlt_tracker_reset(&nlt->zones[pos].tracker, 16);
-        atomic_fetch_add_explicit(&nlt->used, 1, memory_order_relaxed);
-        nlt_active_buckets_add(nlt, pos);
-    }
-
-    return &nlt->zones[pos];
+    return NULL;
 }
 
-static void nlt_tracker_grow_if_needed(nlt_zone_entry_t *zone)
+/* Slow path: ensure a bucket exists for zone_id.  Allocates the tracker
+ * and atomically publishes zone_id.  Single-threaded under alloc_lock. */
+static nlt_zone_entry_t *nlt_attach_zone(nlt_t *nlt, uint32_t zone_id)
 {
-    size_t used = atomic_load_explicit(&zone->tracker.used, memory_order_relaxed);
-    if ((used + 1) * 10 < zone->tracker.capacity * 7)
+    if (zone_id == ZTREE_INVALID_ZONE_ID)
+        return NULL;
+
+    nlt_zone_entry_t *existing = nlt_probe_zone_atomic(nlt, zone_id);
+    if (existing)
+        return existing;
+
+    /* Allocate-and-publish under alloc_lock. */
+    uint64_t lock_t0 = nlt_monotonic_ns();
+    pthread_mutex_lock(&nlt->alloc_lock);
+    uint64_t lock_t1 = nlt_monotonic_ns();
+
+    /* Re-check under lock — another thread may have attached the bucket. */
+    existing = nlt_probe_zone_atomic(nlt, zone_id);
+    if (existing)
     {
-        return;
+        uint64_t lock_t2 = nlt_monotonic_ns();
+        pthread_mutex_unlock(&nlt->alloc_lock);
+        nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
+        return existing;
     }
 
-    nlt_tracker_t new_tracker;
-    nlt_tracker_reset(&new_tracker, zone->tracker.capacity * 2);
-
-    for (size_t i = 0; i < zone->tracker.capacity; i++)
+    /* Find an empty slot in zones[].  zones[] is fixed-size, so callers
+     * must size it well above max attached zones. */
+    size_t cap  = nlt->capacity;
+    size_t mask = cap - 1;
+    size_t pos  = (size_t)(nlt_hash_zone(zone_id) & (uint64_t)mask);
+    size_t target = SIZE_MAX;
+    for (size_t i = 0; i < cap; i++)
     {
-        ztree_node_id_t node_id = zone->tracker.entries[i].node_id;
-        if (node_id == ZTREE_INVALID_NODE_ID)
+        uint32_t cur = atomic_load_explicit(&nlt->zones[pos].zone_id,
+                                            memory_order_relaxed);
+        if (cur == ZTREE_INVALID_ZONE_ID)
         {
+            target = pos;
+            break;
+        }
+        pos = (pos + 1) & mask;
+    }
+    if (target == SIZE_MAX)
+    {
+        fprintf(stderr,
+                "nlt_attach_zone: zones[] full (capacity=%zu) for zone_id=%u\n",
+                cap, zone_id);
+        uint64_t lock_t2 = nlt_monotonic_ns();
+        pthread_mutex_unlock(&nlt->alloc_lock);
+        nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
+        return NULL;
+    }
+
+    nlt_zone_entry_t *zone = &nlt->zones[target];
+
+    /* Allocate tracker (zero-initialised → all slots EMPTY). */
+    if (atomic_load_explicit(&zone->tracker, memory_order_relaxed) == 0)
+    {
+        nlt_slot_t *tracker = calloc(nlt->tracker_cap, sizeof(*tracker));
+        if (!tracker)
+        {
+            perror("nlt_attach_zone: calloc tracker");
+            uint64_t lock_t2 = nlt_monotonic_ns();
+            pthread_mutex_unlock(&nlt->alloc_lock);
+            nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
+            return NULL;
+        }
+        zone->tracker_cap = nlt->tracker_cap;
+        atomic_store_explicit(&zone->used, 0, memory_order_relaxed);
+        atomic_store_explicit(&zone->sealed, 0, memory_order_relaxed);
+        /* Publish tracker pointer with release so readers that load
+         * zone_id (acquire) see a fully-initialised tracker. */
+        atomic_store_explicit(&zone->tracker, (uintptr_t)tracker,
+                              memory_order_release);
+    }
+
+    /* Publish zone_id last; a successful acquire-load on zone_id implies
+     * the tracker pointer / capacity are visible. */
+    atomic_store_explicit(&zone->zone_id, zone_id, memory_order_release);
+    atomic_fetch_add_explicit(&nlt->used, 1, memory_order_relaxed);
+
+    uint64_t lock_t2 = nlt_monotonic_ns();
+    pthread_mutex_unlock(&nlt->alloc_lock);
+    nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
+
+    return zone;
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Tracker probing
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/* Lock-free linear probe.  Returns the matching slot value (non-empty,
+ * non-tombstone) and writes its position into *out_pos when found.
+ * Returns NLT_SLOT_EMPTY if not present. */
+static uint64_t nlt_tracker_lookup(nlt_slot_t *tracker, size_t cap,
+                                   ztree_node_id_t node_id,
+                                   size_t *out_pos)
+{
+    if (!tracker || cap == 0 || node_id == ZTREE_INVALID_NODE_ID)
+        return NLT_SLOT_EMPTY;
+
+    size_t mask = cap - 1;
+    size_t pos  = (size_t)(nlt_hash_node(node_id) & (uint64_t)mask);
+
+    for (size_t i = 0; i < cap; i++)
+    {
+        uint64_t v = atomic_load_explicit(&tracker[pos], memory_order_acquire);
+        if (v == NLT_SLOT_EMPTY)
+            return NLT_SLOT_EMPTY;                 /* probe ends at empty */
+        if (v != NLT_SLOT_TOMBSTONE &&
+            nlt_unpack_node(v) == node_id)
+        {
+            if (out_pos) *out_pos = pos;
+            return v;
+        }
+        pos = (pos + 1) & mask;
+    }
+    return NLT_SLOT_EMPTY;
+}
+
+/* Lock-free insert/update.  Claims an empty / tombstone slot via CAS, or
+ * overwrites an existing entry for the same node_id.  Returns 1 on success. */
+static int nlt_tracker_publish(nlt_zone_entry_t *zone,
+                               ztree_node_id_t node_id,
+                               uint32_t slot_id)
+{
+    nlt_slot_t *tracker = nlt_zone_tracker(zone);
+    if (!tracker || zone->tracker_cap == 0)
+        return 0;
+
+    size_t cap  = zone->tracker_cap;
+    size_t mask = cap - 1;
+    size_t pos  = (size_t)(nlt_hash_node(node_id) & (uint64_t)mask);
+    uint64_t new_v = nlt_pack(node_id, slot_id);
+
+    for (size_t i = 0; i < cap; i++)
+    {
+        uint64_t v = atomic_load_explicit(&tracker[pos], memory_order_acquire);
+
+        if (v == NLT_SLOT_EMPTY || v == NLT_SLOT_TOMBSTONE)
+        {
+            uint64_t expected = v;
+            if (atomic_compare_exchange_strong_explicit(
+                    &tracker[pos], &expected, new_v,
+                    memory_order_release, memory_order_acquire))
+            {
+                if (v == NLT_SLOT_EMPTY)
+                    atomic_fetch_add_explicit(&zone->used, 1,
+                                              memory_order_relaxed);
+                return 1;
+            }
+            /* CAS lost — re-read this slot before deciding next step. */
             continue;
         }
-        size_t pos = nlt_probe_tracker(&new_tracker, new_tracker.capacity, node_id);
-        new_tracker.entries[pos] = zone->tracker.entries[i];
-    }
-    atomic_store_explicit(&new_tracker.used,
-                          atomic_load_explicit(&zone->tracker.used, memory_order_relaxed),
-                          memory_order_relaxed);
 
-    free(zone->tracker.entries);
-    zone->tracker = new_tracker;
+        if (nlt_unpack_node(v) == node_id)
+        {
+            /* Existing entry for this node — atomic store updates slot.
+             * Concurrent updaters can race, but flush_page_immediate holds
+             * the per-node latch so the same node_id is single-writer here. */
+            atomic_store_explicit(&tracker[pos], new_v, memory_order_release);
+            return 1;
+        }
+
+        pos = (pos + 1) & mask;
+    }
+
+    fprintf(stderr,
+            "nlt_tracker_publish: tracker full (cap=%zu) zone_id=%u node_id=%u\n",
+            cap, atomic_load_explicit(&zone->zone_id, memory_order_relaxed),
+            node_id);
+    return 0;
+}
+
+/* Tombstone the entry for node_id (no-op if absent). */
+static void nlt_tracker_tombstone(nlt_zone_entry_t *zone,
+                                  ztree_node_id_t node_id)
+{
+    nlt_slot_t *tracker = nlt_zone_tracker(zone);
+    if (!tracker || zone->tracker_cap == 0)
+        return;
+
+    size_t cap  = zone->tracker_cap;
+    size_t mask = cap - 1;
+    size_t pos  = (size_t)(nlt_hash_node(node_id) & (uint64_t)mask);
+
+    for (size_t i = 0; i < cap; i++)
+    {
+        uint64_t v = atomic_load_explicit(&tracker[pos], memory_order_acquire);
+        if (v == NLT_SLOT_EMPTY)
+            return;                              /* not present */
+        if (v == NLT_SLOT_TOMBSTONE)
+        {
+            pos = (pos + 1) & mask;
+            continue;
+        }
+        if (nlt_unpack_node(v) == node_id)
+        {
+            uint64_t expected = v;
+            if (atomic_compare_exchange_strong_explicit(
+                    &tracker[pos], &expected, NLT_SLOT_TOMBSTONE,
+                    memory_order_release, memory_order_acquire))
+            {
+                atomic_fetch_sub_explicit(&zone->used, 1,
+                                          memory_order_relaxed);
+                return;
+            }
+            /* CAS lost — re-read same slot (entry may have been updated). */
+            continue;
+        }
+        pos = (pos + 1) & mask;
+    }
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
  * Public API
  * ─────────────────────────────────────────────────────────────────────────── */
 
-void nlt_init(nlt_t *nlt, size_t initial_cap)
+void nlt_init(nlt_t *nlt, size_t zone_capacity_hint, size_t tracker_capacity)
 {
-    size_t cap = next_pow2(initial_cap < 16 ? 16 : initial_cap);
+    size_t zcap = next_pow2(zone_capacity_hint < 16 ? 16 : zone_capacity_hint);
+    size_t tcap = next_pow2(tracker_capacity   < 64 ? 64 : tracker_capacity);
 
-    nlt->zones = calloc(cap, sizeof(*nlt->zones));
+    nlt->zones = calloc(zcap, sizeof(*nlt->zones));
     if (!nlt->zones)
     {
-        perror("nlt_init: calloc");
+        perror("nlt_init: calloc zones");
         exit(EXIT_FAILURE);
     }
-    for (size_t i = 0; i < cap; i++)
+    for (size_t i = 0; i < zcap; i++)
     {
-        nlt_zone_init_empty(&nlt->zones[i]);
+        atomic_store_explicit(&nlt->zones[i].zone_id, ZTREE_INVALID_ZONE_ID,
+                              memory_order_relaxed);
+        atomic_store_explicit(&nlt->zones[i].sealed, 0, memory_order_relaxed);
+        atomic_store_explicit(&nlt->zones[i].tracker, (uintptr_t)0,
+                              memory_order_relaxed);
+        nlt->zones[i].tracker_cap = 0;
+        atomic_store_explicit(&nlt->zones[i].used, 0, memory_order_relaxed);
     }
 
-    nlt->capacity = cap;
+    nlt->capacity     = zcap;
+    nlt->tracker_cap  = tcap;
     atomic_store_explicit(&nlt->used, 0, memory_order_relaxed);
-    atomic_store_explicit(&nlt->generation, 0, memory_order_relaxed);
 
-    /* Active-bucket index list (starts at 256, grows on demand). */
-    nlt->active_buckets_cap   = 256;
-    nlt->active_buckets_count = 0;
-    nlt->active_buckets       = malloc(sizeof(size_t) * nlt->active_buckets_cap);
-    if (!nlt->active_buckets)
+    if (pthread_mutex_init(&nlt->alloc_lock, NULL) != 0)
     {
-        perror("nlt_init: malloc active_buckets");
+        perror("nlt_init: pthread_mutex_init");
         exit(EXIT_FAILURE);
     }
 
-    /* Lock profile counters */
     atomic_store_explicit(&nlt->prof_wait_ns_sum,   0, memory_order_relaxed);
     atomic_store_explicit(&nlt->prof_hold_ns_sum,   0, memory_order_relaxed);
     atomic_store_explicit(&nlt->prof_acquire_count, 0, memory_order_relaxed);
     atomic_store_explicit(&nlt->prof_max_wait_ns,   0, memory_order_relaxed);
-
-    if (pthread_rwlock_init(&nlt->grow_lock, NULL) != 0)
-    {
-        perror("nlt_init: pthread_rwlock_init");
-        exit(EXIT_FAILURE);
-    }
-}
-
-/* Caller holds wrlock.  Append a bucket index to the active list (grow if full). */
-static void nlt_active_buckets_add(nlt_t *nlt, size_t pos)
-{
-    if (nlt->active_buckets_count >= nlt->active_buckets_cap)
-    {
-        size_t new_cap = nlt->active_buckets_cap * 2;
-        size_t *new_arr = realloc(nlt->active_buckets, sizeof(size_t) * new_cap);
-        if (!new_arr)
-        {
-            perror("nlt_active_buckets_add: realloc");
-            exit(EXIT_FAILURE);
-        }
-        nlt->active_buckets     = new_arr;
-        nlt->active_buckets_cap = new_cap;
-    }
-    nlt->active_buckets[nlt->active_buckets_count++] = pos;
 }
 
 void nlt_destroy(nlt_t *nlt)
 {
-    pthread_rwlock_destroy(&nlt->grow_lock);
+    pthread_mutex_destroy(&nlt->alloc_lock);
     if (nlt->zones)
     {
         for (size_t i = 0; i < nlt->capacity; i++)
         {
-            if (nlt->zones[i].zone_id == ZTREE_INVALID_ZONE_ID)
-            {
-                continue;
-            }
-            nlt_tracker_destroy(&nlt->zones[i].tracker);
+            nlt_slot_t *t = (nlt_slot_t *)atomic_load_explicit(
+                &nlt->zones[i].tracker, memory_order_relaxed);
+            free(t);
         }
+        free(nlt->zones);
     }
-    free(nlt->zones);
     nlt->zones = NULL;
     nlt->capacity = 0;
-
-    free(nlt->active_buckets);
-    nlt->active_buckets       = NULL;
-    nlt->active_buckets_count = 0;
-    nlt->active_buckets_cap   = 0;
+    nlt->tracker_cap = 0;
 }
 
 int nlt_lookup(nlt_t *nlt, const nlt_location_t *query, nlt_location_t *out)
@@ -375,70 +392,53 @@ int nlt_lookup(nlt_t *nlt, const nlt_location_t *query, nlt_location_t *out)
     if (!query || query->node_id == ZTREE_INVALID_NODE_ID)
         return 0;
 
-    /* Take rdlock for the whole probe + fallback: gives an always-consistent
-     * view (writers wait until we release) and removes the need for retry. */
-    pthread_rwlock_rdlock(&nlt->grow_lock);
-
-    nlt_zone_entry_t *zones = nlt->zones;
-    size_t capacity = nlt->capacity;
-
-    nlt_location_t result;
-    memset(&result, 0, sizeof(result));
-    int found = 0;
-
+    /* ── Fast path: probe the bucket pointed at by the parent's hint. */
     if (query->zone_id != ZTREE_INVALID_ZONE_ID)
     {
-        size_t zpos = nlt_probe_zone(zones, capacity, query->zone_id);
-        if (zones[zpos].zone_id == query->zone_id &&
-            zones[zpos].tracker.capacity > 0)
+        nlt_zone_entry_t *zone = nlt_probe_zone_atomic(nlt, query->zone_id);
+        if (zone)
         {
-            size_t tpos = nlt_probe_tracker(&zones[zpos].tracker,
-                                            zones[zpos].tracker.capacity,
-                                            query->node_id);
-            if (zones[zpos].tracker.entries[tpos].node_id == query->node_id)
+            nlt_slot_t *tracker = nlt_zone_tracker(zone);
+            uint64_t v = nlt_tracker_lookup(tracker, zone->tracker_cap,
+                                            query->node_id, NULL);
+            if (v != NLT_SLOT_EMPTY)
             {
-                result.zone_id = zones[zpos].zone_id;
-                result.node_id = query->node_id;
-                result.slot_id = zones[zpos].tracker.entries[tpos].slot_id;
-                found = 1;
-            }
-        }
-    }
-    if (!found)
-    {
-        /* Fallback: walk only active bucket indices (~150) instead of
-         * scanning the whole capacity (~65K).  Rdlock blocks writers so
-         * the active list and zones array are stable for the entire scan. */
-        size_t *active = nlt->active_buckets;
-        size_t active_n = nlt->active_buckets_count;
-        for (size_t i = 0; i < active_n; i++)
-        {
-            size_t bidx = active[i];
-            nlt_zone_entry_t *zone = &zones[bidx];
-            if (zone->zone_id == ZTREE_INVALID_ZONE_ID ||
-                zone->tracker.capacity == 0)
-                continue;
-            size_t tpos = nlt_probe_tracker(&zone->tracker,
-                                            zone->tracker.capacity,
-                                            query->node_id);
-            if (zone->tracker.entries[tpos].node_id == query->node_id)
-            {
-                result.zone_id = zone->zone_id;
-                result.node_id = query->node_id;
-                result.slot_id = zone->tracker.entries[tpos].slot_id;
-                found = 1;
-                break;
+                if (out)
+                {
+                    out->zone_id = query->zone_id;
+                    out->node_id = query->node_id;
+                    out->slot_id = nlt_unpack_slot(v);
+                }
+                return 1;
             }
         }
     }
 
-    pthread_rwlock_unlock(&nlt->grow_lock);
-
-    if (found)
+    /* ── Fallback: stale hint or unknown zone — scan every attached bucket.
+     * Each iteration is a few atomic loads; with zones[] sized to ≥ 2 ×
+     * max attached zones, the typical scan is well under a microsecond. */
+    size_t cap = nlt->capacity;
+    for (size_t i = 0; i < cap; i++)
     {
-        if (out)
-            *out = result;
-        return 1;
+        uint32_t zid = atomic_load_explicit(&nlt->zones[i].zone_id,
+                                            memory_order_acquire);
+        if (zid == ZTREE_INVALID_ZONE_ID)
+            continue;
+        if (zid == query->zone_id)
+            continue; /* already probed in fast path */
+        nlt_slot_t *tracker = nlt_zone_tracker(&nlt->zones[i]);
+        uint64_t v = nlt_tracker_lookup(tracker, nlt->zones[i].tracker_cap,
+                                        query->node_id, NULL);
+        if (v != NLT_SLOT_EMPTY)
+        {
+            if (out)
+            {
+                out->zone_id = zid;
+                out->node_id = query->node_id;
+                out->slot_id = nlt_unpack_slot(v);
+            }
+            return 1;
+        }
     }
     return 0;
 }
@@ -447,75 +447,17 @@ void nlt_update(nlt_t *nlt, const nlt_location_t *entry)
 {
     if (!entry || entry->node_id == ZTREE_INVALID_NODE_ID ||
         entry->zone_id == ZTREE_INVALID_ZONE_ID)
-    {
         return;
-    }
 
-    uint64_t lock_t0 = nlt_monotonic_ns();
-    pthread_rwlock_wrlock(&nlt->grow_lock);
-    uint64_t lock_t1 = nlt_monotonic_ns();
-
-    nlt_zone_entry_t *zone = nlt_find_zone_entry(nlt, entry->zone_id, 1);
+    nlt_zone_entry_t *zone = nlt_probe_zone_atomic(nlt, entry->zone_id);
     if (!zone)
-    {
-        uint64_t lock_t2 = nlt_monotonic_ns();
-        pthread_rwlock_unlock(&nlt->grow_lock);
-        nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
+        zone = nlt_attach_zone(nlt, entry->zone_id);
+    if (!zone)
         return;
-    }
 
-    nlt_tracker_grow_if_needed(zone);
-
-    size_t pos = nlt_probe_tracker(&zone->tracker, zone->tracker.capacity,
-                                   entry->node_id);
-    if (zone->tracker.entries[pos].node_id == ZTREE_INVALID_NODE_ID)
-    {
-        atomic_fetch_add_explicit(&zone->tracker.used, 1, memory_order_relaxed);
-    }
-
-    zone->tracker.entries[pos].node_id = entry->node_id;
-    zone->tracker.entries[pos].slot_id = entry->slot_id;
-
-    atomic_fetch_add_explicit(&nlt->generation, 1, memory_order_release);
-    uint64_t lock_t2 = nlt_monotonic_ns();
-    pthread_rwlock_unlock(&nlt->grow_lock);
-    nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
+    nlt_tracker_publish(zone, entry->node_id, entry->slot_id);
 }
 
-/* Remove (zone, node_id) from a tracker.  Caller holds the wrlock. */
-static void nlt_remove_locked(nlt_zone_entry_t *zone, ztree_node_id_t node_id)
-{
-    if (zone->tracker.capacity == 0)
-        return;
-    size_t cap  = zone->tracker.capacity;
-    size_t mask = cap - 1;
-    size_t pos  = nlt_probe_tracker(&zone->tracker, cap, node_id);
-    if (zone->tracker.entries[pos].node_id != node_id)
-        return;
-
-    zone->tracker.entries[pos].node_id = ZTREE_INVALID_NODE_ID;
-    zone->tracker.entries[pos].slot_id = 0;
-    atomic_fetch_sub_explicit(&zone->tracker.used, 1, memory_order_relaxed);
-
-    /* Linear-probe rehash chain repair. */
-    size_t next = (pos + 1) & mask;
-    while (zone->tracker.entries[next].node_id != ZTREE_INVALID_NODE_ID)
-    {
-        nlt_tracker_entry_t displaced = zone->tracker.entries[next];
-        zone->tracker.entries[next].node_id = ZTREE_INVALID_NODE_ID;
-        zone->tracker.entries[next].slot_id = 0;
-        atomic_fetch_sub_explicit(&zone->tracker.used, 1, memory_order_relaxed);
-
-        size_t reinsert_pos = nlt_probe_tracker(&zone->tracker, cap,
-                                                displaced.node_id);
-        zone->tracker.entries[reinsert_pos] = displaced;
-        atomic_fetch_add_explicit(&zone->tracker.used, 1, memory_order_relaxed);
-
-        next = (next + 1) & mask;
-    }
-}
-
-/* Atomic insert-new + remove-stale.  Single wrlock, single generation bump. */
 void nlt_update_migrate(nlt_t *nlt,
                         const nlt_location_t *new_entry,
                         uint32_t prev_zone)
@@ -524,138 +466,65 @@ void nlt_update_migrate(nlt_t *nlt,
         new_entry->zone_id == ZTREE_INVALID_ZONE_ID)
         return;
 
-    uint64_t lock_t0 = nlt_monotonic_ns();
-    pthread_rwlock_wrlock(&nlt->grow_lock);
-    uint64_t lock_t1 = nlt_monotonic_ns();
+    /* 1) Publish the fresh entry first so readers that pick up the
+     *    parent's NEW zone_id always find a valid slot. */
+    nlt_zone_entry_t *new_zone = nlt_probe_zone_atomic(nlt, new_entry->zone_id);
+    if (!new_zone)
+        new_zone = nlt_attach_zone(nlt, new_entry->zone_id);
+    if (new_zone)
+        nlt_tracker_publish(new_zone, new_entry->node_id, new_entry->slot_id);
 
-    /* 1) insert/update fresh entry */
-    nlt_zone_entry_t *new_zone_e = nlt_find_zone_entry(nlt, new_entry->zone_id, 1);
-    if (new_zone_e)
-    {
-        nlt_tracker_grow_if_needed(new_zone_e);
-        size_t pos = nlt_probe_tracker(&new_zone_e->tracker,
-                                       new_zone_e->tracker.capacity,
-                                       new_entry->node_id);
-        if (new_zone_e->tracker.entries[pos].node_id == ZTREE_INVALID_NODE_ID)
-        {
-            atomic_fetch_add_explicit(&new_zone_e->tracker.used, 1,
-                                      memory_order_relaxed);
-        }
-        new_zone_e->tracker.entries[pos].node_id = new_entry->node_id;
-        new_zone_e->tracker.entries[pos].slot_id = new_entry->slot_id;
-    }
-
-    /* 2) invalidate stale entry from previous zone bucket */
+    /* 2) Tombstone the previous zone's entry (if it differs).  Readers
+     *    using the OLD parent's zone_id may still observe the live entry
+     *    here until this CAS lands — that is fine; the OLD slot has the
+     *    snapshot they expect.  After the CAS, OLD-hint readers fall back
+     *    to the scan, which finds the NEW bucket. */
     if (prev_zone != ZTREE_INVALID_ZONE_ID && prev_zone != new_entry->zone_id)
     {
-        nlt_zone_entry_t *prev_zone_e = nlt_find_zone_entry(nlt, prev_zone, 0);
+        nlt_zone_entry_t *prev_zone_e = nlt_probe_zone_atomic(nlt, prev_zone);
         if (prev_zone_e)
-            nlt_remove_locked(prev_zone_e, new_entry->node_id);
+            nlt_tracker_tombstone(prev_zone_e, new_entry->node_id);
     }
 
-    atomic_fetch_add_explicit(&nlt->generation, 1, memory_order_release);
-    uint64_t lock_t2 = nlt_monotonic_ns();
-    pthread_rwlock_unlock(&nlt->grow_lock);
-    nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
+    atomic_thread_fence(memory_order_release);
 }
 
 void nlt_remove(nlt_t *nlt, uint32_t zone_id, ztree_node_id_t node_id)
 {
     if (node_id == ZTREE_INVALID_NODE_ID || zone_id == ZTREE_INVALID_ZONE_ID)
-    {
         return;
-    }
 
-    uint64_t lock_t0 = nlt_monotonic_ns();
-    pthread_rwlock_wrlock(&nlt->grow_lock);
-    uint64_t lock_t1 = nlt_monotonic_ns();
-
-    nlt_zone_entry_t *zone = nlt_find_zone_entry(nlt, zone_id, 0);
-    if (!zone || zone->tracker.capacity == 0)
-    {
-        uint64_t lock_t2 = nlt_monotonic_ns();
-        pthread_rwlock_unlock(&nlt->grow_lock);
-        nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
+    nlt_zone_entry_t *zone = nlt_probe_zone_atomic(nlt, zone_id);
+    if (!zone)
         return;
-    }
 
-    size_t cap = zone->tracker.capacity;
-    size_t mask = cap - 1;
-    size_t pos = nlt_probe_tracker(&zone->tracker, cap, node_id);
-
-    if (zone->tracker.entries[pos].node_id != node_id)
-    {
-        uint64_t lock_t2 = nlt_monotonic_ns();
-        pthread_rwlock_unlock(&nlt->grow_lock);
-        nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
-        return;
-    }
-
-    zone->tracker.entries[pos].node_id = ZTREE_INVALID_NODE_ID;
-    zone->tracker.entries[pos].slot_id = 0;
-    atomic_fetch_sub_explicit(&zone->tracker.used, 1, memory_order_relaxed);
-
-    size_t next = (pos + 1) & mask;
-    while (zone->tracker.entries[next].node_id != ZTREE_INVALID_NODE_ID)
-    {
-        nlt_tracker_entry_t displaced = zone->tracker.entries[next];
-        zone->tracker.entries[next].node_id = ZTREE_INVALID_NODE_ID;
-        zone->tracker.entries[next].slot_id = 0;
-        atomic_fetch_sub_explicit(&zone->tracker.used, 1, memory_order_relaxed);
-
-        size_t reinsert_pos = nlt_probe_tracker(&zone->tracker, cap,
-                                                displaced.node_id);
-        zone->tracker.entries[reinsert_pos] = displaced;
-        atomic_fetch_add_explicit(&zone->tracker.used, 1, memory_order_relaxed);
-
-        next = (next + 1) & mask;
-    }
-
-    atomic_fetch_add_explicit(&nlt->generation, 1, memory_order_release);
-    uint64_t lock_t2 = nlt_monotonic_ns();
-    pthread_rwlock_unlock(&nlt->grow_lock);
-    nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
+    nlt_tracker_tombstone(zone, node_id);
 }
 
 void nlt_set_zone_sealed(nlt_t *nlt, uint32_t zone_id, bool sealed)
 {
     if (zone_id == ZTREE_INVALID_ZONE_ID)
-    {
         return;
-    }
 
-    uint64_t lock_t0 = nlt_monotonic_ns();
-    pthread_rwlock_wrlock(&nlt->grow_lock);
-    uint64_t lock_t1 = nlt_monotonic_ns();
-    nlt_zone_entry_t *zone = nlt_find_zone_entry(nlt, zone_id, 1);
-    if (zone)
-    {
-        zone->sealed = sealed ? 1 : 0;
-        atomic_fetch_add_explicit(&nlt->generation, 1, memory_order_release);
-    }
-    uint64_t lock_t2 = nlt_monotonic_ns();
-    pthread_rwlock_unlock(&nlt->grow_lock);
-    nlt_record_lock(nlt, lock_t1 - lock_t0, lock_t2 - lock_t1);
+    nlt_zone_entry_t *zone = nlt_probe_zone_atomic(nlt, zone_id);
+    if (!zone)
+        zone = nlt_attach_zone(nlt, zone_id);
+    if (!zone)
+        return;
+
+    atomic_store_explicit(&zone->sealed, sealed ? 1 : 0,
+                          memory_order_release);
 }
 
 int nlt_zone_is_sealed(const nlt_t *nlt, uint32_t zone_id)
 {
     if (zone_id == ZTREE_INVALID_ZONE_ID)
-    {
         return 0;
-    }
 
-    uint64_t gen_before = atomic_load_explicit(&nlt->generation,
-                                               memory_order_acquire);
-    size_t pos = nlt_probe_zone(nlt->zones, nlt->capacity, zone_id);
-    int sealed = (nlt->zones[pos].zone_id == zone_id) ? nlt->zones[pos].sealed : 0;
-    uint64_t gen_after = atomic_load_explicit(&nlt->generation,
-                                              memory_order_acquire);
-    if (gen_before != gen_after)
-    {
+    nlt_zone_entry_t *zone = nlt_probe_zone_atomic((nlt_t *)nlt, zone_id);
+    if (!zone)
         return 0;
-    }
-    return sealed;
+    return (int)atomic_load_explicit(&zone->sealed, memory_order_acquire);
 }
 
 void nlt_sync_zone(nlt_t *nlt, uint32_t zone_id)
@@ -664,9 +533,7 @@ void nlt_sync_zone(nlt_t *nlt, uint32_t zone_id)
     (void)zone_id;
 
     if (zone_id == ZTREE_INVALID_ZONE_ID)
-    {
         return;
-    }
 
     atomic_thread_fence(memory_order_release);
 }

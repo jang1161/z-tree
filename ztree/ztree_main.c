@@ -1625,7 +1625,17 @@ cow_tree *cow_open(const char *path)
     /* Initialise subsystems */
     cache_init(t);
 
-    nlt_init(&t->nlt, 65536); /* initial NLT capacity */
+    /* Per-zone tracker pre-sized to ~4× zone page capacity so we can
+     * absorb tombstone accumulation without ever resizing.  zones[]
+     * capacity covers every device zone (with headroom). */
+    uint64_t zone_pages = (t->info.nr_zones > 0)
+                              ? (t->zones[0].capacity / ZTREE_PAGE_SIZE)
+                              : 65536ULL;
+    size_t tracker_cap = (size_t)zone_pages * 4ULL;
+    if (tracker_cap < 4096) tracker_cap = 4096;
+    size_t zones_cap = (size_t)t->info.nr_zones * 2ULL;
+    if (zones_cap < 256) zones_cap = 256;
+    nlt_init(&t->nlt, zones_cap, tracker_cap);
 
     t->node_latches = calloc(ZTREE_NODE_LATCH_BUCKETS, sizeof(*t->node_latches));
     if (!t->node_latches)
@@ -1851,7 +1861,7 @@ void cow_close(cow_tree *t)
             "", "acquires", "wait", "avg_wait", "avg_hold");
     fprintf(stderr,
             "  %-16s %10llu %10.1f ms %10.2f us %10.2f us\n",
-            "NLT wrlock", (unsigned long long)nlt_cnt,
+            "NLT alloc lock", (unsigned long long)nlt_cnt,
             _MS(nlt_wait), _AVG_US(nlt_wait, nlt_cnt), _AVG_US(nlt_hold, nlt_cnt));
     fprintf(stderr,
             "  %-16s %10llu %10.1f ms %10.2f us %10.2f us\n",

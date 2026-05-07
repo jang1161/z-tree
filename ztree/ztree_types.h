@@ -52,6 +52,12 @@
 #define ZTREE_LEAF_ORDER     32U
 #define ZTREE_INTERNAL_ORDER 249U
 
+/* Minimum capacity (B+-tree standard ORDER/2).  Used by DELETE to decide
+ * when a node is underfilled and a sibling merge is needed.  Root is
+ * exempt — root may shrink to 0 keys, which triggers root collapse.      */
+#define ZTREE_LEAF_MIN       (ZTREE_LEAF_ORDER / 2)       /* 16 */
+#define ZTREE_INTERNAL_MIN   (ZTREE_INTERNAL_ORDER / 2)   /* 124 */
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Identifier types
  * ═══════════════════════════════════════════════════════════════════════════ */

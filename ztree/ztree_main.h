@@ -55,6 +55,10 @@ struct ztree_s {
 
     /* Stats */
     _Atomic(uint64_t) stat_inserts;
+    _Atomic(uint64_t) stat_deletes;
+    _Atomic(uint64_t) stat_delete_merges;
+    _Atomic(uint64_t) stat_delete_cascades;
+    _Atomic(uint64_t) stat_delete_root_collapses;
     _Atomic(uint64_t) stat_cache_hit;
     _Atomic(uint64_t) stat_cache_miss;
     _Atomic(uint64_t) stat_page_appends;
@@ -105,3 +109,9 @@ void      cow_insert(cow_tree *t, int64_t key, const char *value);
 void      cow_close (cow_tree *t);
 
 ztree_record *ztree_find(ztree_t *t, int64_t key);
+
+/* cow_delete  –  remove the entry for key.  Returns 1 if a key was deleted,
+ * 0 if the key was not present.  Implements paper Algorithm 4 (sibling
+ * merge when curNode + sibling ≤ MAX), with parent cascade and root
+ * collapse for full B+-tree consistency. */
+int cow_delete(cow_tree *t, int64_t key);

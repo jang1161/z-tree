@@ -77,6 +77,10 @@ struct ztree_s {
 
     /* Stats */
     _Atomic(uint64_t) stat_inserts;
+    _Atomic(uint64_t) stat_deletes;
+    _Atomic(uint64_t) stat_delete_merges;
+    _Atomic(uint64_t) stat_delete_cascades;
+    _Atomic(uint64_t) stat_delete_root_collapses;
     _Atomic(uint64_t) stat_cache_hit;
     _Atomic(uint64_t) stat_cache_miss;
     _Atomic(uint64_t) stat_page_appends;
@@ -125,5 +129,9 @@ typedef ztree_t cow_tree;
 cow_tree *cow_open (const char *dev_path);
 void      cow_insert(cow_tree *t, int64_t key, const char *value);
 void      cow_close (cow_tree *t);
+
+/* cow_delete – remove the entry for key. Returns 1 if a key was deleted,
+ * 0 if not found. Mirrors ZTree semantics. */
+int       cow_delete(cow_tree *t, int64_t key);
 
 ztree_record *ztree_find(ztree_t *t, int64_t key);

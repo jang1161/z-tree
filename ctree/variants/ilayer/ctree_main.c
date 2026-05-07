@@ -1613,6 +1613,641 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Single-pass CoW delete path (paper Algorithm 4 + cascade + root collapse)
+ *
+ * Same b1 concurrency model as base ctree.  In ilayer, internal-node CoW
+ * always lands on CNS at slot_id == node_id, so flush_page_immediate
+ * returns out_zone_changed == 0 for internals — propagate-zone-up will
+ * naturally short-circuit at the leaf's immediate parent.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    ztree_node_id_t node_id;
+    uint32_t zone_id;
+    uint32_t slot_id;
+    ztree_page page;
+    uint32_t cidx_from_parent;  /* RIGHTMOST_IDX if linked via ptr_* */
+} delete_path_frame;
+
+#define DEL_OK          0
+#define DEL_NOT_FOUND   1
+#define DEL_RACE        2
+#define DEL_NEEDS_MERGE 3
+
+static void delete_release_path_locks(ztree_t *t, delete_path_frame *path, int n)
+{
+    for (int i = 0; i < n; i++) {
+        int dup = 0;
+        for (int j = 0; j < i; j++) {
+            if (node_latch_for_id(t, path[i].node_id) ==
+                node_latch_for_id(t, path[j].node_id)) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup)
+            node_unlock(t, path[i].node_id);
+    }
+}
+
+static int delete_propagate_zone_up(ztree_t *t,
+                                    delete_path_frame *path, int depth,
+                                    int64_t key,
+                                    propagate_state *prop)
+{
+    for (int level = depth - 2; level >= 0 && prop->left_zone_changed; level--) {
+        delete_path_frame *pf = &path[level];
+        node_wrlock(t, pf->node_id);
+        if (!load_latest_node(t, pf->zone_id, pf->node_id,
+                              &pf->zone_id, &pf->slot_id, &pf->page)) {
+            node_unlock(t, pf->node_id);
+            return -1;
+        }
+        ztree_page *par = &pf->page;
+        uint32_t cidx = child_pos_for_id(par, prop->left_id);
+        if (cidx == UINT32_MAX) {
+            cidx = child_pos_for_key(par, key);
+            ztree_node_id_t expected = (cidx == RIGHTMOST_IDX)
+                                           ? par->ptr_node_id
+                                           : par->internal[cidx].child_node_id;
+            if (expected != prop->left_id) {
+                node_unlock(t, pf->node_id);
+                return -1;
+            }
+        }
+        if (cidx == RIGHTMOST_IDX) {
+            par->ptr_zone_id = prop->left_zone;
+        } else {
+            par->internal[cidx].child_zone_id = prop->left_zone;
+        }
+        flush_page_immediate(t, par, pf->zone_id, ZTREE_INVALID_ZONE_ID,
+                             &prop->left_zone_changed,
+                             &prop->left_zone, &prop->left_slot);
+        prop->left_id = par->node_id;
+        if (prop->left_zone_changed)
+            atomic_fetch_add_explicit(&t->stat_parent_rewrites, 1,
+                                      memory_order_relaxed);
+        node_unlock(t, pf->node_id);
+    }
+    return 0;
+}
+
+static int try_optimistic_delete(ztree_t *t, int64_t key,
+                                 ztree_node_id_t root_nid, uint32_t root_zone,
+                                 uint32_t root_slot, uint64_t seq_snapshot,
+                                 ztree_node_id_t *out_root_nid,
+                                 uint32_t *out_root_zone,
+                                 uint32_t *out_root_slot,
+                                 int *out_root_changed)
+{
+    delete_path_frame path[MAX_HEIGHT];
+    int depth = 0;
+
+    ztree_node_id_t cur_id = root_nid;
+    uint32_t cur_zone = root_zone;
+    node_rdlock(t, cur_id);
+
+    while (1) {
+        if (depth >= MAX_HEIGHT) {
+            node_unlock(t, cur_id);
+            fprintf(stderr, "delete: depth overflow\n");
+            exit(EXIT_FAILURE);
+        }
+        delete_path_frame *f = &path[depth];
+        f->node_id = cur_id;
+        f->cidx_from_parent = (depth == 0) ? RIGHTMOST_IDX
+                                            : path[depth - 1].cidx_from_parent;
+        if (!load_latest_node(t, cur_zone, cur_id,
+                              &f->zone_id, &f->slot_id, &f->page)) {
+            node_unlock(t, cur_id);
+            return DEL_RACE;
+        }
+        if (f->page.is_leaf) {
+            node_unlock(t, cur_id);
+            node_wrlock(t, cur_id);
+            if (!load_latest_node(t, cur_zone, cur_id,
+                                  &f->zone_id, &f->slot_id, &f->page)) {
+                node_unlock(t, cur_id);
+                return DEL_RACE;
+            }
+            if (!f->page.is_leaf) {
+                node_unlock(t, cur_id);
+                return DEL_RACE;
+            }
+            if (depth >= 1) {
+                delete_path_frame *pf = &path[depth - 1];
+                ztree_page latest_par;
+                uint32_t pzone, pslot;
+                if (!load_latest_node(t, pf->zone_id, pf->node_id,
+                                      &pzone, &pslot, &latest_par)
+                    || latest_par.is_leaf) {
+                    node_unlock(t, cur_id);
+                    return DEL_RACE;
+                }
+                uint32_t new_cidx = child_pos_for_key(&latest_par, key);
+                ztree_node_id_t routed = (new_cidx == RIGHTMOST_IDX)
+                                              ? latest_par.ptr_node_id
+                                              : latest_par.internal[new_cidx].child_node_id;
+                if (routed != cur_id) {
+                    node_unlock(t, cur_id);
+                    return DEL_RACE;
+                }
+            }
+            depth++;
+            break;
+        }
+        uint32_t cidx = child_pos_for_key(&f->page, key);
+        ztree_node_id_t next_id = (cidx == RIGHTMOST_IDX)
+                                       ? f->page.ptr_node_id
+                                       : f->page.internal[cidx].child_node_id;
+        if (node_latch_for_id(t, next_id) != node_latch_for_id(t, cur_id)) {
+            node_rdlock(t, next_id);
+            node_unlock(t, cur_id);
+        }
+        cur_zone = (cidx == RIGHTMOST_IDX) ? f->page.ptr_zone_id
+                                            : f->page.internal[cidx].child_zone_id;
+        cur_id = next_id;
+        path[depth + 1].cidx_from_parent = cidx;
+        depth++;
+    }
+
+    delete_path_frame *leaff = &path[depth - 1];
+    ztree_page *leaf = &leaff->page;
+    int found_idx = -1;
+    for (uint32_t i = 0; i < leaf->num_keys; i++) {
+        if ((int64_t)leaf->leaf[i].key == key) {
+            found_idx = (int)i;
+            break;
+        }
+    }
+    if (found_idx < 0) {
+        node_unlock(t, leaff->node_id);
+        return DEL_NOT_FOUND;
+    }
+
+    int is_root_leaf = (depth == 1);
+    uint32_t new_count = leaf->num_keys - 1;
+    int needs_merge = (!is_root_leaf && new_count < ZTREE_LEAF_MIN);
+    if (needs_merge) {
+        node_unlock(t, leaff->node_id);
+        return DEL_NEEDS_MERGE;
+    }
+
+    for (uint32_t i = (uint32_t)found_idx; i + 1 < leaf->num_keys; i++)
+        leaf->leaf[i] = leaf->leaf[i + 1];
+    leaf->num_keys = new_count;
+
+    if (is_root_leaf && leaf->num_keys == 0) {
+        node_unlock(t, leaff->node_id);
+        *out_root_nid = ZTREE_INVALID_NODE_ID;
+        *out_root_zone = ZTREE_INVALID_ZONE_ID;
+        *out_root_slot = ZTREE_INVALID_SLOT_ID;
+        *out_root_changed = 1;
+        (void)seq_snapshot;
+        return DEL_OK;
+    }
+
+    propagate_state prop;
+    memset(&prop, 0, sizeof prop);
+    flush_page_immediate(t, leaf, leaff->zone_id, ZTREE_INVALID_ZONE_ID,
+                         &prop.left_zone_changed,
+                         &prop.left_zone, &prop.left_slot);
+    prop.left_id = leaf->node_id;
+    node_unlock(t, leaff->node_id);
+
+    if (delete_propagate_zone_up(t, path, depth, key, &prop) != 0)
+        return DEL_RACE;
+
+    if (prop.left_id == root_nid) {
+        *out_root_nid = root_nid;
+        *out_root_zone = prop.left_zone;
+        *out_root_slot = prop.left_slot;
+        *out_root_changed = 1;
+    } else {
+        *out_root_nid = root_nid;
+        *out_root_zone = root_zone;
+        *out_root_slot = root_slot;
+        *out_root_changed = 0;
+    }
+    return DEL_OK;
+}
+
+static int try_pessimistic_delete(ztree_t *t, int64_t key,
+                                  ztree_node_id_t root_nid, uint32_t root_zone,
+                                  uint32_t root_slot,
+                                  ztree_node_id_t *out_root_nid,
+                                  uint32_t *out_root_zone,
+                                  uint32_t *out_root_slot,
+                                  int *out_root_changed)
+{
+    delete_path_frame path[MAX_HEIGHT];
+    int depth = 0;
+
+    ztree_node_id_t cur_id = root_nid;
+    uint32_t cur_zone = root_zone;
+    uint32_t pending_cidx = RIGHTMOST_IDX;
+    node_wrlock(t, cur_id);
+
+    while (1) {
+        if (depth >= MAX_HEIGHT) {
+            delete_release_path_locks(t, path, depth);
+            node_unlock(t, cur_id);
+            fprintf(stderr, "delete: depth overflow (pessimistic)\n");
+            exit(EXIT_FAILURE);
+        }
+        delete_path_frame *f = &path[depth];
+        f->node_id = cur_id;
+        f->cidx_from_parent = pending_cidx;
+        if (!load_latest_node(t, cur_zone, cur_id,
+                              &f->zone_id, &f->slot_id, &f->page)) {
+            delete_release_path_locks(t, path, depth + 1);
+            return DEL_RACE;
+        }
+        if (f->page.is_leaf) {
+            depth++;
+            break;
+        }
+        uint32_t cidx = child_pos_for_key(&f->page, key);
+        ztree_node_id_t next_id = (cidx == RIGHTMOST_IDX)
+                                       ? f->page.ptr_node_id
+                                       : f->page.internal[cidx].child_node_id;
+        uint32_t next_zone = (cidx == RIGHTMOST_IDX)
+                                  ? f->page.ptr_zone_id
+                                  : f->page.internal[cidx].child_zone_id;
+
+        int already_held = 0;
+        for (int j = 0; j <= depth; j++) {
+            if (node_latch_for_id(t, next_id) ==
+                node_latch_for_id(t, path[j].node_id)) {
+                already_held = 1;
+                break;
+            }
+        }
+        if (!already_held)
+            node_wrlock(t, next_id);
+
+        cur_id = next_id;
+        cur_zone = next_zone;
+        pending_cidx = cidx;
+        depth++;
+    }
+
+    delete_path_frame *leaff = &path[depth - 1];
+    ztree_page *leaf = &leaff->page;
+    int found_idx = -1;
+    for (uint32_t i = 0; i < leaf->num_keys; i++) {
+        if ((int64_t)leaf->leaf[i].key == key) {
+            found_idx = (int)i;
+            break;
+        }
+    }
+    if (found_idx < 0) {
+        delete_release_path_locks(t, path, depth);
+        return DEL_NOT_FOUND;
+    }
+
+    for (uint32_t i = (uint32_t)found_idx; i + 1 < leaf->num_keys; i++)
+        leaf->leaf[i] = leaf->leaf[i + 1];
+    leaf->num_keys--;
+
+    if (depth == 1 && leaf->num_keys == 0) {
+        delete_release_path_locks(t, path, depth);
+        *out_root_nid = ZTREE_INVALID_NODE_ID;
+        *out_root_zone = ZTREE_INVALID_ZONE_ID;
+        *out_root_slot = ZTREE_INVALID_SLOT_ID;
+        *out_root_changed = 1;
+        return DEL_OK;
+    }
+
+    propagate_state prop;
+    memset(&prop, 0, sizeof prop);
+    int level = depth - 1;
+    int merge_done_at_level = -1;
+    int root_collapsed = 0;
+    ztree_node_id_t collapsed_root_nid = ZTREE_INVALID_NODE_ID;
+    uint32_t collapsed_root_zone = ZTREE_INVALID_ZONE_ID;
+    uint32_t collapsed_root_slot = ZTREE_INVALID_SLOT_ID;
+
+    while (level > 0) {
+        delete_path_frame *cur_f = &path[level];
+        delete_path_frame *par_f = &path[level - 1];
+        ztree_page *cur = &cur_f->page;
+        ztree_page *par = &par_f->page;
+        uint32_t cidx = cur_f->cidx_from_parent;
+
+        uint32_t min_keys = cur->is_leaf ? ZTREE_LEAF_MIN : ZTREE_INTERNAL_MIN;
+        if (cur->num_keys >= min_keys) {
+            break;
+        }
+
+        ztree_node_id_t sib_id = ZTREE_INVALID_NODE_ID;
+        uint32_t sib_zone = ZTREE_INVALID_ZONE_ID;
+        uint32_t sib_cidx = UINT32_MAX;
+        int sib_is_right = 0;
+        int sib_was_rightmost = 0;
+        if (cidx == RIGHTMOST_IDX) {
+            if (par->num_keys == 0) break;
+            sib_cidx = par->num_keys - 1;
+            sib_id = par->internal[sib_cidx].child_node_id;
+            sib_zone = par->internal[sib_cidx].child_zone_id;
+            sib_is_right = 0;
+        } else if (cidx + 1 < par->num_keys) {
+            sib_cidx = cidx + 1;
+            sib_id = par->internal[sib_cidx].child_node_id;
+            sib_zone = par->internal[sib_cidx].child_zone_id;
+            sib_is_right = 1;
+        } else if (cidx + 1 == par->num_keys) {
+            sib_cidx = par->num_keys;
+            sib_id = par->ptr_node_id;
+            sib_zone = par->ptr_zone_id;
+            sib_is_right = 1;
+            sib_was_rightmost = 1;
+        } else if (cidx > 0) {
+            sib_cidx = cidx - 1;
+            sib_id = par->internal[sib_cidx].child_node_id;
+            sib_zone = par->internal[sib_cidx].child_zone_id;
+            sib_is_right = 0;
+        } else {
+            break;
+        }
+
+        int sib_already_held = 0;
+        for (int j = 0; j < depth; j++) {
+            if (node_latch_for_id(t, sib_id) ==
+                node_latch_for_id(t, path[j].node_id)) {
+                sib_already_held = 1;
+                break;
+            }
+        }
+        if (!sib_already_held)
+            node_wrlock(t, sib_id);
+
+        ztree_page sib_page;
+        uint32_t sib_actual_zone, sib_actual_slot;
+        if (!load_latest_node(t, sib_zone, sib_id,
+                              &sib_actual_zone, &sib_actual_slot, &sib_page)) {
+            if (!sib_already_held) node_unlock(t, sib_id);
+            delete_release_path_locks(t, path, depth);
+            return DEL_RACE;
+        }
+
+        uint32_t cur_keys = cur->num_keys;
+        uint32_t sib_keys = sib_page.num_keys;
+        uint32_t merged_keys, max_keys;
+        if (cur->is_leaf) {
+            merged_keys = cur_keys + sib_keys;
+            max_keys = ZTREE_LEAF_ORDER - 1;
+        } else {
+            merged_keys = cur_keys + 1 + sib_keys;
+            max_keys = ZTREE_INTERNAL_ORDER - 1;
+        }
+
+        if (merged_keys > max_keys) {
+            if (!sib_already_held) node_unlock(t, sib_id);
+            break;
+        }
+
+        if (cur->is_leaf) {
+            if (sib_is_right) {
+                for (uint32_t i = 0; i < sib_keys; i++)
+                    cur->leaf[cur_keys + i] = sib_page.leaf[i];
+                cur->num_keys = cur_keys + sib_keys;
+                cur->ptr_node_id = sib_page.ptr_node_id;
+                cur->ptr_zone_id = sib_page.ptr_zone_id;
+            } else {
+                ztree_leaf_entity tmp[ZTREE_LEAF_ORDER];
+                for (uint32_t i = 0; i < sib_keys; i++) tmp[i] = sib_page.leaf[i];
+                for (uint32_t i = 0; i < cur_keys; i++) tmp[sib_keys + i] = cur->leaf[i];
+                for (uint32_t i = 0; i < sib_keys + cur_keys; i++) cur->leaf[i] = tmp[i];
+                cur->num_keys = sib_keys + cur_keys;
+            }
+        } else {
+            uint64_t separator;
+            if (sib_is_right) {
+                separator = par->internal[cidx].key;
+            } else {
+                separator = par->internal[sib_cidx].key;
+            }
+            ztree_page *left_p = sib_is_right ? cur : &sib_page;
+            ztree_page *right_p = sib_is_right ? &sib_page : cur;
+
+            ztree_internal_entity tmp_ent[ZTREE_INTERNAL_ORDER];
+            uint32_t pos = 0;
+            for (uint32_t i = 0; i < left_p->num_keys; i++)
+                tmp_ent[pos++] = left_p->internal[i];
+            tmp_ent[pos].key = separator;
+            tmp_ent[pos].child_node_id = left_p->ptr_node_id;
+            tmp_ent[pos].child_zone_id = left_p->ptr_zone_id;
+            pos++;
+            for (uint32_t i = 0; i < right_p->num_keys; i++)
+                tmp_ent[pos++] = right_p->internal[i];
+
+            for (uint32_t i = 0; i < pos; i++) cur->internal[i] = tmp_ent[i];
+            cur->num_keys = pos;
+            cur->ptr_node_id = right_p->ptr_node_id;
+            cur->ptr_zone_id = right_p->ptr_zone_id;
+        }
+
+        flush_page_immediate(t, cur, cur_f->zone_id, ZTREE_INVALID_ZONE_ID,
+                             &prop.left_zone_changed,
+                             &prop.left_zone, &prop.left_slot);
+        prop.left_id = cur->node_id;
+
+        uint32_t k_idx = sib_is_right ? cidx : sib_cidx;
+        uint32_t c_idx = sib_is_right ? (sib_was_rightmost ? par->num_keys
+                                                            : sib_cidx)
+                                       : sib_cidx;
+        for (uint32_t j = k_idx; j + 1 < par->num_keys; j++)
+            par->internal[j].key = par->internal[j + 1].key;
+        if (sib_was_rightmost) {
+            par->ptr_node_id = cur->node_id;
+            par->ptr_zone_id = prop.left_zone;
+        } else {
+            for (uint32_t j = c_idx; j + 1 < par->num_keys; j++) {
+                par->internal[j].child_node_id =
+                    par->internal[j + 1].child_node_id;
+                par->internal[j].child_zone_id =
+                    par->internal[j + 1].child_zone_id;
+            }
+        }
+        par->num_keys--;
+
+        if (sib_is_right && !sib_was_rightmost) {
+            par->internal[cidx].child_zone_id = prop.left_zone;
+            par->internal[cidx].child_node_id = cur->node_id;
+        } else if (!sib_is_right) {
+            par->internal[sib_cidx].child_node_id = cur->node_id;
+            par->internal[sib_cidx].child_zone_id = prop.left_zone;
+        }
+
+        if (!sib_already_held) node_unlock(t, sib_id);
+
+        atomic_fetch_add_explicit(&t->stat_delete_merges, 1, memory_order_relaxed);
+
+        if (level - 1 == 0 && par->num_keys == 0) {
+            nlt_location_t q = { .zone_id = par->ptr_zone_id,
+                                 .node_id = par->ptr_node_id,
+                                 .slot_id = ZTREE_INVALID_SLOT_ID };
+            nlt_location_t r;
+            if (!nlt_lookup(&t->nlt, &q, &r)) {
+                delete_release_path_locks(t, path, depth);
+                return DEL_RACE;
+            }
+            root_collapsed = 1;
+            collapsed_root_nid = r.node_id;
+            collapsed_root_zone = r.zone_id;
+            collapsed_root_slot = r.slot_id;
+            atomic_fetch_add_explicit(&t->stat_delete_root_collapses, 1,
+                                      memory_order_relaxed);
+            level = 0;
+            break;
+        }
+
+        flush_page_immediate(t, par, par_f->zone_id, ZTREE_INVALID_ZONE_ID,
+                             &prop.left_zone_changed,
+                             &prop.left_zone, &prop.left_slot);
+        prop.left_id = par->node_id;
+        if ((level - 1) < merge_done_at_level || merge_done_at_level < 0)
+            merge_done_at_level = level - 1;
+
+        if (level - 1 == 0) {
+            break;
+        }
+
+        if (par->num_keys < ZTREE_INTERNAL_MIN) {
+            atomic_fetch_add_explicit(&t->stat_delete_cascades, 1,
+                                      memory_order_relaxed);
+            level--;
+            continue;
+        }
+        break;
+    }
+
+    if (!root_collapsed && merge_done_at_level < 0) {
+        delete_path_frame *lf = &path[depth - 1];
+        flush_page_immediate(t, &lf->page, lf->zone_id,
+                             ZTREE_INVALID_ZONE_ID,
+                             &prop.left_zone_changed,
+                             &prop.left_zone, &prop.left_slot);
+        prop.left_id = lf->page.node_id;
+        merge_done_at_level = depth - 1;
+    }
+
+    if (!root_collapsed) {
+        int start_level = merge_done_at_level - 1;
+        for (int lvl = start_level; lvl >= 0 && prop.left_zone_changed; lvl--) {
+            delete_path_frame *pf = &path[lvl];
+            ztree_page *par = &pf->page;
+            uint32_t cidx = child_pos_for_id(par, prop.left_id);
+            if (cidx == UINT32_MAX) {
+                cidx = child_pos_for_key(par, key);
+                ztree_node_id_t expected = (cidx == RIGHTMOST_IDX)
+                                                ? par->ptr_node_id
+                                                : par->internal[cidx].child_node_id;
+                if (expected != prop.left_id) {
+                    delete_release_path_locks(t, path, depth);
+                    return DEL_RACE;
+                }
+            }
+            if (cidx == RIGHTMOST_IDX) {
+                par->ptr_zone_id = prop.left_zone;
+            } else {
+                par->internal[cidx].child_zone_id = prop.left_zone;
+            }
+            flush_page_immediate(t, par, pf->zone_id, ZTREE_INVALID_ZONE_ID,
+                                 &prop.left_zone_changed,
+                                 &prop.left_zone, &prop.left_slot);
+            prop.left_id = par->node_id;
+            if (prop.left_zone_changed)
+                atomic_fetch_add_explicit(&t->stat_parent_rewrites, 1,
+                                          memory_order_relaxed);
+        }
+    }
+
+    delete_release_path_locks(t, path, depth);
+
+    if (root_collapsed) {
+        *out_root_nid = collapsed_root_nid;
+        *out_root_zone = collapsed_root_zone;
+        *out_root_slot = collapsed_root_slot;
+        *out_root_changed = 1;
+    } else if (prop.left_id == root_nid) {
+        *out_root_nid = root_nid;
+        *out_root_zone = prop.left_zone;
+        *out_root_slot = prop.left_slot;
+        *out_root_changed = 1;
+    } else {
+        *out_root_nid = root_nid;
+        *out_root_zone = root_zone;
+        *out_root_slot = root_slot;
+        *out_root_changed = 0;
+    }
+    return DEL_OK;
+}
+
+int cow_delete(cow_tree *t, int64_t key)
+{
+    for (uint32_t retry = 0;; retry++) {
+        if (retry >= 1000000U) {
+            fprintf(stderr, "cow_delete: excessive retries (key=%ld)\n", (long)key);
+            exit(EXIT_FAILURE);
+        }
+        if (retry > 0 && (retry & 0xFU) == 0) sched_yield();
+
+        ztree_node_id_t root_nid;
+        uint32_t root_zone, root_slot;
+        uint64_t seq_snapshot;
+        for (;;) {
+            uint64_t s1 = atomic_load_explicit(&t->volatile_sb.seq_no,
+                                               memory_order_acquire);
+            if (s1 & 1ULL) continue;
+            root_nid = atomic_load_explicit(&t->volatile_sb.root_node_id,
+                                            memory_order_acquire);
+            root_zone = atomic_load_explicit(&t->volatile_sb.root_zone_id,
+                                             memory_order_acquire);
+            root_slot = atomic_load_explicit(&t->volatile_sb.root_slot_id,
+                                             memory_order_acquire);
+            uint64_t s2 = atomic_load_explicit(&t->volatile_sb.seq_no,
+                                               memory_order_acquire);
+            if (s1 == s2 && (s2 & 1ULL) == 0) {
+                seq_snapshot = s2;
+                break;
+            }
+        }
+        if (root_nid == ZTREE_INVALID_NODE_ID) return 0;
+
+        ztree_node_id_t out_nid = root_nid;
+        uint32_t out_zone = root_zone;
+        uint32_t out_slot = root_slot;
+        int root_changed = 0;
+
+        int res = try_optimistic_delete(t, key, root_nid, root_zone, root_slot,
+                                        seq_snapshot,
+                                        &out_nid, &out_zone, &out_slot,
+                                        &root_changed);
+        if (res == DEL_NOT_FOUND) return 0;
+        if (res == DEL_RACE) continue;
+        if (res == DEL_NEEDS_MERGE) {
+            res = try_pessimistic_delete(t, key, root_nid, root_zone, root_slot,
+                                         &out_nid, &out_zone, &out_slot,
+                                         &root_changed);
+            if (res == DEL_NOT_FOUND) return 0;
+            if (res == DEL_RACE) continue;
+        }
+
+        if (root_changed &&
+            !(out_nid == root_nid && out_zone == root_zone && out_slot == root_slot))
+        {
+            if (!try_publish_root_if_unchanged(t, seq_snapshot,
+                                               out_nid, out_zone, out_slot))
+                continue;
+        }
+        atomic_fetch_add_explicit(&t->stat_deletes, 1, memory_order_relaxed);
+        return 1;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * cow_open / cow_insert / cow_close
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1902,6 +2537,10 @@ void cow_close(cow_tree *t)
     pthread_join(t->flusher_tid, NULL);
 
     uint64_t inserts = atomic_load_explicit(&t->stat_inserts, memory_order_relaxed);
+    uint64_t deletes = atomic_load_explicit(&t->stat_deletes, memory_order_relaxed);
+    uint64_t del_merges = atomic_load_explicit(&t->stat_delete_merges, memory_order_relaxed);
+    uint64_t del_cascades = atomic_load_explicit(&t->stat_delete_cascades, memory_order_relaxed);
+    uint64_t del_root_collapses = atomic_load_explicit(&t->stat_delete_root_collapses, memory_order_relaxed);
     uint64_t ch = atomic_load_explicit(&t->stat_cache_hit, memory_order_relaxed);
     uint64_t cm = atomic_load_explicit(&t->stat_cache_miss, memory_order_relaxed);
     uint64_t appends = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed);
@@ -1915,6 +2554,7 @@ void cow_close(cow_tree *t)
     fprintf(stderr,
             "\n[ctree_ilayer profile]\n"
             "  inserts        = %llu\n"
+            "  deletes        = %llu  (merges=%llu cascades=%llu root_collapses=%llu)\n"
             "  cache_hit      = %llu  miss = %llu  hit_rate = %.1f%%\n"
             "  page_appends   = %llu\n"
             "  internal_writes_to_cns = %llu  (%.1f%% of page_appends)\n"
@@ -1924,6 +2564,10 @@ void cow_close(cow_tree *t)
             "    parent_rewrites   = %llu\n"
             "  avg_flush_us   = %.1f\n",
             (unsigned long long)inserts,
+            (unsigned long long)deletes,
+            (unsigned long long)del_merges,
+            (unsigned long long)del_cascades,
+            (unsigned long long)del_root_collapses,
             (unsigned long long)ch,
             (unsigned long long)cm,
             (ch + cm > 0) ? 100.0 * (double)ch / (double)(ch + cm) : 0.0,

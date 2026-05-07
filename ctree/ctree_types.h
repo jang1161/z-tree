@@ -62,6 +62,11 @@
 #define ZTREE_LEAF_ORDER     32U
 #define ZTREE_INTERNAL_ORDER 249U
 
+/* Underflow thresholds (ORDER/2) — DELETE merge cascade triggers when a
+ * non-root node drops below MIN keys after a deletion. */
+#define ZTREE_LEAF_MIN       (ZTREE_LEAF_ORDER / 2)       /* 16 */
+#define ZTREE_INTERNAL_MIN   (ZTREE_INTERNAL_ORDER / 2)   /* 124 */
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Identifier types
  * ═══════════════════════════════════════════════════════════════════════════ */

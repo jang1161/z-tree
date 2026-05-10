@@ -6,8 +6,8 @@
 # ── Configure below ──────────────────────────────────────
 KEYS=10000000
 RUNS=1
-THREADS=(8 16 32 64)
-OUTDIR=logs/compare/10M
+THREADS=(1 2 4)
+OUTDIR=logs/compare/10M_T123
 ZTREE_BIN=build/ztree
 CTREE_BIN=build/ctree
 # ─────────────────────────────────────────────────────────

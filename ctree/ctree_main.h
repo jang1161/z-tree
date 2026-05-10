@@ -135,3 +135,15 @@ void      cow_close (cow_tree *t);
 int       cow_delete(cow_tree *t, int64_t key);
 
 ztree_record *ztree_find(ztree_t *t, int64_t key);
+
+/* Dynamic CNS variant only — NO-OP in other variants.
+ * cow_evict_cns_leaves:  migrate every CNS-resident leaf back to a ZNS zone.
+ * cow_gc_cns:            punch holes in CNS file for orphan slot ranges.
+ * Both must be called from a quiescent point (no concurrent ops). */
+size_t    cow_evict_cns_leaves(cow_tree *t);
+size_t    cow_gc_cns(cow_tree *t);
+
+/* Diagnostic: walk cns_bitmap, load each marked node, classify is_leaf. */
+void      cow_count_cns_residents(cow_tree *t,
+                                  size_t *out_internals,
+                                  size_t *out_leaves);

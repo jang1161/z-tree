@@ -43,6 +43,49 @@
 /* CNS I/O mode toggle (env var CNS_ODIRECT=1 to enable). */
 static int g_cns_odirect = 0;
 
+/* ── Periodic evict+GC quiesce + thread ────────────────────────────────────
+ * The bench is concurrent insert-only.  evict/GC require a quiescent point
+ * (see ctree_main.h doc comment), so we wrap inserts in an rdlock and let a
+ * background thread take the wrlock to drive evict→GC.  Cadence configurable
+ * via env CTREE_DYNAMIC_GC_INTERVAL_MS (default 1000; 0 disables).
+ *
+ * IMPORTANT: rwlock must be writer-preference, otherwise the continuous
+ * stream of rdlocks from worker threads starves the GC thread's wrlock and
+ * GC effectively never runs during the insert phase (we observed monotonic
+ * cns_phys growth with no sawtooth).  Use the glibc-specific NP variant. */
+static pthread_rwlock_t g_insert_pause;
+static _Atomic bool     g_insert_pause_initialised = false;
+static pthread_t        g_gc_tid;
+static _Atomic bool     g_gc_running     = false;
+static _Atomic bool     g_gc_stop        = false;
+static unsigned         g_gc_interval_ms = 0;
+
+static void *dynamic_gc_thread(void *arg)
+{
+    cow_tree *t = (cow_tree *)arg;
+    /* Sleep in ~50ms slices so cow_close can stop us promptly. */
+    while (!atomic_load_explicit(&g_gc_stop, memory_order_acquire))
+    {
+        unsigned slept = 0;
+        while (slept < g_gc_interval_ms
+            && !atomic_load_explicit(&g_gc_stop, memory_order_acquire))
+        {
+            unsigned step = (g_gc_interval_ms - slept > 50) ? 50 : (g_gc_interval_ms - slept);
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)step * 1000000L };
+            nanosleep(&ts, NULL);
+            slept += step;
+        }
+        if (atomic_load_explicit(&g_gc_stop, memory_order_acquire))
+            break;
+
+        pthread_rwlock_wrlock(&g_insert_pause);
+        cow_evict_cns_leaves(t);
+        cow_gc_cns(t);
+        pthread_rwlock_unlock(&g_insert_pause);
+    }
+    return NULL;
+}
+
 /* Dynamic variant uses CNS via an F2FS sparse file (so that
  * cns_physical_bytes() can read st_blocks and GC can punch holes).
  * F2FS mount must exist at /mnt/cns. */
@@ -61,6 +104,21 @@ static inline size_t cns_physical_bytes(ztree_t *t)
     struct stat st;
     if (fstat(t->cns_fd, &st) != 0) return 0;
     return (size_t)st.st_blocks * 512;
+}
+
+/* Bytes physically appended to ZNS leaf zones (cumulative WP - zone_start).
+ * Monotonically non-decreasing without ZNS GC.  Diff against (leaves on ZNS)
+ * × 4KB gives the stale-page volume that a future ZNS GC would reclaim. */
+static inline size_t zns_physical_bytes(ztree_t *t)
+{
+    size_t total = 0;
+    for (uint32_t z = ZTREE_LLAYER_ZONE_START; z < t->info.nr_zones; z++) {
+        uint64_t wp    = atomic_load_explicit(&t->zone_wp_bytes[z],
+                                              memory_order_relaxed);
+        uint64_t start = t->zones[z].start;
+        if (wp > start) total += (size_t)(wp - start);
+    }
+    return total;
 }
 
 /* ── CNS bitmap helpers ────────────────────────────────────────────────────
@@ -89,6 +147,25 @@ static inline int cns_bitmap_test(ztree_t *t, ztree_node_id_t nid)
     if (byte >= t->cns_bitmap_bytes)
         return 0;
     return (atomic_load_explicit(&t->cns_bitmap[byte], memory_order_relaxed) & bit) != 0;
+}
+
+/* Retire a node that has been removed from the tree (delete-merge, root
+ * collapse, root-leaf-empty).  Order matters: cow_gc_cns()'s SAFETY check
+ * refuses to punch a slot whose nid still maps to CNS in the NLT — so we
+ * tombstone the NLT entry FIRST, then clear the bitmap.  With this order
+ * the next GC pass sees bitmap=0 + NLT-miss → safe=1 → punch.  Reverse
+ * order would yield bitmap=0 + NLT=CNS → safe=0 (counted as race, slot
+ * persists until the eventual flush-page race window closes). */
+static inline void retire_cns_node(ztree_t *t, uint32_t zone_id,
+                                   ztree_node_id_t nid)
+{
+    nlt_remove(&t->nlt, zone_id, nid);
+    if (zone_id == CTREE_CNS_ZONE_ID) {
+        if (cns_bitmap_test(t, nid))
+            atomic_fetch_sub_explicit(&t->stat_cns_current, 1,
+                                      memory_order_relaxed);
+        cns_bitmap_clear(t, nid);
+    }
 }
 
 /* ── Zone busy counter (used in CNS spill stat sampling) ─────────────────── */
@@ -169,14 +246,16 @@ static inline void maybe_trace_sample(ztree_t *t)
     uint64_t cns_w = atomic_load_explicit(&t->stat_cns_writes, memory_order_relaxed);
     uint32_t height = atomic_load_explicit(&t->tree_height, memory_order_relaxed);
     size_t cns_phys = cns_physical_bytes(t);
-    fprintf(t->trace_fp, "%.3f,%lld,%lld,%llu,%llu,%u,%zu\n",
+    size_t zns_phys = zns_physical_bytes(t);
+    fprintf(t->trace_fp, "%.3f,%lld,%lld,%llu,%llu,%u,%zu,%zu\n",
             elapsed,
             (long long)leaves,
             (long long)internals,
             (unsigned long long)total,
             (unsigned long long)cns_w,
             height,
-            cns_phys);
+            cns_phys,
+            zns_phys);
 }
 
 static inline uint64_t ztree_hash64(ztree_node_id_t id)
@@ -1863,6 +1942,30 @@ typedef struct {
     uint32_t cidx_from_parent;  /* RIGHTMOST_IDX if linked via ptr_* */
 } delete_path_frame;
 
+/* Deferred retirement list.  Used for nodes whose retirement is NOT safe
+ * inline because the OLD superblock still references them at the time
+ * we'd want to retire — specifically root collapse (old root) and
+ * root-leaf-empty (the now-empty root leaf).  cow_delete drains this
+ * list AFTER try_publish_root_if_unchanged() succeeds, at which point
+ * the new sb has committed and the old root is unreachable from any
+ * fresh reader.  Inline merge-sibling retirement bypasses this list. */
+#define DELETE_RETIRE_MAX 4
+typedef struct {
+    int count;
+    uint32_t zone[DELETE_RETIRE_MAX];
+    ztree_node_id_t nid[DELETE_RETIRE_MAX];
+} delete_retire_list;
+
+static inline void retire_list_push(delete_retire_list *r,
+                                    uint32_t zone, ztree_node_id_t nid)
+{
+    if (r->count < DELETE_RETIRE_MAX) {
+        r->zone[r->count] = zone;
+        r->nid[r->count] = nid;
+        r->count++;
+    }
+}
+
 #define DEL_OK          0
 #define DEL_NOT_FOUND   1
 #define DEL_RACE        2
@@ -1932,7 +2035,8 @@ static int try_optimistic_delete(ztree_t *t, int64_t key,
                                  ztree_node_id_t *out_root_nid,
                                  uint32_t *out_root_zone,
                                  uint32_t *out_root_slot,
-                                 int *out_root_changed)
+                                 int *out_root_changed,
+                                 delete_retire_list *retire)
 {
     delete_path_frame path[MAX_HEIGHT];
     int depth = 0;
@@ -2038,6 +2142,9 @@ static int try_optimistic_delete(ztree_t *t, int64_t key,
         *out_root_slot = ZTREE_INVALID_SLOT_ID;
         *out_root_changed = 1;
         (void)seq_snapshot;
+        /* Tree becomes empty.  Old root-leaf is still referenced by the
+         * current sb until publish_root commits root=INVALID; defer. */
+        retire_list_push(retire, leaff->zone_id, leaff->node_id);
         return DEL_OK;
     }
 
@@ -2072,7 +2179,8 @@ static int try_pessimistic_delete(ztree_t *t, int64_t key,
                                   ztree_node_id_t *out_root_nid,
                                   uint32_t *out_root_zone,
                                   uint32_t *out_root_slot,
-                                  int *out_root_changed)
+                                  int *out_root_changed,
+                                  delete_retire_list *retire)
 {
     delete_path_frame path[MAX_HEIGHT];
     int depth = 0;
@@ -2145,6 +2253,9 @@ static int try_pessimistic_delete(ztree_t *t, int64_t key,
     leaf->num_keys--;
 
     if (depth == 1 && leaf->num_keys == 0) {
+        /* Tree becomes empty; old root-leaf still referenced by current
+         * sb until publish_root commits root=INVALID.  Defer retire. */
+        retire_list_push(retire, path[0].zone_id, path[0].node_id);
         delete_release_path_locks(t, path, depth);
         *out_root_nid = ZTREE_INVALID_NODE_ID;
         *out_root_zone = ZTREE_INVALID_ZONE_ID;
@@ -2331,6 +2442,13 @@ static int try_pessimistic_delete(ztree_t *t, int64_t key,
             collapsed_root_nid = r.node_id;
             collapsed_root_zone = r.zone_id;
             collapsed_root_slot = r.slot_id;
+            /* par (old root) was NOT flushed in this branch — its on-disk
+             * content still references sib.  Until publish_root swings
+             * sb.root to collapsed_root_nid, the old sb keeps the path
+             * old_root → {cur, sib} reachable.  Defer BOTH retirements
+             * until cow_delete confirms the publish. */
+            retire_list_push(retire, par_f->zone_id, par->node_id);
+            retire_list_push(retire, sib_actual_zone, sib_id);
             atomic_fetch_add_explicit(&t->stat_delete_root_collapses, 1,
                                       memory_order_relaxed);
             level = 0;
@@ -2341,6 +2459,13 @@ static int try_pessimistic_delete(ztree_t *t, int64_t key,
                              &prop.left_zone_changed,
                              &prop.left_zone, &prop.left_slot);
         prop.left_id = par->node_id;
+
+        /* par is now persisted without referencing sib_id.  Any fresh
+         * reader navigating from par will skip sib_id; old-sb readers
+         * holding stale par content can still find sib via NLT until
+         * the very next moment — accepted race (existing model). */
+        retire_cns_node(t, sib_actual_zone, sib_id);
+
         if ((level - 1) < merge_done_at_level || merge_done_at_level < 0)
             merge_done_at_level = level - 1;
 
@@ -2454,17 +2579,18 @@ int cow_delete(cow_tree *t, int64_t key)
         uint32_t out_zone = root_zone;
         uint32_t out_slot = root_slot;
         int root_changed = 0;
+        delete_retire_list retire = { .count = 0 };
 
         int res = try_optimistic_delete(t, key, root_nid, root_zone, root_slot,
                                         seq_snapshot,
                                         &out_nid, &out_zone, &out_slot,
-                                        &root_changed);
+                                        &root_changed, &retire);
         if (res == DEL_NOT_FOUND) return 0;
         if (res == DEL_RACE) continue;
         if (res == DEL_NEEDS_MERGE) {
             res = try_pessimistic_delete(t, key, root_nid, root_zone, root_slot,
                                          &out_nid, &out_zone, &out_slot,
-                                         &root_changed);
+                                         &root_changed, &retire);
             if (res == DEL_NOT_FOUND) return 0;
             if (res == DEL_RACE) continue;
         }
@@ -2474,8 +2600,13 @@ int cow_delete(cow_tree *t, int64_t key)
         {
             if (!try_publish_root_if_unchanged(t, seq_snapshot,
                                                out_nid, out_zone, out_slot))
-                continue;
+                continue;  /* publish race → retire list dropped, leak this attempt */
         }
+        /* Publish (if any) committed, or no publish needed.  Drain the
+         * deferred retirements: old root from collapse / empty-root-leaf,
+         * plus the sib that was paired with a non-flushed old root. */
+        for (int i = 0; i < retire.count; i++)
+            retire_cns_node(t, retire.zone[i], retire.nid[i]);
         atomic_fetch_add_explicit(&t->stat_deletes, 1, memory_order_relaxed);
         return 1;
     }
@@ -2574,12 +2705,26 @@ cow_tree *cow_open(const char *path)
 
     /* Trace: time-stepped sample of node counts, append totals, and the
      * CNS file's *physical* size (cns_phys_bytes — the metric that drops
-     * when GC punches holes).  Path differs from ilayer to avoid clashes. */
-    t->trace_fp = fopen("/tmp/ctree_dynamic_trace.csv", "w");
+     * when GC punches holes).  Path differs from ilayer to avoid clashes.
+     * Override default with env CTREE_DYNAMIC_TRACE_PATH so buffered/ODIRECT
+     * runs can keep their own CSVs side-by-side. */
+    {
+        const char *trace_path = getenv("CTREE_DYNAMIC_TRACE_PATH");
+        if (!trace_path || !*trace_path)
+            trace_path = "/tmp/ctree_dynamic_trace.csv";
+        t->trace_fp = fopen(trace_path, "w");
+        if (!t->trace_fp)
+            fprintf(stderr,
+                    "[ctree_dynamic] WARNING: cannot open trace %s: %s\n",
+                    trace_path, strerror(errno));
+        else
+            fprintf(stderr,
+                    "[ctree_dynamic] trace -> %s\n", trace_path);
+    }
     t->trace_start_ns = monotonic_ns();
     if (t->trace_fp)
         fprintf(t->trace_fp,
-                "time_sec,zns_current,cns_current,appends,cns_writes,height,cns_phys_bytes\n");
+                "time_sec,zns_current,cns_current,appends,cns_writes,height,cns_phys_bytes,zns_phys_bytes\n");
     atomic_store_explicit(&t->stat_cns_current, 0, memory_order_relaxed);
     atomic_store_explicit(&t->stat_cns_writes, 0, memory_order_relaxed);
     atomic_store_explicit(&t->tree_height, 1, memory_order_relaxed);
@@ -2777,12 +2922,63 @@ cow_tree *cow_open(const char *path)
         return NULL;
     }
 
+    /* Periodic evict+GC.  Default 1000ms; 0 disables. */
+    {
+        const char *env = getenv("CTREE_DYNAMIC_GC_INTERVAL_MS");
+        long ms = env ? atol(env) : 1000;
+        if (ms < 0) ms = 0;
+        g_gc_interval_ms = (unsigned)ms;
+    }
+    if (g_gc_interval_ms > 0)
+    {
+        if (!atomic_load_explicit(&g_insert_pause_initialised, memory_order_acquire))
+        {
+            pthread_rwlockattr_t attr;
+            pthread_rwlockattr_init(&attr);
+            /* Writer preference (non-recursive): GC's wrlock no longer
+             * starves under continuous worker rdlock traffic. */
+            pthread_rwlockattr_setkind_np(
+                &attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+            pthread_rwlock_init(&g_insert_pause, &attr);
+            pthread_rwlockattr_destroy(&attr);
+            atomic_store_explicit(&g_insert_pause_initialised, true,
+                                  memory_order_release);
+        }
+        atomic_store_explicit(&g_gc_stop, false, memory_order_relaxed);
+        atomic_store_explicit(&g_gc_running, true, memory_order_release);
+        if (pthread_create(&g_gc_tid, NULL, dynamic_gc_thread, t) != 0)
+        {
+            perror("pthread_create dynamic_gc_thread");
+            atomic_store_explicit(&g_gc_running, false, memory_order_release);
+        }
+        else
+        {
+            fprintf(stderr,
+                    "[ctree_dynamic] periodic evict+GC enabled: every %u ms\n",
+                    g_gc_interval_ms);
+        }
+    }
+    else
+    {
+        fprintf(stderr,
+                "[ctree_dynamic] periodic evict+GC disabled (CTREE_DYNAMIC_GC_INTERVAL_MS=0)\n");
+    }
+
     return t;
 }
 
 void cow_insert(cow_tree *t, int64_t key, const char *value)
 {
-    do_single_insert(t, key, value);
+    if (atomic_load_explicit(&g_gc_running, memory_order_acquire))
+    {
+        pthread_rwlock_rdlock(&g_insert_pause);
+        do_single_insert(t, key, value);
+        pthread_rwlock_unlock(&g_insert_pause);
+    }
+    else
+    {
+        do_single_insert(t, key, value);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -3006,6 +3202,18 @@ void cow_close(cow_tree *t)
 {
     if (!t)
         return;
+
+    if (atomic_load_explicit(&g_gc_running, memory_order_acquire))
+    {
+        atomic_store_explicit(&g_gc_stop, true, memory_order_release);
+        pthread_join(g_gc_tid, NULL);
+        atomic_store_explicit(&g_gc_running, false, memory_order_release);
+
+        /* Final evict+GC at quiescence so the trace ends with the sawtooth's
+         * trailing valley rather than mid-burst. */
+        cow_evict_cns_leaves(t);
+        cow_gc_cns(t);
+    }
 
     atomic_store_explicit(&t->stop_flusher, true, memory_order_release);
     pthread_join(t->flusher_tid, NULL);

@@ -566,15 +566,11 @@ static void load_page_by_pn(ztree_t *t, ztree_pagenum_t pn, ztree_page *dst)
 
     cache_insert(t, pn, dst);
 
-    if (dst->node_id != ZTREE_INVALID_NODE_ID)
-    {
-        nlt_location_t loc = {
-            .zone_id = dst->zone_id,
-            .node_id = dst->node_id,
-            .slot_id = dst->slot_id,
-        };
-        nlt_update(&t->nlt, &loc);
-    }
+    /* DO NOT call nlt_update() here.  A loaded page's header carries the
+     * (zone_id, slot_id) it was flushed at, which may be an OLD slot —
+     * publishing that back into the NLT can revert the live entry for
+     * this node_id to a stale slot, orphaning the latest content.  NLT
+     * is owned solely by the flush path (flush_page_immediate). */
 }
 
 /* Read a page from CNS.  O_DIRECT path uses an aligned bounce buffer. */

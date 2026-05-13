@@ -1,14 +1,5 @@
 /*
- * ctree_main.c  –  CTree variant: Dynamic CNS (PoC, step 1)
- *
- * Phase 1 starting point: same behavior as ilayer (internal=CNS, leaf=ZNS),
- * plus measurement infrastructure for CNS *physical* size over time.
- *
- * Future steps will add:
- *   - leaf spill on ZNS zone-lock contention (base ctree fallback)
- *   - cns_valid_bitmap (1 bit per node_id)
- *   - cns_evict_all_leaves(): migrate CNS-resident leaves back to ZNS
- *   - cns_gc(): fallocate(FALLOC_FL_PUNCH_HOLE) on orphan slot ranges
+ * ctree_main.c  –  CTree variant: Dynamic CNS
  *
  gcc -O2 -g -Wall -Wextra -std=c11 -pthread -I ctree \
       ctree/ctree_nlt.c ctree/ctree_zone.c \
@@ -232,13 +223,11 @@ static inline uint64_t monotonic_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-static inline void maybe_trace_sample(ztree_t *t)
+static inline void emit_trace_row(ztree_t *t)
 {
     if (!t->trace_fp)
         return;
     uint64_t total = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed);
-    if (total % TRACE_SAMPLE_INTERVAL != 0)
-        return;
     double elapsed = (double)(monotonic_ns() - t->trace_start_ns) / 1e9;
     int64_t internals = atomic_load_explicit(&t->stat_cns_current, memory_order_relaxed);
     uint32_t total_nodes = atomic_load_explicit(&t->next_node_id, memory_order_relaxed) - 1;
@@ -256,6 +245,27 @@ static inline void maybe_trace_sample(ztree_t *t)
             height,
             cns_phys,
             zns_phys);
+}
+
+static inline void maybe_trace_sample(ztree_t *t)
+{
+    if (!t->trace_fp)
+        return;
+    uint64_t total = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed);
+    if (total % TRACE_SAMPLE_INTERVAL != 0)
+        return;
+    emit_trace_row(t);
+}
+
+/* Unconditional trace sample — used inside maintenance (evict + gc) where
+ * stat_page_appends doesn't advance, so the modulo-gated sampler would
+ * otherwise stay silent and the M-band on the plot would have no data
+ * points to draw the CNS drop or ZNS rise. */
+static inline void force_trace_sample(ztree_t *t)
+{
+    emit_trace_row(t);
+    if (t->trace_fp)
+        fflush(t->trace_fp);
 }
 
 static inline uint64_t ztree_hash64(ztree_node_id_t id)
@@ -2993,10 +3003,70 @@ void cow_insert(cow_tree *t, int64_t key, const char *value)
  *   blocks.  Result: cns_physical_bytes() shrinks.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Verbosity gate for noisy diagnostic prints (NLT miss in ztree_find,
+ * GC SAFETY warnings in cow_gc_cns).  Both are symptoms of the known
+ * residual 0.5% concurrent-split race (see project_dynamic_insert_race
+ * memory).  Quiet by default; set CTREE_DYNAMIC_VERBOSE=1 to re-enable
+ * (e.g., when debugging a fresh race lead). */
+static inline int dynamic_verbose(void)
+{
+    static int inited = 0, on = 0;
+    if (!inited) {
+        const char *e = getenv("CTREE_DYNAMIC_VERBOSE");
+        on = (e && *e && *e != '0');
+        inited = 1;
+    }
+    return on;
+}
+
+/* Phase marker: append (time_sec_since_cow_open, name) to a side file
+ * for plot annotation.  Path: CTREE_DYNAMIC_PHASE_PATH env, or default
+ * "<trace_path>.phases".  Caller (binding's Maintenance) invokes this
+ * at workload phase boundaries; plotter draws a vline + region label
+ * at each marker. */
+void cow_phase_mark(cow_tree *t, const char *name)
+{
+    static FILE *phase_fp = NULL;
+    static pthread_mutex_t phase_mu = PTHREAD_MUTEX_INITIALIZER;
+    static int tried_open = 0;
+    if (!t || !name) return;
+    pthread_mutex_lock(&phase_mu);
+    if (!phase_fp && !tried_open) {
+        tried_open = 1;
+        const char *path = getenv("CTREE_DYNAMIC_PHASE_PATH");
+        char buf[1024];
+        if (!path || !*path) {
+            const char *tp = getenv("CTREE_DYNAMIC_TRACE_PATH");
+            if (tp && *tp) {
+                snprintf(buf, sizeof buf, "%s.phases", tp);
+                path = buf;
+            }
+        }
+        if (path && *path) {
+            phase_fp = fopen(path, "w");
+            if (phase_fp) {
+                fprintf(phase_fp, "time_sec,phase\n");
+                fprintf(stderr, "[ctree_dynamic] phase log -> %s\n", path);
+            }
+        }
+    }
+    if (phase_fp) {
+        double sec = (double)(monotonic_ns() - t->trace_start_ns) / 1e9;
+        fprintf(phase_fp, "%.3f,%s\n", sec, name);
+        fflush(phase_fp);
+    }
+    pthread_mutex_unlock(&phase_mu);
+}
+
 size_t cow_evict_cns_leaves(cow_tree *t)
 {
     if (!t || t->cns_fd < 0 || !t->cns_bitmap) return 0;
     size_t evicted = 0, skipped_internal = 0, skipped_full = 0;
+
+    /* Snapshot before evict so the plot has at least one data point inside
+     * the M-band even when the surrounding workload generated no further
+     * page writes (e.g. final M after workload G). */
+    force_trace_sample(t);
 
     uint32_t max_node = atomic_load_explicit(&t->next_node_id, memory_order_relaxed);
     for (uint32_t nid = 1; nid < max_node; nid++)
@@ -3084,7 +3154,14 @@ size_t cow_evict_cns_leaves(cow_tree *t)
         atomic_fetch_sub_explicit(&t->stat_cns_current, 1, memory_order_relaxed);
 
         evicted++;
+
+        /* Periodic snapshot during evict — captures the ZNS-rising slope
+         * inside the M-band on the plot.  ~1K evictions ≈ 4MB of ZNS
+         * growth per sample, fine resolution at low write cost. */
+        if ((evicted & 1023) == 0) force_trace_sample(t);
     }
+
+    force_trace_sample(t);  /* End-of-evict snapshot (before GC). */
 
     fprintf(stderr,
             "[ctree_dynamic] cow_evict_cns_leaves: evicted=%zu  internal_skipped=%zu  "
@@ -3120,63 +3197,62 @@ size_t cow_gc_cns(cow_tree *t)
     size_t before = cns_physical_bytes(t);
 
     uint32_t max_node = atomic_load_explicit(&t->next_node_id, memory_order_relaxed);
-    int in_run = 0;
-    uint32_t run_start = 0;
     size_t total_punched_pages = 0;
     size_t punched_internal_caught = 0;
 
-    /* Iterate one past max_node so the last run is closed naturally. */
+    /* Slot-granular GC.  Previously the SAFETY check skipped the ENTIRE
+     * bitmap=0 run if ANY single slot's NLT still mapped to CNS — one
+     * stale nid blocked hundreds of safe neighbors.  Now we walk slot
+     * by slot, accumulate a punchable range, and flush it whenever we
+     * hit either a bitmap=1 slot OR an NLT-dirty slot.  Only the dirty
+     * slot itself leaks (4 KB each) instead of the whole run. */
+    uint32_t punch_start = 0;
+    int punch_active = 0;  /* 1 → an accumulating run of safe slots is open */
+
     for (uint32_t nid = 0; nid <= max_node; nid++)
     {
-        int valid = (nid < max_node) && cns_bitmap_test(t, nid);
-        if (!valid && !in_run)
-        {
-            run_start = nid;
-            in_run = 1;
-        }
-        else if (valid && in_run)
-        {
-            uint32_t run_len = nid - run_start;
-            if (run_len > 0)
-            {
-                /* SAFETY: probe NLT for each slot in the run.  If any node_id
-                 * is still mapped to CNS (= bitmap missed it), do NOT punch
-                 * that range — log and skip.  Catches stale bitmap bugs. */
-                int safe = 1;
-                for (uint32_t scan = run_start; scan < nid; scan++)
-                {
-                    nlt_location_t q = { .zone_id = CTREE_CNS_ZONE_ID,
-                                         .node_id = scan,
-                                         .slot_id = ZTREE_INVALID_SLOT_ID };
-                    nlt_location_t r;
-                    if (nlt_lookup(&t->nlt, &q, &r)
-                        && r.zone_id == CTREE_CNS_ZONE_ID)
-                    {
-                        /* Load page to check is_leaf (diagnostic). */
-                        ztree_page p;
-                        load_page_from_cns(t, r.slot_id, &p);
-                        fprintf(stderr,
-                                "[ctree_dynamic] GC SAFETY: nid=%u (is_leaf=%d num_keys=%u) still on CNS "
-                                "but bitmap=0!  skipping run [%u,%u)\n",
-                                scan, p.is_leaf, p.num_keys, run_start, nid);
-                        punched_internal_caught++;
-                        safe = 0;
-                        break;
-                    }
+        int slot_punchable = 0;
+        if (nid < max_node && !cns_bitmap_test(t, nid)) {
+            /* Bitmap=0 candidate.  Verify NLT no longer maps this nid to
+             * a live CNS slot — if it does, bitmap is stale (residual
+             * concurrent-split race; see project_dynamic_insert_race). */
+            nlt_location_t q = { .zone_id = CTREE_CNS_ZONE_ID,
+                                 .node_id = nid,
+                                 .slot_id = ZTREE_INVALID_SLOT_ID };
+            nlt_location_t r;
+            if (nlt_lookup(&t->nlt, &q, &r)
+                && r.zone_id == CTREE_CNS_ZONE_ID) {
+                if (dynamic_verbose()) {
+                    ztree_page p;
+                    load_page_from_cns(t, r.slot_id, &p);
+                    fprintf(stderr,
+                            "[ctree_dynamic] GC SAFETY: nid=%u (is_leaf=%d num_keys=%u) "
+                            "still on CNS but bitmap=0!  skipping this slot\n",
+                            nid, p.is_leaf, p.num_keys);
                 }
-                if (safe)
+                punched_internal_caught++;
+                /* slot_punchable stays 0 → this slot blocks itself only. */
+            } else {
+                slot_punchable = 1;
+            }
+        }
+
+        if (slot_punchable) {
+            if (!punch_active) { punch_start = nid; punch_active = 1; }
+        } else if (punch_active) {
+            /* End of safe run — flush accumulated [punch_start, nid). */
+            uint32_t run_len = nid - punch_start;
+            if (run_len > 0) {
+                off_t off = (off_t)punch_start * ZTREE_PAGE_SIZE;
+                off_t len = (off_t)run_len * ZTREE_PAGE_SIZE;
+                if (fallocate(t->cns_fd,
+                              FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                              off, len) == 0)
                 {
-                    off_t off = (off_t)run_start * ZTREE_PAGE_SIZE;
-                    off_t len = (off_t)run_len * ZTREE_PAGE_SIZE;
-                    if (fallocate(t->cns_fd,
-                                  FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                                  off, len) == 0)
-                    {
-                        total_punched_pages += run_len;
-                    }
+                    total_punched_pages += run_len;
                 }
             }
-            in_run = 0;
+            punch_active = 0;
         }
     }
     if (punched_internal_caught)
@@ -3185,6 +3261,7 @@ size_t cow_gc_cns(cow_tree *t)
                 punched_internal_caught);
 
     size_t after = cns_physical_bytes(t);
+    force_trace_sample(t);  /* Post-GC snapshot — captures CNS drop. */
     fprintf(stderr,
             "[ctree_dynamic] cow_gc_cns: punched_pages=%zu  cns_phys: %zu → %zu KB  "
             "(freed %zu KB)\n",
@@ -3431,9 +3508,11 @@ ztree_record *ztree_find(ztree_t *t, int64_t key)
         }
         else
         {
-            fprintf(stderr, "ztree_find: NLT miss for child node_id=%llu "
-                            "(zone_hint=%u)\n",
-                    (unsigned long long)child_nid, child_zone);
+            if (dynamic_verbose()) {
+                fprintf(stderr, "ztree_find: NLT miss for child node_id=%llu "
+                                "(zone_hint=%u)\n",
+                        (unsigned long long)child_nid, child_zone);
+            }
             return NULL;
         }
     }

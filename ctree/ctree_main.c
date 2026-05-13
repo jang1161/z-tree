@@ -2665,14 +2665,26 @@ cow_tree *cow_open(const char *path)
 
     t->direct_fd = open(path, O_RDWR | O_DIRECT);
 
-    /* ── Open CNS (Conventional Namespace) device for contention fallback ── */
-    t->cns_fd = open(CTREE_CNS_DEV_PATH, O_RDWR | O_DIRECT);
+    /* ── Open CNS (Conventional Namespace) device for contention fallback ──
+     * CNS_ODIRECT env (default 1 = O_DIRECT) toggles buffered vs O_DIRECT
+     * access to the CNS fallback device.  Buffered mode keeps the kernel
+     * page cache in front of CNS writes so the comparison vs the dynamic
+     * variant (which has CNS_ODIRECT=0/1 of its own) is apples-to-apples. */
+    int cns_flags = O_RDWR | O_DIRECT;
+    {
+        const char *od = getenv("CNS_ODIRECT");
+        if (od && od[0] == '0') cns_flags = O_RDWR;
+    }
+    t->cns_fd = open(CTREE_CNS_DEV_PATH, cns_flags);
     if (t->cns_fd < 0)
     {
         fprintf(stderr, "[ctree] WARNING: cannot open CNS device %s: %s\n"
                         "        CNS fallback disabled — will block on contention.\n",
                 CTREE_CNS_DEV_PATH, strerror(errno));
         /* Non-fatal: we can still operate (degrades to ztree behavior). */
+    } else {
+        fprintf(stderr, "[ctree] CNS mode: %s\n",
+                (cns_flags & O_DIRECT) ? "O_DIRECT" : "buffered");
     }
     /* Allocate CNS bitmap */
     t->cns_bitmap_bytes = CTREE_CNS_BITMAP_MAX_NODES / 8;

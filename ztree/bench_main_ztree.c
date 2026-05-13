@@ -150,16 +150,27 @@ int main(int argc, char *argv[])
         all_keys[i] = i;
     }
 
-    srand(54321);
-    for (int i = total_keys - 1; i > 0; i--)
+    /* BENCH_SEQUENTIAL=1 skips the Fisher-Yates shuffle so threads insert
+     * keys in ascending order — used for the sequential-insert comparison
+     * across variants.  Default (unset / 0) keeps the original randomised
+     * order so existing bench numbers remain comparable. */
+    const char *seq_env = getenv("BENCH_SEQUENTIAL");
+    int sequential = seq_env && seq_env[0] == '1';
+
+    if (!sequential)
     {
-        int j = rand() % (i + 1);
-        int tmp = all_keys[i];
-        all_keys[i] = all_keys[j];
-        all_keys[j] = tmp;
+        srand(54321);
+        for (int i = total_keys - 1; i > 0; i--)
+        {
+            int j = rand() % (i + 1);
+            int tmp = all_keys[i];
+            all_keys[i] = all_keys[j];
+            all_keys[j] = tmp;
+        }
     }
 
-    printf("Random key set generated (%d keys).\n", total_keys);
+    printf("%s key set generated (%d keys).\n",
+           sequential ? "Sequential" : "Random", total_keys);
 
     int thread_counts[] = {1, 2, 4, 8, 16, 32, 64};
     int num_configs = (int)(sizeof(thread_counts) / sizeof(thread_counts[0]));

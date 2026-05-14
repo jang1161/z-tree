@@ -366,16 +366,8 @@ static void load_page_by_pn(ztree_t *t, ztree_pagenum_t pn, ztree_page *dst)
     /* 3. Warm the cache */
     cache_insert(t, pn, dst);
 
-    /* 4. Lazy NLT population: register this node's stable location */
-    if (dst->node_id != ZTREE_INVALID_NODE_ID)
-    {
-        nlt_location_t loc = {
-            .zone_id = dst->zone_id,
-            .node_id = dst->node_id,
-            .slot_id = dst->slot_id,
-        };
-        nlt_update(&t->nlt, &loc);
-    }
+    /* NLT is owned by flush_page_immediate; read-side republish would
+     * revert the live entry to a stale slot (see e8dc9d8). */
 }
 
 /*
@@ -2659,9 +2651,9 @@ void cow_close(cow_tree *t)
 
 ztree_record *ztree_find(ztree_t *t, int64_t key)
 {
-    /* Read the current root safely using the seqlock volatile superblock */
+    /* volatile_sb's root_slot goes stale on same-zone CoW; resolve via NLT. */
     ztree_node_id_t root_nid;
-    uint32_t root_zone, root_slot;
+    uint32_t root_zone;
     for (;;)
     {
         uint64_t s1 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
@@ -2669,7 +2661,6 @@ ztree_record *ztree_find(ztree_t *t, int64_t key)
             continue;
         root_nid = atomic_load_explicit(&t->volatile_sb.root_node_id, memory_order_acquire);
         root_zone = atomic_load_explicit(&t->volatile_sb.root_zone_id, memory_order_acquire);
-        root_slot = atomic_load_explicit(&t->volatile_sb.root_slot_id, memory_order_acquire);
         uint64_t s2 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
         if (s1 == s2 && (s2 & 1ULL) == 0)
             break;
@@ -2678,12 +2669,19 @@ ztree_record *ztree_find(ztree_t *t, int64_t key)
     if (root_nid == ZTREE_INVALID_NODE_ID)
         return NULL;
 
-    /* Traverse the tree from root to leaf using NLT resolution */
-    (void)root_nid; /* identity tracked inside pg.node_id after first load */
-
     ztree_page pg;
-    ztree_pagenum_t pn = zone_slot_to_pn(t, root_zone, root_slot);
-    load_page_by_pn(t, pn, &pg);
+    {
+        nlt_location_t root_query = {
+            .zone_id = root_zone,
+            .node_id = root_nid,
+            .slot_id = ZTREE_INVALID_SLOT_ID,
+        };
+        nlt_location_t root_result;
+        if (!nlt_lookup(&t->nlt, &root_query, &root_result))
+            return NULL;
+        ztree_pagenum_t pn = zone_slot_to_pn(t, root_result.zone_id, root_result.slot_id);
+        load_page_by_pn(t, pn, &pg);
+    }
 
     while (!pg.is_leaf)
     {
@@ -2707,19 +2705,14 @@ ztree_record *ztree_find(ztree_t *t, int64_t key)
             .slot_id = ZTREE_INVALID_SLOT_ID,
         };
         nlt_location_t result;
-        if (nlt_lookup(&t->nlt, &query, &result))
+        if (!nlt_lookup(&t->nlt, &query, &result))
         {
-            pn = zone_slot_to_pn(t, result.zone_id, result.slot_id);
-        }
-        else
-        {
-            /* NLT not yet populated — should be resolved by lazy population. */
             fprintf(stderr, "ztree_find: NLT miss for child node_id=%llu "
-                            "(zone_hint=%u) – NLT not yet populated?\n",
+                            "(zone_hint=%u)\n",
                     (unsigned long long)child_nid, child_zone);
             return NULL;
         }
-
+        ztree_pagenum_t pn = zone_slot_to_pn(t, result.zone_id, result.slot_id);
         load_page_by_pn(t, pn, &pg);
     }
 

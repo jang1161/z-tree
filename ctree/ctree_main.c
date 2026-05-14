@@ -425,16 +425,8 @@ static void load_page_by_pn(ztree_t *t, ztree_pagenum_t pn, ztree_page *dst)
     /* 3. Warm the cache */
     cache_insert(t, pn, dst);
 
-    /* 4. Lazy NLT population: register this node's stable location */
-    if (dst->node_id != ZTREE_INVALID_NODE_ID)
-    {
-        nlt_location_t loc = {
-            .zone_id = dst->zone_id,
-            .node_id = dst->node_id,
-            .slot_id = dst->slot_id,
-        };
-        nlt_update(&t->nlt, &loc);
-    }
+    /* NLT is owned by flush_page_immediate; read-side republish would
+     * revert the live entry to a stale slot (see e8dc9d8). */
 }
 
 /*
@@ -942,6 +934,7 @@ retry_flush:
                 /* Mark zone full and seal. */
                 atomic_store_explicit(&t->zone_full[prev_zone], 1, memory_order_release);
                 nlt_set_zone_sealed(&t->nlt, prev_zone, true);
+                atomic_fetch_add_explicit(&t->stat_zone_seals, 1, memory_order_relaxed);
                 zone_seal_and_replace(&t->za, prev_zone);
             }
         }
@@ -1256,6 +1249,7 @@ retry_flush:
         if (new_wp >= zone_end)
         {
             atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
+            atomic_fetch_add_explicit(&t->stat_zone_seals, 1, memory_order_relaxed);
             zone_seal_and_replace(&t->za, target_zone);
         }
 
@@ -1307,7 +1301,8 @@ retry_flush:
         .node_id = pg->node_id,
         .slot_id = slot_id,
     };
-    nlt_update(&t->nlt, &loc);
+    /* Migrate (not update) so prev_zone's stale entry is tombstoned. */
+    nlt_update_migrate(&t->nlt, &loc, prev_zone);
 
     if (!cns_path)
     {
@@ -1318,6 +1313,7 @@ retry_flush:
         {
             atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
             nlt_set_zone_sealed(&t->nlt, target_zone, true);
+            atomic_fetch_add_explicit(&t->stat_zone_seals, 1, memory_order_relaxed);
             zone_seal_and_replace(&t->za, target_zone);
         }
     }
@@ -1625,6 +1621,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
             {
                 memcpy(leaf->leaf[i].record.value, value, 120);
                 updated = 1;
+                atomic_fetch_add_explicit(&t->stat_leaf_updates, 1, memory_order_relaxed);
                 break;
             }
         }
@@ -1641,6 +1638,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                 leaf->leaf[pos].key = (uint64_t)key;
                 memcpy(leaf->leaf[pos].record.value, value, 120);
                 leaf->num_keys++;
+                atomic_fetch_add_explicit(&t->stat_leaf_appends, 1, memory_order_relaxed);
             }
             else
             {
@@ -1681,6 +1679,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                  * avoid_zone = leaff->zone_id so the new right sibling is
                  * always allocated to a different zone than the left sibling. */
                 int rzchg = 1;
+                atomic_fetch_add_explicit(&t->stat_leaf_splits, 1, memory_order_relaxed);
                 flush_page_immediate(t, &right, ZTREE_INVALID_ZONE_ID,
                                      leaff->zone_id,
                                      &rzchg, &prop.right_zone, &prop.right_slot);
@@ -1833,6 +1832,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
                         right.ptr_zone_id = tchld_zone[ZTREE_INTERNAL_ORDER];
 
                         int rzchg = 1;
+                        atomic_fetch_add_explicit(&t->stat_internal_splits, 1, memory_order_relaxed);
                         flush_page_immediate(t, &right, ZTREE_INVALID_ZONE_ID,
                                              pf->zone_id,
                                              &rzchg, &prop.right_zone, &prop.right_slot);
@@ -2921,6 +2921,11 @@ void cow_close(cow_tree *t)
     uint64_t fl_sum = atomic_load_explicit(&t->stat_flush_ns_sum, memory_order_relaxed);
     uint64_t fl_samp = atomic_load_explicit(&t->stat_flush_ns_samples, memory_order_relaxed);
     uint64_t cns_writes = atomic_load_explicit(&t->stat_cns_writes, memory_order_relaxed);
+    uint64_t leaf_splits = atomic_load_explicit(&t->stat_leaf_splits, memory_order_relaxed);
+    uint64_t internal_splits = atomic_load_explicit(&t->stat_internal_splits, memory_order_relaxed);
+    uint64_t zone_seals = atomic_load_explicit(&t->stat_zone_seals, memory_order_relaxed);
+    uint64_t leaf_updates = atomic_load_explicit(&t->stat_leaf_updates, memory_order_relaxed);
+    uint64_t leaf_appends = atomic_load_explicit(&t->stat_leaf_appends, memory_order_relaxed);
 
     fprintf(stderr,
             "\n[ctree profile]\n"
@@ -2928,6 +2933,9 @@ void cow_close(cow_tree *t)
             "  deletes        = %llu  (merges=%llu cascades=%llu root_collapses=%llu)\n"
             "  cache_hit      = %llu  miss = %llu  hit_rate = %.1f%%\n"
             "  page_appends   = %llu\n"
+            "  leaf ops       = %llu updates + %llu appends + %llu splits\n"
+            "  splits         = %llu leaf + %llu internal\n"
+            "  zone_seals     = %llu\n"
             "  two-stage tracking:\n"
             "    nlt_only_updates  = %llu  (parent skipped, same zone)\n"
             "    zone_changes      = %llu  (node moved to new zone)\n"
@@ -2942,6 +2950,12 @@ void cow_close(cow_tree *t)
             (unsigned long long)cm,
             (ch + cm > 0) ? 100.0 * (double)ch / (double)(ch + cm) : 0.0,
             (unsigned long long)appends,
+            (unsigned long long)leaf_updates,
+            (unsigned long long)leaf_appends,
+            (unsigned long long)leaf_splits,
+            (unsigned long long)leaf_splits,
+            (unsigned long long)internal_splits,
+            (unsigned long long)zone_seals,
             (unsigned long long)nlt_only,
             (unsigned long long)zone_chg,
             (unsigned long long)par_rew,
@@ -3083,9 +3097,9 @@ void cow_close(cow_tree *t)
 
 ztree_record *ztree_find(ztree_t *t, int64_t key)
 {
-    /* Read the current root safely using the seqlock volatile superblock */
+    /* volatile_sb's root_slot goes stale on same-zone CoW; resolve via NLT. */
     ztree_node_id_t root_nid;
-    uint32_t root_zone, root_slot;
+    uint32_t root_zone;
     for (;;)
     {
         uint64_t s1 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
@@ -3093,7 +3107,6 @@ ztree_record *ztree_find(ztree_t *t, int64_t key)
             continue;
         root_nid = atomic_load_explicit(&t->volatile_sb.root_node_id, memory_order_acquire);
         root_zone = atomic_load_explicit(&t->volatile_sb.root_zone_id, memory_order_acquire);
-        root_slot = atomic_load_explicit(&t->volatile_sb.root_slot_id, memory_order_acquire);
         uint64_t s2 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
         if (s1 == s2 && (s2 & 1ULL) == 0)
             break;
@@ -3102,16 +3115,23 @@ ztree_record *ztree_find(ztree_t *t, int64_t key)
     if (root_nid == ZTREE_INVALID_NODE_ID)
         return NULL;
 
-    /* Traverse the tree from root to leaf using NLT resolution */
-    (void)root_nid; /* identity tracked inside pg.node_id after first load */
-
     ztree_page pg;
-    if (root_zone == CTREE_CNS_ZONE_ID)
-        load_page_from_cns(t, root_slot, &pg);
-    else
     {
-        ztree_pagenum_t pn = zone_slot_to_pn(t, root_zone, root_slot);
-        load_page_by_pn(t, pn, &pg);
+        nlt_location_t root_query = {
+            .zone_id = root_zone,
+            .node_id = root_nid,
+            .slot_id = ZTREE_INVALID_SLOT_ID,
+        };
+        nlt_location_t root_result;
+        if (!nlt_lookup(&t->nlt, &root_query, &root_result))
+            return NULL;
+        if (root_result.zone_id == CTREE_CNS_ZONE_ID)
+            load_page_from_cns(t, root_result.slot_id, &pg);
+        else
+        {
+            ztree_pagenum_t pn = zone_slot_to_pn(t, root_result.zone_id, root_result.slot_id);
+            load_page_by_pn(t, pn, &pg);
+        }
     }
 
     while (!pg.is_leaf)

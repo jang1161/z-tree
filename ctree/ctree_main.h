@@ -89,6 +89,12 @@ struct ztree_s {
     _Atomic(uint64_t) stat_zone_changes;
     _Atomic(uint64_t) stat_parent_rewrites;
 
+    _Atomic(uint64_t) stat_leaf_splits;
+    _Atomic(uint64_t) stat_internal_splits;
+    _Atomic(uint64_t) stat_zone_seals;
+    _Atomic(uint64_t) stat_leaf_updates;   /* same-key overwrite */
+    _Atomic(uint64_t) stat_leaf_appends;   /* new key, no split */
+
     _Atomic(uint64_t) stat_apply_ns_sum;
     _Atomic(uint64_t) stat_apply_ns_samples;
     _Atomic(uint64_t) stat_flush_ns_sum;

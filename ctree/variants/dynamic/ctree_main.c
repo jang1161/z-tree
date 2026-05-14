@@ -3058,19 +3058,32 @@ void cow_phase_mark(cow_tree *t, const char *name)
     pthread_mutex_unlock(&phase_mu);
 }
 
-size_t cow_evict_cns_leaves(cow_tree *t)
+/* Parallel maintenance: split nid range across N workers.  Knob:
+ * CTREE_DYNAMIC_MAINT_THREADS (default 8).  Foreground writes assumed
+ * quiesced (chain runner gates phases). */
+static int dyn_maint_threads(void)
 {
-    if (!t || t->cns_fd < 0 || !t->cns_bitmap) return 0;
-    size_t evicted = 0, skipped_internal = 0, skipped_full = 0;
+    const char *e = getenv("CTREE_DYNAMIC_MAINT_THREADS");
+    int n = e ? atoi(e) : 8;
+    if (n < 1) n = 1;
+    if (n > 32) n = 32;
+    return n;
+}
 
-    /* Snapshot before evict so the plot has at least one data point inside
-     * the M-band even when the surrounding workload generated no further
-     * page writes (e.g. final M after workload G). */
-    force_trace_sample(t);
+struct dyn_evict_arg {
+    cow_tree *t;
+    uint32_t  nid_start, nid_end;
+    size_t    evicted, skipped_internal, skipped_full;
+};
 
-    uint32_t max_node = atomic_load_explicit(&t->next_node_id, memory_order_relaxed);
-    for (uint32_t nid = 1; nid < max_node; nid++)
+static void *dyn_evict_worker(void *p)
+{
+    struct dyn_evict_arg *a = p;
+    cow_tree *t = a->t;
+
+    for (uint32_t nid = a->nid_start; nid < a->nid_end; nid++)
     {
+        if (nid == 0) continue;
         if (!cns_bitmap_test(t, nid)) continue;
 
         nlt_location_t q = { .zone_id = CTREE_CNS_ZONE_ID, .node_id = nid,
@@ -3078,20 +3091,14 @@ size_t cow_evict_cns_leaves(cow_tree *t)
         nlt_location_t r;
         if (!nlt_lookup(&t->nlt, &q, &r) || r.zone_id != CTREE_CNS_ZONE_ID)
         {
-            /* NLT now points elsewhere — bitmap stale, just clear it. */
             cns_bitmap_clear(t, nid);
             continue;
         }
 
         ztree_page p;
         load_page_from_cns(t, r.slot_id, &p);
-        if (!p.is_leaf)
-        {
-            skipped_internal++;
-            continue;
-        }
+        if (!p.is_leaf) { a->skipped_internal++; continue; }
 
-        /* Pick a target ZNS zone: prefer home_zone, else allocate a fresh one. */
         uint32_t home_zone = p.zone_id;
         bool home_valid = (home_zone >= ZTREE_ILAYER_ZONE_START)
                        && (home_zone < t->info.nr_zones)
@@ -3101,13 +3108,12 @@ size_t cow_evict_cns_leaves(cow_tree *t)
                               ? home_zone
                               : zone_alloc_llayer(&t->za, p.node_id, ZTREE_INVALID_ZONE_ID);
 
-        /* Blocking lock — eviction is stop-the-world so no contention by design. */
+        /* Blocking — workers on same target zone queue, never CNS-fallback. */
         pthread_mutex_lock(&t->zone_write_locks[target]);
-
         if (atomic_load_explicit(&t->zone_full[target], memory_order_acquire))
         {
             pthread_mutex_unlock(&t->zone_write_locks[target]);
-            skipped_full++;
+            a->skipped_full++;
             continue;
         }
 
@@ -3119,14 +3125,13 @@ size_t cow_evict_cns_leaves(cow_tree *t)
             pthread_mutex_unlock(&t->zone_write_locks[target]);
             atomic_store_explicit(&t->zone_full[target], 1, memory_order_release);
             zone_seal_and_replace(&t->za, target);
-            skipped_full++;
+            a->skipped_full++;
             continue;
         }
 
         atomic_store_explicit(&t->zone_wp_bytes[target], wp + ZTREE_PAGE_SIZE,
                               memory_order_relaxed);
         uint64_t cur_wp = wp;
-
         uint32_t slot_id = (uint32_t)((cur_wp - t->zones[target].start) / ZTREE_PAGE_SIZE);
         p.zone_id = target;
         p.slot_id = slot_id;
@@ -3145,28 +3150,52 @@ size_t cow_evict_cns_leaves(cow_tree *t)
         }
         pthread_mutex_unlock(&t->zone_write_locks[target]);
 
-        /* Update NLT: leaf is now on ZNS at (target, slot_id). */
         nlt_location_t newloc = { .zone_id = target, .node_id = nid, .slot_id = slot_id };
         nlt_update_migrate(&t->nlt, &newloc, CTREE_CNS_ZONE_ID);
 
-        /* Bitmap: leaf no longer on CNS. */
         cns_bitmap_clear(t, nid);
         atomic_fetch_sub_explicit(&t->stat_cns_current, 1, memory_order_relaxed);
 
-        evicted++;
+        a->evicted++;
+    }
+    return NULL;
+}
 
-        /* Periodic snapshot during evict — captures the ZNS-rising slope
-         * inside the M-band on the plot.  ~1K evictions ≈ 4MB of ZNS
-         * growth per sample, fine resolution at low write cost. */
-        if ((evicted & 1023) == 0) force_trace_sample(t);
+size_t cow_evict_cns_leaves(cow_tree *t)
+{
+    if (!t || t->cns_fd < 0 || !t->cns_bitmap) return 0;
+    force_trace_sample(t);  /* pre-evict snapshot for plot M-band */
+
+    uint32_t max_node = atomic_load_explicit(&t->next_node_id, memory_order_relaxed);
+    int N = dyn_maint_threads();
+    if ((uint32_t)N > max_node && max_node > 0) N = (int)max_node;
+    if (N < 1) N = 1;
+
+    pthread_t tids[32];
+    struct dyn_evict_arg args[32];
+    uint32_t per = (max_node + N - 1) / N;
+    for (int i = 0; i < N; i++)
+    {
+        uint32_t s = (uint32_t)i * per;
+        uint32_t e = ((uint32_t)(i + 1) * per > max_node) ? max_node : ((uint32_t)(i + 1) * per);
+        args[i] = (struct dyn_evict_arg){ .t = t, .nid_start = s, .nid_end = e };
+        pthread_create(&tids[i], NULL, dyn_evict_worker, &args[i]);
+    }
+    size_t evicted = 0, skipped_internal = 0, skipped_full = 0;
+    for (int i = 0; i < N; i++)
+    {
+        pthread_join(tids[i], NULL);
+        evicted += args[i].evicted;
+        skipped_internal += args[i].skipped_internal;
+        skipped_full += args[i].skipped_full;
     }
 
-    force_trace_sample(t);  /* End-of-evict snapshot (before GC). */
-
+    force_trace_sample(t);
     fprintf(stderr,
             "[ctree_dynamic] cow_evict_cns_leaves: evicted=%zu  internal_skipped=%zu  "
-            "zone_full_skipped=%zu  cns_phys=%zu KB\n",
-            evicted, skipped_internal, skipped_full, cns_physical_bytes(t) / 1024);
+            "zone_full_skipped=%zu  cns_phys=%zu KB  (workers=%d)\n",
+            evicted, skipped_internal, skipped_full,
+            cns_physical_bytes(t) / 1024, N);
     return evicted;
 }
 
@@ -3191,56 +3220,39 @@ void cow_count_cns_residents(cow_tree *t, size_t *out_internals, size_t *out_lea
     }
 }
 
-size_t cow_gc_cns(cow_tree *t)
+struct dyn_gc_arg {
+    cow_tree *t;
+    uint32_t  nid_start, nid_end, max_node;
+    size_t    total_punched_pages;
+    size_t    punched_internal_caught;
+};
+
+static void *dyn_gc_worker(void *p)
 {
-    if (!t || t->cns_fd < 0 || !t->cns_bitmap) return 0;
-    size_t before = cns_physical_bytes(t);
-
-    uint32_t max_node = atomic_load_explicit(&t->next_node_id, memory_order_relaxed);
-    size_t total_punched_pages = 0;
-    size_t punched_internal_caught = 0;
-
-    /* Slot-granular GC.  Previously the SAFETY check skipped the ENTIRE
-     * bitmap=0 run if ANY single slot's NLT still mapped to CNS — one
-     * stale nid blocked hundreds of safe neighbors.  Now we walk slot
-     * by slot, accumulate a punchable range, and flush it whenever we
-     * hit either a bitmap=1 slot OR an NLT-dirty slot.  Only the dirty
-     * slot itself leaks (4 KB each) instead of the whole run. */
+    struct dyn_gc_arg *a = p;
+    cow_tree *t = a->t;
     uint32_t punch_start = 0;
-    int punch_active = 0;  /* 1 → an accumulating run of safe slots is open */
+    int punch_active = 0;
 
-    for (uint32_t nid = 0; nid <= max_node; nid++)
+    /* nid==nid_end is sentinel: flush accumulated run at chunk boundary. */
+    for (uint32_t nid = a->nid_start; nid <= a->nid_end; nid++)
     {
         int slot_punchable = 0;
-        if (nid < max_node && !cns_bitmap_test(t, nid)) {
-            /* Bitmap=0 candidate.  Verify NLT no longer maps this nid to
-             * a live CNS slot — if it does, bitmap is stale (residual
-             * concurrent-split race; see project_dynamic_insert_race). */
+        if (nid < a->nid_end && nid < a->max_node && !cns_bitmap_test(t, nid)) {
             nlt_location_t q = { .zone_id = CTREE_CNS_ZONE_ID,
                                  .node_id = nid,
                                  .slot_id = ZTREE_INVALID_SLOT_ID };
             nlt_location_t r;
             if (nlt_lookup(&t->nlt, &q, &r)
                 && r.zone_id == CTREE_CNS_ZONE_ID) {
-                if (dynamic_verbose()) {
-                    ztree_page p;
-                    load_page_from_cns(t, r.slot_id, &p);
-                    fprintf(stderr,
-                            "[ctree_dynamic] GC SAFETY: nid=%u (is_leaf=%d num_keys=%u) "
-                            "still on CNS but bitmap=0!  skipping this slot\n",
-                            nid, p.is_leaf, p.num_keys);
-                }
-                punched_internal_caught++;
-                /* slot_punchable stays 0 → this slot blocks itself only. */
+                a->punched_internal_caught++;
             } else {
                 slot_punchable = 1;
             }
         }
-
         if (slot_punchable) {
             if (!punch_active) { punch_start = nid; punch_active = 1; }
         } else if (punch_active) {
-            /* End of safe run — flush accumulated [punch_start, nid). */
             uint32_t run_len = nid - punch_start;
             if (run_len > 0) {
                 off_t off = (off_t)punch_start * ZTREE_PAGE_SIZE;
@@ -3248,26 +3260,54 @@ size_t cow_gc_cns(cow_tree *t)
                 if (fallocate(t->cns_fd,
                               FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                               off, len) == 0)
-                {
-                    total_punched_pages += run_len;
-                }
+                    a->total_punched_pages += run_len;
             }
             punch_active = 0;
         }
     }
-    if (punched_internal_caught)
+    return NULL;
+}
+
+size_t cow_gc_cns(cow_tree *t)
+{
+    if (!t || t->cns_fd < 0 || !t->cns_bitmap) return 0;
+    size_t before = cns_physical_bytes(t);
+
+    uint32_t max_node = atomic_load_explicit(&t->next_node_id, memory_order_relaxed);
+    int N = dyn_maint_threads();
+    if ((uint32_t)N > max_node && max_node > 0) N = (int)max_node;
+    if (N < 1) N = 1;
+
+    pthread_t tids[32];
+    struct dyn_gc_arg args[32];
+    uint32_t per = (max_node + N - 1) / N;
+    for (int i = 0; i < N; i++) {
+        uint32_t s = (uint32_t)i * per;
+        uint32_t e = ((uint32_t)(i + 1) * per > max_node) ? max_node : ((uint32_t)(i + 1) * per);
+        args[i] = (struct dyn_gc_arg){ .t = t, .nid_start = s, .nid_end = e,
+                                       .max_node = max_node };
+        pthread_create(&tids[i], NULL, dyn_gc_worker, &args[i]);
+    }
+    size_t total_punched_pages = 0, punched_internal_caught = 0;
+    for (int i = 0; i < N; i++) {
+        pthread_join(tids[i], NULL);
+        total_punched_pages    += args[i].total_punched_pages;
+        punched_internal_caught += args[i].punched_internal_caught;
+    }
+
+    if (punched_internal_caught && dynamic_verbose())
         fprintf(stderr,
-                "[ctree_dynamic] GC: %zu unsafe runs caught\n",
+                "[ctree_dynamic] GC: %zu unsafe slots caught\n",
                 punched_internal_caught);
 
     size_t after = cns_physical_bytes(t);
-    force_trace_sample(t);  /* Post-GC snapshot — captures CNS drop. */
+    force_trace_sample(t);
     fprintf(stderr,
             "[ctree_dynamic] cow_gc_cns: punched_pages=%zu  cns_phys: %zu → %zu KB  "
-            "(freed %zu KB)\n",
+            "(freed %zu KB, workers=%d)\n",
             total_punched_pages,
             before / 1024, after / 1024,
-            (before > after ? (before - after) / 1024 : 0));
+            (before > after ? (before - after) / 1024 : 0), N);
     return (before > after) ? (before - after) : 0;
 }
 
@@ -3444,8 +3484,9 @@ void cow_close(cow_tree *t)
 
 ztree_record *ztree_find(ztree_t *t, int64_t key)
 {
+    /* volatile_sb's root_slot goes stale on same-zone CoW; resolve via NLT. */
     ztree_node_id_t root_nid;
-    uint32_t root_zone, root_slot;
+    uint32_t root_zone;
     for (;;)
     {
         uint64_t s1 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
@@ -3453,7 +3494,6 @@ ztree_record *ztree_find(ztree_t *t, int64_t key)
             continue;
         root_nid = atomic_load_explicit(&t->volatile_sb.root_node_id, memory_order_acquire);
         root_zone = atomic_load_explicit(&t->volatile_sb.root_zone_id, memory_order_acquire);
-        root_slot = atomic_load_explicit(&t->volatile_sb.root_slot_id, memory_order_acquire);
         uint64_t s2 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
         if (s1 == s2 && (s2 & 1ULL) == 0)
             break;
@@ -3462,17 +3502,23 @@ ztree_record *ztree_find(ztree_t *t, int64_t key)
     if (root_nid == ZTREE_INVALID_NODE_ID)
         return NULL;
 
-    (void)root_nid;
-
     ztree_page pg;
-    if (root_zone == CTREE_CNS_ZONE_ID)
     {
-        load_page_from_cns(t, root_slot, &pg);
-    }
-    else
-    {
-        ztree_pagenum_t pn = zone_slot_to_pn(t, root_zone, root_slot);
-        load_page_by_pn(t, pn, &pg);
+        nlt_location_t root_query = {
+            .zone_id = root_zone,
+            .node_id = root_nid,
+            .slot_id = ZTREE_INVALID_SLOT_ID,
+        };
+        nlt_location_t root_result;
+        if (!nlt_lookup(&t->nlt, &root_query, &root_result))
+            return NULL;
+        if (root_result.zone_id == CTREE_CNS_ZONE_ID)
+            load_page_from_cns(t, root_result.slot_id, &pg);
+        else
+        {
+            ztree_pagenum_t pn = zone_slot_to_pn(t, root_result.zone_id, root_result.slot_id);
+            load_page_by_pn(t, pn, &pg);
+        }
     }
 
     while (!pg.is_leaf)

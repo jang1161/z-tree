@@ -26,11 +26,24 @@ YCSB_DIR="$(cd "$(dirname "$0")/../../YCSB-cpp" && pwd)"
 LOG_DIR="$(cd "$(dirname "$0")/.." && pwd)/logs/dynamic_multi-workload/$MODE_TAG"
 mkdir -p "$LOG_DIR"
 
+# Compact count formatting: 10000000 → 10M, 500000 → 500K.
+fmt_count() {
+  case "$1" in
+    *000000) echo "$(($1 / 1000000))M" ;;
+    *000)    echo "$(($1 / 1000))K"    ;;
+    *)       echo "$1"                 ;;
+  esac
+}
+KEYS_TAG=$(fmt_count "$RECCOUNT")
+OPS_TAG=$(fmt_count "$OPCOUNT")
+
 # Timestamp suffix prevents overwriting previous runs.  Set RUN_TAG="latest"
 # (or any fixed string) to keep a stable path that does overwrite.
+# Naming convention: K<keys>_O<ops>_T<threads>_<mode>_<timestamp>
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-TRACE_CSV="$LOG_DIR/R${RECCOUNT}_O${OPCOUNT}_T${THREADS}_${RUN_TAG}.csv"
-RUN_LOG="$LOG_DIR/R${RECCOUNT}_O${OPCOUNT}_T${THREADS}_${RUN_TAG}.log"
+RUN_NAME="K${KEYS_TAG}_O${OPS_TAG}_T${THREADS}_${MODE_TAG}_${RUN_TAG}"
+TRACE_CSV="$LOG_DIR/${RUN_NAME}.csv"
+RUN_LOG="$LOG_DIR/${RUN_NAME}.log"
 
 # Wipe disks so we start from a fresh tree.
 echo "[reset] $ZNS  + remount /mnt/cns"
@@ -65,27 +78,19 @@ sudo CTREE_DYNAMIC_GC_INTERVAL_MS=0 \
   -s 2>&1 | tee "$RUN_LOG"
 
 echo
-echo "[plot] generating graphs/ctree_dynamic/zns_cns_K..._T${THREADS}_${MODE_TAG}.png"
-
-# Format records count for filename suffix (1M, 100K, etc.) to match plotter convention.
-case "$RECCOUNT" in
-  *000000) KEYS_TAG="$((RECCOUNT / 1000000))M" ;;
-  *000)    KEYS_TAG="$((RECCOUNT / 1000))K"    ;;
-  *)       KEYS_TAG="$RECCOUNT"                ;;
-esac
+echo "[plot] generating graphs/ctree_dynamic/${RUN_NAME}.png"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Drop privileges for plot step so matplotlib (installed in user env) is found.
 # When invoked via `sudo bash run_...`, $SUDO_USER is set; otherwise we're
-# already running as the user.
-PLOT_TAG="${MODE_TAG}_${RUN_TAG}"
+# already running as the user.  4th arg = explicit output basename.
 if [ -n "$SUDO_USER" ]; then
   sudo -u "$SUDO_USER" \
     CTREE_DYNAMIC_TRACE_PATH="$TRACE_CSV" \
     python3 "$REPO_ROOT/graphs/plot_dynamic_zns_cns.py" \
-      "$RECCOUNT" "$THREADS" "$PLOT_TAG"
+      "$RECCOUNT" "$THREADS" "$MODE_TAG" "$RUN_NAME"
 else
   CTREE_DYNAMIC_TRACE_PATH="$TRACE_CSV" \
     python3 "$REPO_ROOT/graphs/plot_dynamic_zns_cns.py" \
-      "$RECCOUNT" "$THREADS" "$PLOT_TAG"
+      "$RECCOUNT" "$THREADS" "$MODE_TAG" "$RUN_NAME"
 fi

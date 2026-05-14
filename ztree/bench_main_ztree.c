@@ -19,6 +19,9 @@ static int total_keys;
 
 static _Atomic int progress_count = 0;
 static _Atomic int work_cursor = 0;
+static _Atomic int verify_cursor = 0;
+static _Atomic int found_cnt = 0;
+static _Atomic int missing_cnt = 0;
 
 static void *worker(void *arg)
 {
@@ -48,6 +51,20 @@ static void *worker(void *arg)
         }
     }
 
+    return NULL;
+}
+
+/* Post-insert integrity check: every inserted key must be findable. */
+static void *verifier(void *arg)
+{
+    thread_arg *a = (thread_arg *)arg;
+    int idx;
+    while ((idx = atomic_fetch_add(&verify_cursor, 1)) < total_keys)
+    {
+        ztree_record *r = ztree_find(a->t, all_keys[idx]);
+        if (r) { atomic_fetch_add(&found_cnt, 1); free(r); }
+        else   { atomic_fetch_add(&missing_cnt, 1); }
+    }
     return NULL;
 }
 
@@ -118,6 +135,24 @@ static void run_test(const char *dev_path, int num_threads)
     printf("\nThreads: %d\n", num_threads);
     printf("Elapsed time: %.6f seconds\n", elapsed);
     printf("Average throughput: %.2f ops/sec\n", iops);
+
+    /* ── Integrity verification: find every inserted key ── */
+    atomic_store(&verify_cursor, 0);
+    atomic_store(&found_cnt, 0);
+    atomic_store(&missing_cnt, 0);
+    struct timespec vstart, vend;
+    clock_gettime(CLOCK_MONOTONIC, &vstart);
+    for (int i = 0; i < num_threads; i++)
+        pthread_create(&threads[i], NULL, verifier, &args[i]);
+    for (int i = 0; i < num_threads; i++)
+        pthread_join(threads[i], NULL);
+    clock_gettime(CLOCK_MONOTONIC, &vend);
+    double velapsed =
+        (vend.tv_sec - vstart.tv_sec) + (vend.tv_nsec - vstart.tv_nsec) / 1e9;
+    int found = atomic_load(&found_cnt);
+    int missing = atomic_load(&missing_cnt);
+    printf("Verify: found %d / %d (%.2f%%)  missing %d  in %.2f s\n",
+           found, total_keys, 100.0 * found / total_keys, missing, velapsed);
 
     cow_close(t);
 

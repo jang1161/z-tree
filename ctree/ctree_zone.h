@@ -28,7 +28,7 @@
  * ─────────────────────────────────────────────────────────────────────────── */
 typedef struct {
     _Atomic(uint16_t) access_count;  /* 2-byte: access frequency counter */
-    _Atomic(uint16_t) last_write_ts; /* 2-byte: timestamp of last write  */
+    _Atomic(uint32_t) last_write_ts; /* 4-byte ms ts (no wrap under ~50 days) */
 } ztree_node_heat_t;
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -64,7 +64,7 @@ typedef struct {
     /* Percentile-based heat thresholds (paper §3.1.1).
      * Recomputed every RECOMPUTE_INTERVAL writes; one thread at a time. */
     _Atomic(uint16_t) heat_median_count;
-    _Atomic(uint16_t) heat_median_ts;
+    _Atomic(uint32_t) heat_median_ts;
     _Atomic(uint64_t) heat_writes_since_recompute;
     _Atomic(uint8_t)  heat_recompute_in_progress;
 

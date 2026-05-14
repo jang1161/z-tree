@@ -23,13 +23,15 @@
  * Internal helpers
  * ─────────────────────────────────────────────────────────────────────────── */
 
-/* Paper-aligned timestamp: compressed to 16-bit milliseconds (mod 65536) */
-static inline uint16_t zone_monotonic_ts_16b(void)
+/* ms timestamp truncated to 32 bits — wraps at ~50 days (vs 65 s for 16-bit).
+ * Eliminates the cyclic-sort artifact that flipped sequential workloads
+ * between hot/cold pools every ts wrap. */
+static inline uint32_t zone_monotonic_ts_16b(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
-    return (uint16_t)(ms & 0xFFFFU);
+    return (uint32_t)ms;
 }
 
 /*
@@ -339,16 +341,22 @@ static int cmp_u16(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a;
+    uint32_t y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
 static void recompute_heat_medians(zone_alloc_t *za)
 {
-    /* 128 KB per array — too large for stack; malloc is fine at ~16K-write intervals. */
     uint16_t *cnts = malloc(ZTREE_HEAT_TABLE_SIZE * sizeof(uint16_t));
-    uint16_t *tss  = malloc(ZTREE_HEAT_TABLE_SIZE * sizeof(uint16_t));
+    uint32_t *tss  = malloc(ZTREE_HEAT_TABLE_SIZE * sizeof(uint32_t));
     if (!cnts || !tss)
     {
         free(cnts);
         free(tss);
-        return; /* skip this round; medians stay at their previous values */
+        return;
     }
 
     size_t n = 0;
@@ -357,8 +365,8 @@ static void recompute_heat_medians(zone_alloc_t *za)
         uint16_t c = atomic_load_explicit(&za->heat_table[i].access_count,
                                           memory_order_relaxed);
         if (c == 0)
-            continue; /* empty bucket — exclude from population */
-        uint16_t t = atomic_load_explicit(&za->heat_table[i].last_write_ts,
+            continue;
+        uint32_t t = atomic_load_explicit(&za->heat_table[i].last_write_ts,
                                           memory_order_relaxed);
         cnts[n] = c;
         tss[n]  = t;
@@ -367,7 +375,6 @@ static void recompute_heat_medians(zone_alloc_t *za)
 
     if (n < ZTREE_HEAT_MIN_SAMPLES)
     {
-        /* Too few samples; keep defaults so zone_is_hot() → default-hot. */
         atomic_store_explicit(&za->heat_median_count, 0, memory_order_relaxed);
         atomic_store_explicit(&za->heat_median_ts,    0, memory_order_relaxed);
         free(cnts);
@@ -376,9 +383,8 @@ static void recompute_heat_medians(zone_alloc_t *za)
     }
 
     qsort(cnts, n, sizeof(uint16_t), cmp_u16);
-    qsort(tss,  n, sizeof(uint16_t), cmp_u16);
+    qsort(tss,  n, sizeof(uint32_t), cmp_u32);
 
-    /* 50th percentile = element at index n/2 (lower median for even n). */
     atomic_store_explicit(&za->heat_median_count, cnts[n / 2], memory_order_relaxed);
     atomic_store_explicit(&za->heat_median_ts,    tss[n / 2],  memory_order_relaxed);
 
@@ -465,8 +471,7 @@ void zone_heat_inherit(zone_alloc_t *za,
     if (src_idx == dst_idx)
         return;
 
-    /* Copy timestamp (propagates hot/cold character), reset counter (fresh start). */
-    uint16_t src_ts = atomic_load_explicit(&za->heat_table[src_idx].last_write_ts,
+    uint32_t src_ts = atomic_load_explicit(&za->heat_table[src_idx].last_write_ts,
                                            memory_order_relaxed);
 
     atomic_store_explicit(&za->heat_table[dst_idx].access_count, 0,
@@ -484,11 +489,11 @@ int zone_is_hot(zone_alloc_t *za, ztree_node_id_t node_id)
 
     uint16_t cnt     = atomic_load_explicit(&za->heat_table[idx].access_count,
                                             memory_order_relaxed);
-    uint16_t ts      = atomic_load_explicit(&za->heat_table[idx].last_write_ts,
+    uint32_t ts      = atomic_load_explicit(&za->heat_table[idx].last_write_ts,
                                             memory_order_relaxed);
     uint16_t med_cnt = atomic_load_explicit(&za->heat_median_count,
                                             memory_order_relaxed);
-    uint16_t med_ts  = atomic_load_explicit(&za->heat_median_ts,
+    uint32_t med_ts  = atomic_load_explicit(&za->heat_median_ts,
                                             memory_order_relaxed);
 
     /* Bootstrap: default to hot (avoids cold-pool funneling). */

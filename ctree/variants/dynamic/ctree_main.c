@@ -105,11 +105,11 @@ static void *dynamic_zns_gc_thread(void *arg)
         if (atomic_load_explicit(&g_zns_gc_stop, memory_order_acquire))
             break;
 
-        pthread_rwlock_wrlock(&g_insert_pause);
+        /* Non-blocking: cow_gc_zns serialises with foreground per-leaf
+         * via node_latch_for_id, not via g_insert_pause. */
         cow_phase_mark(t, "begin:zns_gc_periodic");
         cow_gc_zns(t);
         cow_phase_mark(t, "end:zns_gc_periodic");
-        pthread_rwlock_unlock(&g_insert_pause);
     }
     return NULL;
 }
@@ -2746,10 +2746,8 @@ static int do_single_delete(cow_tree *t, int64_t key)
 
 int cow_delete(cow_tree *t, int64_t key)
 {
-    /* Same insert_pause rdlock as cow_insert so delete writes serialise
-     * with the background CNS / ZNS GC threads. */
-    if (atomic_load_explicit(&g_gc_running, memory_order_acquire)
-        || atomic_load_explicit(&g_zns_gc_running, memory_order_acquire))
+    /* Only CNS GC needs the insert_pause rdlock — ZNS GC is non-blocking. */
+    if (atomic_load_explicit(&g_gc_running, memory_order_acquire))
     {
         pthread_rwlock_rdlock(&g_insert_pause);
         int r = do_single_delete(t, key);
@@ -3164,12 +3162,9 @@ cow_tree *cow_open(const char *path)
 
 void cow_insert(cow_tree *t, int64_t key, const char *value)
 {
-    /* Take the insert-pause rdlock if EITHER background GC thread is
-     * running — both wrlock g_insert_pause for quiescence, and missing
-     * the ZNS-GC case lets foreground writes race with cow_gc_zns'
-     * migrate/reset (zone state diverges between mem and device). */
-    if (atomic_load_explicit(&g_gc_running, memory_order_acquire)
-        || atomic_load_explicit(&g_zns_gc_running, memory_order_acquire))
+    /* CNS GC takes g_insert_pause wrlock for quiescence.  ZNS GC is
+     * non-blocking (per-leaf node_latch in zns_gc_migrate_leaf). */
+    if (atomic_load_explicit(&g_gc_running, memory_order_acquire))
     {
         pthread_rwlock_rdlock(&g_insert_pause);
         do_single_insert(t, key, value);
@@ -3532,21 +3527,51 @@ size_t cow_gc_cns(cow_tree *t)
 #define ZNS_GC_STALE_THRESHOLD 0.5
 
 /* Migrate one live leaf (victim:slot, node_id=nid) to a fresh ZNS zone.
- * Returns 1 on success, 0 if skipped (not a leaf / target full / I/O err). */
+ * Returns 1 on success, 0 if skipped (not a leaf / already moved by
+ * foreground / target full / I/O err).
+ *
+ * Takes the per-leaf node latch (wrlock) to serialise with foreground
+ * cow_insert / cow_delete that may concurrently CoW the same leaf — both
+ * paths take node_latch_for_id(nid) wrlock so only one publishes to NLT.
+ * After acquiring the latch, we re-resolve NLT[nid]: if it no longer
+ * points to (victim, slot), the foreground already moved it; skip. */
 static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
                                ztree_node_id_t nid, uint32_t slot)
 {
+    node_wrlock(t, nid);
+
+    /* Re-verify the leaf still lives at (victim, slot). */
+    nlt_location_t query = { .zone_id = victim, .node_id = nid,
+                             .slot_id = ZTREE_INVALID_SLOT_ID };
+    nlt_location_t actual;
+    if (!nlt_lookup(&t->nlt, &query, &actual)
+        || actual.zone_id != victim
+        || actual.slot_id != slot)
+    {
+        node_unlock(t, nid);
+        return 0;
+    }
+
     ztree_page p;
     ztree_pagenum_t pn = zone_slot_to_pn(t, victim, slot);
     load_page_by_pn(t, pn, &p);
-    if (!p.is_leaf) return 0;  /* internals never live on ZNS — defensive */
+    if (!p.is_leaf)
+    {
+        node_unlock(t, nid);
+        return 0;  /* internals never live on ZNS — defensive */
+    }
 
     uint32_t target = zone_alloc_llayer(&t->za, nid, victim);
-    if (target == ZTREE_INVALID_ZONE_ID) return 0;  /* at active cap — defer */
+    if (target == ZTREE_INVALID_ZONE_ID)
+    {
+        node_unlock(t, nid);
+        return 0;  /* at active cap — defer */
+    }
     pthread_mutex_lock(&t->zone_write_locks[target]);
     if (atomic_load_explicit(&t->zone_full[target], memory_order_acquire))
     {
         pthread_mutex_unlock(&t->zone_write_locks[target]);
+        node_unlock(t, nid);
         return 0;
     }
     uint64_t zone_end = t->zones[target].start + t->zones[target].capacity;
@@ -3557,6 +3582,7 @@ static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
         pthread_mutex_unlock(&t->zone_write_locks[target]);
         atomic_store_explicit(&t->zone_full[target], 1, memory_order_release);
         zone_seal_and_replace(&t->za, target);
+        node_unlock(t, nid);
         return 0;
     }
     atomic_store_explicit(&t->zone_wp_bytes[target], wp + ZTREE_PAGE_SIZE,
@@ -3572,9 +3598,11 @@ static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
     ssize_t pwr = pwrite(wfd, bounce, ZTREE_PAGE_SIZE, (off_t)cur_wp);
     if (pwr != (ssize_t)ZTREE_PAGE_SIZE)
     {
-        /* Per-error logging would spam — caller summarises via seen vs
-         * migrated and leaves the victim sealed (not reset). */
+        /* Roll back the WP reservation, drop locks, caller summarises. */
+        atomic_fetch_sub_explicit(&t->zone_wp_bytes[target], ZTREE_PAGE_SIZE,
+                                  memory_order_relaxed);
         pthread_mutex_unlock(&t->zone_write_locks[target]);
+        node_unlock(t, nid);
         return 0;
     }
     pthread_mutex_unlock(&t->zone_write_locks[target]);
@@ -3582,6 +3610,7 @@ static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
     nlt_location_t newloc = { .zone_id = target, .node_id = nid, .slot_id = new_slot };
     nlt_update_migrate(&t->nlt, &newloc, victim);
     zone_valid_leaves_move(t, victim, target);
+    node_unlock(t, nid);
     return 1;
 }
 
@@ -3733,19 +3762,21 @@ size_t cow_gc_zns(cow_tree *t)
                         r->zone, r->counter_before, r->seen);
         }
 
-        if (r->migrated != r->seen)
+        /* Reset is safe when no live leaf still references the victim.
+         * With per-leaf-latched migration, foreground CoWs may have moved
+         * some leaves out concurrently (migrated < seen), but those moves
+         * also decrement zone_valid_leaves.  So zone_valid_leaves==0 is
+         * the authoritative "victim is fully drained" signal. */
+        uint32_t remaining = atomic_load_explicit(
+            &t->zone_valid_leaves[r->zone], memory_order_acquire);
+        if (remaining > 0)
         {
             fprintf(stderr,
-                    "[ctree_dynamic] cow_gc_zns: victim %u — %zu/%zu leaves "
-                    "migrated, skipping reset\n",
-                    r->zone, r->migrated, r->seen);
+                    "[ctree_dynamic] cow_gc_zns: victim %u — %u live leaf(s) "
+                    "still ref the zone, skipping reset (retry next cycle)\n",
+                    r->zone, remaining);
             continue;
         }
-
-        /* All NLT entries tombstoned → safe to reset.  Force the counter
-         * to 0 (corrects drift) before the zone re-enters the rr window. */
-        atomic_store_explicit(&t->zone_valid_leaves[r->zone], 0,
-                              memory_order_relaxed);
         off_t zstart = (off_t)t->zones[r->zone].start;
         if (zbd_reset_zones(t->fd, zstart, (off_t)t->info.zone_size) != 0)
         {

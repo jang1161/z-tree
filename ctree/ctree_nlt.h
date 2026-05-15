@@ -134,3 +134,10 @@ int nlt_zone_is_sealed(const nlt_t *nlt, uint32_t zone_id);
 
 /* Lightweight synchronization hook for paper-aligned SyncNLT points. */
 void nlt_sync_zone(nlt_t *nlt, uint32_t zone_id);
+
+/* Enumerate every live (node_id, slot_id) currently in zone_id's tracker.
+ * Used by ZNS GC to find a victim zone's resident leaves without a full
+ * node-id scan.  Caller must quiesce NLT mutation during the call. */
+void nlt_zone_for_each(nlt_t *nlt, uint32_t zone_id,
+                       void (*cb)(ztree_node_id_t, uint32_t, void *),
+                       void *ctx);

@@ -233,8 +233,13 @@ static uint64_t nlt_tracker_lookup(nlt_slot_t *tracker, size_t cap,
     return NLT_SLOT_EMPTY;
 }
 
-/* Lock-free insert/update.  Claims an empty / tombstone slot via CAS, or
- * overwrites an existing entry for the same node_id.  Returns 1 on success. */
+/* Linear-probe insert with tombstones.  Walk to EMPTY or a matching LIVE
+ * entry, remembering the first tombstone; overwrite on match, otherwise
+ * CAS into the first tombstone (or the terminating EMPTY).  Eagerly
+ * claiming the first TOMBSTONE without scanning past it created phantom
+ * duplicates when a collision-displaced LIVE entry sat past it — lookups
+ * hid the bug (first match from hash wins) but nlt_zone_for_each picked
+ * up the stale phantom and ZNS GC migrated it as live. */
 static int nlt_tracker_publish(nlt_zone_entry_t *zone,
                                ztree_node_id_t node_id,
                                uint32_t slot_id)
@@ -245,46 +250,70 @@ static int nlt_tracker_publish(nlt_zone_entry_t *zone,
 
     size_t cap  = zone->tracker_cap;
     size_t mask = cap - 1;
-    size_t pos  = (size_t)(nlt_hash_node(node_id) & (uint64_t)mask);
     uint64_t new_v = nlt_pack(node_id, slot_id);
 
-    for (size_t i = 0; i < cap; i++)
+    for (;;)
     {
-        uint64_t v = atomic_load_explicit(&tracker[pos], memory_order_acquire);
+        size_t pos        = (size_t)(nlt_hash_node(node_id) & (uint64_t)mask);
+        size_t first_tomb = SIZE_MAX;
+        size_t claim      = SIZE_MAX;
+        int    saw_empty  = 0;
 
-        if (v == NLT_SLOT_EMPTY || v == NLT_SLOT_TOMBSTONE)
+        for (size_t i = 0; i < cap; i++)
         {
-            uint64_t expected = v;
-            if (atomic_compare_exchange_strong_explicit(
-                    &tracker[pos], &expected, new_v,
-                    memory_order_release, memory_order_acquire))
+            uint64_t v = atomic_load_explicit(&tracker[pos],
+                                              memory_order_acquire);
+            if (v == NLT_SLOT_EMPTY)
             {
-                if (v == NLT_SLOT_EMPTY)
-                    atomic_fetch_add_explicit(&zone->used, 1,
-                                              memory_order_relaxed);
+                claim     = (first_tomb != SIZE_MAX) ? first_tomb : pos;
+                saw_empty = 1;
+                break;
+            }
+            if (v == NLT_SLOT_TOMBSTONE)
+            {
+                if (first_tomb == SIZE_MAX) first_tomb = pos;
+            }
+            else if (nlt_unpack_node(v) == node_id)
+            {
+                atomic_store_explicit(&tracker[pos], new_v,
+                                      memory_order_release);
                 return 1;
             }
-            /* CAS lost — re-read this slot before deciding next step. */
-            continue;
+            pos = (pos + 1) & mask;
         }
 
-        if (nlt_unpack_node(v) == node_id)
+        if (!saw_empty)
         {
-            /* Existing entry for this node — atomic store updates slot.
-             * Concurrent updaters can race, but flush_page_immediate holds
-             * the per-node latch so the same node_id is single-writer here. */
-            atomic_store_explicit(&tracker[pos], new_v, memory_order_release);
+            if (first_tomb == SIZE_MAX)
+            {
+                fprintf(stderr,
+                        "nlt_tracker_publish: tracker full (cap=%zu) "
+                        "zone_id=%u node_id=%u\n",
+                        cap,
+                        atomic_load_explicit(&zone->zone_id,
+                                             memory_order_relaxed),
+                        node_id);
+                return 0;
+            }
+            claim = first_tomb;
+        }
+
+        uint64_t expected = atomic_load_explicit(&tracker[claim],
+                                                 memory_order_acquire);
+        if (expected != NLT_SLOT_EMPTY && expected != NLT_SLOT_TOMBSTONE)
+            continue;  /* slot got claimed by another publisher — retry walk */
+
+        if (atomic_compare_exchange_strong_explicit(
+                &tracker[claim], &expected, new_v,
+                memory_order_release, memory_order_acquire))
+        {
+            if (expected == NLT_SLOT_EMPTY)
+                atomic_fetch_add_explicit(&zone->used, 1,
+                                          memory_order_relaxed);
             return 1;
         }
-
-        pos = (pos + 1) & mask;
+        /* CAS lost — retry whole walk. */
     }
-
-    fprintf(stderr,
-            "nlt_tracker_publish: tracker full (cap=%zu) zone_id=%u node_id=%u\n",
-            cap, atomic_load_explicit(&zone->zone_id, memory_order_relaxed),
-            node_id);
-    return 0;
 }
 
 /* Tombstone the entry for node_id (no-op if absent). */
@@ -536,4 +565,29 @@ void nlt_sync_zone(nlt_t *nlt, uint32_t zone_id)
         return;
 
     atomic_thread_fence(memory_order_release);
+}
+
+/* Enumerate every live (node_id, slot_id) in zone_id's tracker, invoking
+ * cb for each.  Skips EMPTY/TOMBSTONE.  Caller must quiesce NLT mutation
+ * for a consistent snapshot (ZNS GC runs stop-the-world). */
+void nlt_zone_for_each(nlt_t *nlt, uint32_t zone_id,
+                       void (*cb)(ztree_node_id_t, uint32_t, void *),
+                       void *ctx)
+{
+    if (zone_id == ZTREE_INVALID_ZONE_ID || !cb)
+        return;
+    nlt_zone_entry_t *zone = nlt_probe_zone_atomic(nlt, zone_id);
+    if (!zone)
+        return;
+    nlt_slot_t *tracker = nlt_zone_tracker(zone);
+    if (!tracker)
+        return;
+    size_t cap = zone->tracker_cap;
+    for (size_t i = 0; i < cap; i++)
+    {
+        uint64_t v = atomic_load_explicit(&tracker[i], memory_order_acquire);
+        if (v == NLT_SLOT_EMPTY || v == NLT_SLOT_TOMBSTONE)
+            continue;
+        cb(nlt_unpack_node(v), nlt_unpack_slot(v), ctx);
+    }
 }

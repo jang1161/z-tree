@@ -56,6 +56,12 @@ static int      g_keys_count;
 static int      g_pass;
 static _Atomic int g_cursor;
 
+/* Verify-phase shared state. */
+static cow_tree           *g_verify_tree;
+static int                 g_verify_expected_pass;
+static _Atomic int         g_verify_cursor;
+static _Atomic uint64_t    g_verify_found, g_verify_missing, g_verify_mismatch;
+
 static void shuffle(int *a, int n, unsigned seed)
 {
     srand(seed);
@@ -80,6 +86,25 @@ static int value_matches(int key, int expected_pass, const char *got)
     char expected[120];
     pack_value(key, expected_pass, expected);
     return memcmp(expected, got, 120) == 0;
+}
+
+static void *verify_worker(void *arg)
+{
+    (void)arg;
+    int idx;
+    while ((idx = atomic_fetch_add(&g_verify_cursor, 1)) < g_keys_count) {
+        ztree_record *r = ztree_find(g_verify_tree, g_keys[idx]);
+        if (!r) {
+            atomic_fetch_add(&g_verify_missing, 1);
+            continue;
+        }
+        if (value_matches(g_keys[idx], g_verify_expected_pass, r->value))
+            atomic_fetch_add(&g_verify_found, 1);
+        else
+            atomic_fetch_add(&g_verify_mismatch, 1);
+        free(r);
+    }
+    return NULL;
 }
 
 static void *worker(void *arg)
@@ -170,8 +195,10 @@ int main(int argc, char **argv)
 
     /* ── Phase 2: push leaves to ZNS so updates CoW there. */
     printf("\n[phase 2] cow_evict_cns_leaves + cow_gc_cns\n");
+    cow_phase_mark(t, "begin:evict-pre");
     size_t evicted   = cow_evict_cns_leaves(t);
     size_t freed_cns = cow_gc_cns(t);
+    cow_phase_mark(t, "end:evict-pre");
     printf("  evicted=%zu  cns freed=%zu KB\n", evicted, freed_cns / 1024);
 
     /* ── Phase 3: K update passes, each rewriting every key. */
@@ -183,32 +210,41 @@ int main(int argc, char **argv)
      *    some leaves back to CNS; bring them back to ZNS so cow_gc_zns sees
      *    the full set of ZNS-resident leaves and so CNS phys is reclaimed. */
     printf("\n[phase 3a] post-update cow_evict_cns_leaves + cow_gc_cns\n");
+    cow_phase_mark(t, "begin:evict-post");
     size_t evicted2   = cow_evict_cns_leaves(t);
     size_t freed_cns2 = cow_gc_cns(t);
+    cow_phase_mark(t, "end:evict-post");
     printf("  evicted=%zu  cns freed=%zu KB\n", evicted2, freed_cns2 / 1024);
 
     /* ── Phase 4: ZNS GC.  cow_gc_zns itself logs victims / pages_migrated
      *    / zns_phys before→after on stderr, which is the measurement. */
     printf("\n[phase 4] cow_gc_zns\n");
+    cow_phase_mark(t, "begin:zns_gc");
     size_t freed_zns = cow_gc_zns(t);
+    cow_phase_mark(t, "end:zns_gc");
     printf("  freed_zns = %zu KB  (see cow_gc_zns stderr line above)\n",
            freed_zns / 1024);
 
     /* ── Phase 5: verify every key resolves to pass=K's value. */
-    printf("\n[phase 5] verify (single-thread)\n");
-    int expected_pass = (K > 0) ? K : 0;
+    printf("\n[phase 5] verify (%d threads)\n", g_num_threads);
+    g_verify_tree = t;
+    g_verify_expected_pass = (K > 0) ? K : 0;
+    atomic_store(&g_verify_cursor, 0);
+    atomic_store(&g_verify_found, 0);
+    atomic_store(&g_verify_missing, 0);
+    atomic_store(&g_verify_mismatch, 0);
     double v0 = now_sec();
-    size_t found = 0, missing = 0, mismatch = 0;
-    for (int i = 0; i < N; i++) {
-        ztree_record *r = ztree_find(t, keys[i]);
-        if (!r) { missing++; continue; }
-        if (value_matches(keys[i], expected_pass, r->value)) found++;
-        else mismatch++;
-        free(r);
-    }
+    for (int i = 0; i < g_num_threads; i++)
+        pthread_create(&thr[i], NULL, verify_worker, NULL);
+    for (int i = 0; i < g_num_threads; i++)
+        pthread_join(thr[i], NULL);
     double v1 = now_sec();
-    printf("  found=%zu  missing=%zu  mismatch=%zu  (%.2fs, %.0f find/s)\n",
-           found, missing, mismatch,
+    uint64_t found    = atomic_load(&g_verify_found);
+    uint64_t missing  = atomic_load(&g_verify_missing);
+    uint64_t mismatch = atomic_load(&g_verify_mismatch);
+    printf("  found=%llu  missing=%llu  mismatch=%llu  (%.2fs, %.0f find/s)\n",
+           (unsigned long long)found, (unsigned long long)missing,
+           (unsigned long long)mismatch,
            v1 - v0,
            (v1 > v0) ? (double)N / (v1 - v0) : 0.0);
     int ok = (missing == 0 && mismatch == 0);

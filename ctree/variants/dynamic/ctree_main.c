@@ -97,6 +97,31 @@ static inline size_t cns_physical_bytes(ztree_t *t)
     return (size_t)st.st_blocks * 512;
 }
 
+/* True iff zone_id is an LLayer ZNS leaf zone (excludes INVALID, CNS,
+ * ILayer, and meta zones).  Used to gate zone_valid_leaves accounting. */
+static inline bool is_zns_llayer(ztree_t *t, uint32_t zone_id)
+{
+    return zone_id >= ZTREE_LLAYER_ZONE_START && zone_id < t->info.nr_zones;
+}
+
+/* Move a leaf's live residency from prev_zone to target_zone in the
+ * per-zone counter.  No-op when prev==target (sticky re-append).  Non-ZNS
+ * endpoints (INVALID, CNS) are simply skipped, so new-leaf / spill / evict
+ * transitions all fall out of the same call. */
+static inline void zone_valid_leaves_move(ztree_t *t,
+                                          uint32_t prev_zone,
+                                          uint32_t target_zone)
+{
+    if (prev_zone == target_zone)
+        return;
+    if (is_zns_llayer(t, prev_zone))
+        atomic_fetch_sub_explicit(&t->zone_valid_leaves[prev_zone], 1,
+                                  memory_order_relaxed);
+    if (is_zns_llayer(t, target_zone))
+        atomic_fetch_add_explicit(&t->zone_valid_leaves[target_zone], 1,
+                                  memory_order_relaxed);
+}
+
 /* Bytes physically appended to ZNS leaf zones (cumulative WP - zone_start).
  * Monotonically non-decreasing without ZNS GC.  Diff against (leaves on ZNS)
  * × 4KB gives the stale-page volume that a future ZNS GC would reclaim. */
@@ -156,6 +181,10 @@ static inline void retire_cns_node(ztree_t *t, uint32_t zone_id,
             atomic_fetch_sub_explicit(&t->stat_cns_current, 1,
                                       memory_order_relaxed);
         cns_bitmap_clear(t, nid);
+    } else if (is_zns_llayer(t, zone_id)) {
+        /* Leaf removed from a ZNS zone — ZNS GC accounting. */
+        atomic_fetch_sub_explicit(&t->zone_valid_leaves[zone_id], 1,
+                                  memory_order_relaxed);
     }
 }
 
@@ -168,6 +197,7 @@ static inline void zones_busy_dec(ztree_t *t)
 {
     atomic_fetch_sub_explicit(&t->cns_zones_busy, 1, memory_order_relaxed);
 }
+
 static inline void zones_busy_sample(ztree_t *t)
 {
     uint32_t b = atomic_load_explicit(&t->cns_zones_busy, memory_order_relaxed);
@@ -1333,10 +1363,12 @@ retry_flush:
         int e = errno;
         if (!cns_path && e == EOVERFLOW)
         {
-            /* Re-sync zone_wp_bytes from the device's real WP rather than
-             * blindly subtracting PAGE.  An unbounded retry here would
-             * deadlock the tree, since this can run with every node latch
-             * on the delete/insert path held. */
+            /* zone_wp_bytes drifted from the device's real write pointer
+             * (async zbd_finish_zones, or a stale WP left behind by ZNS
+             * GC).  Re-sync from the device under the zone lock we still
+             * hold — a blind -PAGE retry can spin forever, and this runs
+             * with every node latch on the delete/insert path held, so an
+             * unbounded spin deadlocks the whole tree. */
             struct zbd_zone zinfo;
             unsigned int nz = 1;
             if (zbd_report_zones(t->fd,
@@ -1415,6 +1447,9 @@ retry_flush:
         .slot_id = slot_id,
     };
     nlt_update_migrate(&t->nlt, &loc, prev_zone);
+
+    /* Per-zone live-leaf accounting for ZNS GC victim selection. */
+    zone_valid_leaves_move(t, prev_zone, target_zone);
 
     if (!cns_path)
     {
@@ -2770,12 +2805,14 @@ cow_tree *cow_open(const char *path)
     t->zones = calloc(t->info.nr_zones, sizeof *t->zones);
     t->zone_wp_bytes = calloc(t->info.nr_zones, sizeof *t->zone_wp_bytes);
     t->zone_full = calloc(t->info.nr_zones, sizeof *t->zone_full);
-    if (!t->zones || !t->zone_wp_bytes || !t->zone_full)
+    t->zone_valid_leaves = calloc(t->info.nr_zones, sizeof *t->zone_valid_leaves);
+    if (!t->zones || !t->zone_wp_bytes || !t->zone_full || !t->zone_valid_leaves)
     {
         perror("calloc zones");
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
+        free(t->zone_valid_leaves);
         close(t->cns_fd);
         if (t->direct_fd >= 0)
             close(t->direct_fd);
@@ -2791,6 +2828,7 @@ cow_tree *cow_open(const char *path)
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
+        free(t->zone_valid_leaves);
         close(t->cns_fd);
         if (t->direct_fd >= 0)
             close(t->direct_fd);
@@ -2827,6 +2865,7 @@ cow_tree *cow_open(const char *path)
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
+        free(t->zone_valid_leaves);
         close(t->cns_fd);
         if (t->direct_fd >= 0)
             close(t->direct_fd);
@@ -2847,6 +2886,7 @@ cow_tree *cow_open(const char *path)
             free(t->zones);
             free(t->zone_wp_bytes);
             free(t->zone_full);
+            free(t->zone_valid_leaves);
             close(t->cns_fd);
             if (t->direct_fd >= 0)
                 close(t->direct_fd);
@@ -2868,6 +2908,7 @@ cow_tree *cow_open(const char *path)
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
+        free(t->zone_valid_leaves);
         close(t->cns_fd);
         if (t->direct_fd >= 0)
             close(t->direct_fd);
@@ -2891,6 +2932,7 @@ cow_tree *cow_open(const char *path)
             free(t->zones);
             free(t->zone_wp_bytes);
             free(t->zone_full);
+            free(t->zone_valid_leaves);
             close(t->cns_fd);
             if (t->direct_fd >= 0)
                 close(t->direct_fd);
@@ -2954,6 +2996,7 @@ cow_tree *cow_open(const char *path)
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
+        free(t->zone_valid_leaves);
         close(t->cns_fd);
         zbd_close(t->fd);
         free(t);
@@ -3187,6 +3230,8 @@ static void *dyn_evict_worker(void *p)
 
         cns_bitmap_clear(t, nid);
         atomic_fetch_sub_explicit(&t->stat_cns_current, 1, memory_order_relaxed);
+        /* CNS → ZNS: leaf now resident in 'target' for ZNS GC accounting. */
+        zone_valid_leaves_move(t, CTREE_CNS_ZONE_ID, target);
 
         a->evicted++;
     }
@@ -3343,6 +3388,251 @@ size_t cow_gc_cns(cow_tree *t)
     return (before > after) ? (before - after) : 0;
 }
 
+/* ── ZNS region GC ───────────────────────────────────────────────────────
+ * ZNS is append-only: stale CoW slots can only be reclaimed by resetting a
+ * whole zone.  LFS-style: pick sealed LLayer zones whose stale ratio
+ * exceeds ZNS_GC_STALE_THRESHOLD, migrate their live leaves to fresh zones
+ * (zone_alloc_llayer picks the target — a reset victim re-enters the rr
+ * window automatically since zone_has_space() becomes true), then
+ * ZONE_RESET the victim.  Stop-the-world: called from Maintenance(). */
+#define ZNS_GC_STALE_THRESHOLD 0.5
+
+/* Migrate one live leaf (victim:slot, node_id=nid) to a fresh ZNS zone.
+ * Returns 1 on success, 0 if skipped (not a leaf / target full / I/O err). */
+static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
+                               ztree_node_id_t nid, uint32_t slot)
+{
+    ztree_page p;
+    ztree_pagenum_t pn = zone_slot_to_pn(t, victim, slot);
+    load_page_by_pn(t, pn, &p);
+    if (!p.is_leaf) return 0;  /* internals never live on ZNS — defensive */
+
+    uint32_t target = zone_alloc_llayer(&t->za, nid, victim);
+    pthread_mutex_lock(&t->zone_write_locks[target]);
+    if (atomic_load_explicit(&t->zone_full[target], memory_order_acquire))
+    {
+        pthread_mutex_unlock(&t->zone_write_locks[target]);
+        return 0;
+    }
+    uint64_t zone_end = t->zones[target].start + t->zones[target].capacity;
+    uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target],
+                                       memory_order_relaxed);
+    if (wp + ZTREE_PAGE_SIZE > zone_end)
+    {
+        pthread_mutex_unlock(&t->zone_write_locks[target]);
+        atomic_store_explicit(&t->zone_full[target], 1, memory_order_release);
+        zone_seal_and_replace(&t->za, target);
+        return 0;
+    }
+    atomic_store_explicit(&t->zone_wp_bytes[target], wp + ZTREE_PAGE_SIZE,
+                          memory_order_relaxed);
+    uint64_t cur_wp = wp;
+    uint32_t new_slot = (uint32_t)((cur_wp - t->zones[target].start) / ZTREE_PAGE_SIZE);
+    p.zone_id = target;
+    p.slot_id = new_slot;
+
+    _Alignas(ZTREE_PAGE_SIZE) char bounce[ZTREE_PAGE_SIZE];
+    memcpy(bounce, &p, ZTREE_PAGE_SIZE);
+    int wfd = (t->direct_fd >= 0) ? t->direct_fd : t->fd;
+    ssize_t pwr = pwrite(wfd, bounce, ZTREE_PAGE_SIZE, (off_t)cur_wp);
+    if (pwr != (ssize_t)ZTREE_PAGE_SIZE)
+    {
+        /* Per-error logging would spam — caller summarises via seen vs
+         * migrated and leaves the victim sealed (not reset). */
+        pthread_mutex_unlock(&t->zone_write_locks[target]);
+        return 0;
+    }
+    pthread_mutex_unlock(&t->zone_write_locks[target]);
+
+    nlt_location_t newloc = { .zone_id = target, .node_id = nid, .slot_id = new_slot };
+    nlt_update_migrate(&t->nlt, &newloc, victim);
+    zone_valid_leaves_move(t, victim, target);
+    return 1;
+}
+
+struct zns_gc_ctx {
+    cow_tree *t;
+    uint32_t  victim;
+    size_t    seen;       /* live entries enumerated in victim's NLT tracker */
+    size_t    migrated;   /* successfully relocated out of the victim        */
+};
+static void zns_gc_migrate_cb(ztree_node_id_t nid, uint32_t slot, void *vp)
+{
+    struct zns_gc_ctx *c = vp;
+    c->seen++;
+    c->migrated += (size_t)zns_gc_migrate_leaf(c->t, c->victim, nid, slot);
+}
+
+/* Migrate one victim's live leaves out.  Records seen/migrated into the
+ * per-victim result slots.  Does NOT reset the zone — resets are deferred
+ * to phase 2 so that during migration every victim stays sealed and is
+ * therefore never picked by zone_alloc_llayer as a relocation target
+ * (zone_has_space() is false for sealed zones). */
+struct zns_victim_result {
+    uint32_t zone;
+    uint32_t counter_before;
+    size_t   seen;
+    size_t   migrated;
+};
+
+static void zns_gc_migrate_victim(cow_tree *t, struct zns_victim_result *r)
+{
+    r->counter_before =
+        atomic_load_explicit(&t->zone_valid_leaves[r->zone],
+                             memory_order_relaxed);
+    struct zns_gc_ctx ctx = { .t = t, .victim = r->zone,
+                              .seen = 0, .migrated = 0 };
+    nlt_zone_for_each(&t->nlt, r->zone, zns_gc_migrate_cb, &ctx);
+    r->seen     = ctx.seen;
+    r->migrated = ctx.migrated;
+}
+
+struct dyn_zns_gc_arg {
+    cow_tree                 *t;
+    struct zns_victim_result *results;
+    int                       v_start, v_end;
+};
+
+static void *dyn_zns_gc_worker(void *p)
+{
+    struct dyn_zns_gc_arg *a = p;
+    for (int v = a->v_start; v < a->v_end; v++)
+        zns_gc_migrate_victim(a->t, &a->results[v]);
+    return NULL;
+}
+
+size_t cow_gc_zns(cow_tree *t)
+{
+    if (!t) return 0;
+    /* Off by default while the post-GC RUN-G hang is being debugged.
+     * Set CTREE_DYNAMIC_ZNS_GC=1 to exercise it.  The migrate/reset core
+     * works (victims reset, stale GB reclaimed); the open issue is that
+     * post-GC zone state can leave foreground flushes spinning on the
+     * EOVERFLOW retry path. */
+    {
+        const char *e = getenv("CTREE_DYNAMIC_ZNS_GC");
+        if (!e || e[0] != '1')
+            return 0;
+    }
+    force_trace_sample(t);
+    size_t before = zns_physical_bytes(t);
+
+    /* 1. Victim selection: sealed LLayer zones over the stale threshold. */
+    uint32_t *victims = malloc(sizeof(uint32_t) * t->info.nr_zones);
+    if (!victims) return 0;
+    int nvictims = 0;
+    for (uint32_t z = ZTREE_LLAYER_ZONE_START; z < t->info.nr_zones; z++)
+    {
+        if (!atomic_load_explicit(&t->zone_full[z], memory_order_acquire))
+            continue;  /* only sealed zones — never the active write target */
+        uint64_t start = t->zones[z].start;
+        uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[z],
+                                           memory_order_relaxed);
+        if (wp <= start) continue;  /* unused */
+        uint64_t used  = wp - start;
+        uint64_t valid = (uint64_t)atomic_load_explicit(&t->zone_valid_leaves[z],
+                                                        memory_order_relaxed)
+                         * ZTREE_PAGE_SIZE;
+        double stale_ratio = (used > valid)
+                                 ? (1.0 - (double)valid / (double)used)
+                                 : 0.0;
+        if (stale_ratio > ZNS_GC_STALE_THRESHOLD)
+            victims[nvictims++] = z;
+    }
+
+    /* Phase 1: migrate every victim's live leaves out, in parallel.  All
+     *    victims stay sealed throughout, so zone_alloc_llayer never routes
+     *    a relocation back into a victim (zone_has_space()==0 for sealed).
+     *    Each victim is an independent zone + NLT bucket; shared state is
+     *    per-zone atomic or already thread-safe. */
+    struct zns_victim_result *results =
+        malloc(sizeof(*results) * (size_t)nvictims);
+    if (!results) { free(victims); return 0; }
+    for (int v = 0; v < nvictims; v++)
+        results[v] = (struct zns_victim_result){ .zone = victims[v] };
+
+    int N = dyn_maint_threads();
+    if (N > nvictims) N = (nvictims > 0) ? nvictims : 1;
+    if (N < 1) N = 1;
+
+    pthread_t tids[32];
+    struct dyn_zns_gc_arg args[32];
+    int per = (nvictims + N - 1) / N;
+    for (int i = 0; i < N; i++)
+    {
+        int s = i * per;
+        int e = ((i + 1) * per > nvictims) ? nvictims : (i + 1) * per;
+        args[i] = (struct dyn_zns_gc_arg){
+            .t = t, .results = results, .v_start = s, .v_end = e
+        };
+        pthread_create(&tids[i], NULL, dyn_zns_gc_worker, &args[i]);
+    }
+    for (int i = 0; i < N; i++)
+        pthread_join(tids[i], NULL);
+
+    /* Phase 2: reset victims whose live leaves were fully migrated.  Done
+     *    single-threaded after all migration completes — no worker can be
+     *    writing into a zone while it is being reset.  A victim with
+     *    leftover leaves (target-full / I/O error) is left sealed-as-is. */
+    size_t total_migrated = 0, zones_reset = 0, drift_zones = 0;
+    for (int v = 0; v < nvictims; v++)
+    {
+        struct zns_victim_result *r = &results[v];
+        total_migrated += r->migrated;
+
+        if (r->seen != (size_t)r->counter_before)
+        {
+            drift_zones++;
+            if (dynamic_verbose())
+                fprintf(stderr,
+                        "[ctree_dynamic] cow_gc_zns: counter drift victim=%u "
+                        "counter=%u actual=%zu\n",
+                        r->zone, r->counter_before, r->seen);
+        }
+
+        if (r->migrated != r->seen)
+        {
+            fprintf(stderr,
+                    "[ctree_dynamic] cow_gc_zns: victim %u — %zu/%zu leaves "
+                    "migrated, skipping reset\n",
+                    r->zone, r->migrated, r->seen);
+            continue;
+        }
+
+        /* All NLT entries tombstoned → safe to reset.  Force the counter
+         * to 0 (corrects drift) before the zone re-enters the rr window. */
+        atomic_store_explicit(&t->zone_valid_leaves[r->zone], 0,
+                              memory_order_relaxed);
+        off_t zstart = (off_t)t->zones[r->zone].start;
+        if (zbd_reset_zones(t->fd, zstart, (off_t)t->info.zone_size) != 0)
+        {
+            perror("cow_gc_zns: zbd_reset_zones");
+            continue;
+        }
+        atomic_store_explicit(&t->zone_wp_bytes[r->zone],
+                              t->zones[r->zone].start, memory_order_release);
+        atomic_store_explicit(&t->zone_full[r->zone], 0, memory_order_release);
+        nlt_set_zone_sealed(&t->nlt, r->zone, false);
+        zones_reset++;
+    }
+    free(results);
+    free(victims);
+    if (drift_zones)
+        fprintf(stderr,
+                "[ctree_dynamic] cow_gc_zns: %zu zone(s) had counter drift "
+                "(corrected)\n", drift_zones);
+
+    size_t after = zns_physical_bytes(t);
+    force_trace_sample(t);
+    fprintf(stderr,
+            "[ctree_dynamic] cow_gc_zns: victims=%d  zones_reset=%zu  "
+            "pages_migrated=%zu  zns_phys: %zu → %zu KB  (freed %zu KB, workers=%d)\n",
+            nvictims, zones_reset, total_migrated,
+            before / 1024, after / 1024,
+            (before > after ? (before - after) / 1024 : 0), N);
+    return (before > after) ? (before - after) : 0;
+}
+
 void cow_close(cow_tree *t)
 {
     if (!t)
@@ -3494,6 +3784,7 @@ void cow_close(cow_tree *t)
     free(t->zones);
     free(t->zone_wp_bytes);
     free(t->zone_full);
+    free(t->zone_valid_leaves);
 
     zbd_close(t->fd);
     if (t->direct_fd >= 0)

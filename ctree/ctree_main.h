@@ -28,6 +28,11 @@ struct ztree_s {
     _Atomic(uint64_t) *zone_wp_bytes;
     _Atomic(uint8_t)  *zone_full;
 
+    /* Per-zone live-leaf count (LLayer ZNS zones only) — drives ZNS GC
+     * victim selection without a full NLT scan.  Maintained incrementally
+     * by flush_page_immediate / cow_evict_cns_leaves / delete / cow_gc_zns. */
+    _Atomic(uint32_t) *zone_valid_leaves;
+
     /* ── CNS fallback ──────────────────────────────────────────────────── */
     int              cns_fd;          /* fd for /dev/nvme3n1 (O_RDWR|O_DIRECT) */
     _Atomic(uint8_t) *cns_bitmap;    /* 1 bit per node_id: 1=on CNS, 0=on ZNS */
@@ -145,9 +150,12 @@ ztree_record *ztree_find(ztree_t *t, int64_t key);
 /* Dynamic CNS variant only — NO-OP in other variants.
  * cow_evict_cns_leaves:  migrate every CNS-resident leaf back to a ZNS zone.
  * cow_gc_cns:            punch holes in CNS file for orphan slot ranges.
- * Both must be called from a quiescent point (no concurrent ops). */
+ * cow_gc_zns:            migrate live leaves out of stale sealed ZNS zones
+ *                        and ZONE_RESET them.  Gated by CTREE_DYNAMIC_ZNS_GC=1.
+ * All must be called from a quiescent point (no concurrent ops). */
 size_t    cow_evict_cns_leaves(cow_tree *t);
 size_t    cow_gc_cns(cow_tree *t);
+size_t    cow_gc_zns(cow_tree *t);
 
 /* Diagnostic: walk cns_bitmap, load each marked node, classify is_leaf. */
 void      cow_count_cns_residents(cow_tree *t,

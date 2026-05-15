@@ -51,6 +51,16 @@ static _Atomic bool     g_gc_running     = false;
 static _Atomic bool     g_gc_stop        = false;
 static unsigned         g_gc_interval_ms = 0;
 
+/* Independent periodic thread for ZNS region GC.  Enabled via
+ * CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS=<ms> (default 0 = disabled).  Also
+ * requires CTREE_DYNAMIC_ZNS_GC=1 to actually do work (cow_gc_zns is
+ * env-gated).  Shares g_insert_pause so it serialises with both the CNS
+ * GC thread and any explicit Maintenance() / phase-4 caller. */
+static pthread_t        g_zns_gc_tid;
+static _Atomic bool     g_zns_gc_running     = false;
+static _Atomic bool     g_zns_gc_stop        = false;
+static unsigned         g_zns_gc_interval_ms = 0;
+
 static void *dynamic_gc_thread(void *arg)
 {
     cow_tree *t = (cow_tree *)arg;
@@ -77,10 +87,43 @@ static void *dynamic_gc_thread(void *arg)
     return NULL;
 }
 
+static void *dynamic_zns_gc_thread(void *arg)
+{
+    cow_tree *t = (cow_tree *)arg;
+    while (!atomic_load_explicit(&g_zns_gc_stop, memory_order_acquire))
+    {
+        unsigned slept = 0;
+        while (slept < g_zns_gc_interval_ms
+            && !atomic_load_explicit(&g_zns_gc_stop, memory_order_acquire))
+        {
+            unsigned step = (g_zns_gc_interval_ms - slept > 50)
+                                ? 50 : (g_zns_gc_interval_ms - slept);
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)step * 1000000L };
+            nanosleep(&ts, NULL);
+            slept += step;
+        }
+        if (atomic_load_explicit(&g_zns_gc_stop, memory_order_acquire))
+            break;
+
+        pthread_rwlock_wrlock(&g_insert_pause);
+        cow_phase_mark(t, "begin:zns_gc_periodic");
+        cow_gc_zns(t);
+        cow_phase_mark(t, "end:zns_gc_periodic");
+        pthread_rwlock_unlock(&g_insert_pause);
+    }
+    return NULL;
+}
+
 /* Dynamic variant uses CNS via an F2FS sparse file (so that
  * cns_physical_bytes() can read st_blocks and GC can punch holes).
  * F2FS mount must exist at /mnt/cns. */
 #define CTREE_CNS_FILE_PATH    "/mnt/cns/nodes.dat"
+
+/* In the dynamic variant internals live on CNS so the legacy IZ pool
+ * range [2,50) is dormant — LLayer actually starts at zone 2.
+ * ZTREE_LLAYER_ZONE_START (=50) would skip zones 2-49 from zns_phys /
+ * is_zns_llayer / ZNS GC victim selection. */
+#define CTREE_DYNAMIC_LLAYER_BASE  2U
 
 /* Trace every TRACE_SAMPLE_INTERVAL page_appends to /tmp/ctree_dynamic_trace.csv */
 #define TRACE_SAMPLE_INTERVAL 10000U
@@ -101,7 +144,7 @@ static inline size_t cns_physical_bytes(ztree_t *t)
  * ILayer, and meta zones).  Used to gate zone_valid_leaves accounting. */
 static inline bool is_zns_llayer(ztree_t *t, uint32_t zone_id)
 {
-    return zone_id >= ZTREE_LLAYER_ZONE_START && zone_id < t->info.nr_zones;
+    return zone_id >= CTREE_DYNAMIC_LLAYER_BASE && zone_id < t->info.nr_zones;
 }
 
 /* Move a leaf's live residency from prev_zone to target_zone in the
@@ -128,7 +171,7 @@ static inline void zone_valid_leaves_move(ztree_t *t,
 static inline size_t zns_physical_bytes(ztree_t *t)
 {
     size_t total = 0;
-    for (uint32_t z = ZTREE_LLAYER_ZONE_START; z < t->info.nr_zones; z++) {
+    for (uint32_t z = CTREE_DYNAMIC_LLAYER_BASE; z < t->info.nr_zones; z++) {
         uint64_t wp    = atomic_load_explicit(&t->zone_wp_bytes[z],
                                               memory_order_relaxed);
         uint64_t start = t->zones[z].start;
@@ -1153,6 +1196,15 @@ retry_flush:
         bool home_full = !home_valid
                       || atomic_load_explicit(&t->zone_full[home_zone],
                                               memory_order_acquire);
+        /* Skip Step 1.5 if the home zone is EMPTY (post-GC-reset).  Opening
+         * it here bypasses the active-zone cap in rr_pick_zone; let Step 2
+         * route through zone_alloc_llayer instead. */
+        bool home_empty = home_valid
+                       && atomic_load_explicit(&t->zone_wp_bytes[home_zone],
+                                               memory_order_acquire)
+                          <= t->zones[home_zone].start;
+        if (home_empty)
+            home_full = true;  /* force fall-through */
 
         if (!home_full)
         {
@@ -1207,6 +1259,9 @@ retry_flush:
         if (!sticky_ok && home_full)
         {
             target_zone = zone_alloc_llayer(&t->za, pg->node_id, avoid_zone);
+            /* INVALID = at active-zone cap — skip this step, fall to Step 3 CNS spill. */
+            if (target_zone != ZTREE_INVALID_ZONE_ID)
+            {
             pg->zone_id = target_zone;  /* update home zone for future return */
             int rc = pthread_mutex_trylock(&t->zone_write_locks[target_zone]);
             if (rc == 0)
@@ -1241,6 +1296,7 @@ retry_flush:
                     pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
                 }
             }
+            }  /* end if (target_zone != INVALID) */
         }
     }
 
@@ -1252,6 +1308,8 @@ retry_flush:
                                         memory_order_acquire))))
     {
         target_zone = zone_alloc_llayer(&t->za, pg->node_id, avoid_zone);
+        if (target_zone != ZTREE_INVALID_ZONE_ID)  /* INVALID = at active cap → spill */
+        {
         pg->zone_id = target_zone;  /* preserve home zone for future CNS return */
 
         int rc = pthread_mutex_trylock(&t->zone_write_locks[target_zone]);
@@ -1285,6 +1343,7 @@ retry_flush:
                 pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
             }
         }
+        }  /* end if (target_zone != INVALID) */
     }
 
     /* Step 3: CNS spill (every trylock above failed). */
@@ -3045,12 +3104,57 @@ cow_tree *cow_open(const char *path)
                 "[ctree_dynamic] periodic evict+GC disabled (CTREE_DYNAMIC_GC_INTERVAL_MS=0)\n");
     }
 
+    /* Periodic ZNS GC.  Default 0 (disabled).  Also requires
+     * CTREE_DYNAMIC_ZNS_GC=1 for cow_gc_zns to do real work. */
+    {
+        const char *env = getenv("CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS");
+        long ms = env ? atol(env) : 0;
+        if (ms < 0) ms = 0;
+        g_zns_gc_interval_ms = (unsigned)ms;
+    }
+    if (g_zns_gc_interval_ms > 0)
+    {
+        if (!atomic_load_explicit(&g_insert_pause_initialised,
+                                  memory_order_acquire))
+        {
+            pthread_rwlockattr_t attr;
+            pthread_rwlockattr_init(&attr);
+            pthread_rwlockattr_setkind_np(
+                &attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+            pthread_rwlock_init(&g_insert_pause, &attr);
+            pthread_rwlockattr_destroy(&attr);
+            atomic_store_explicit(&g_insert_pause_initialised, true,
+                                  memory_order_release);
+        }
+        atomic_store_explicit(&g_zns_gc_stop, false, memory_order_relaxed);
+        atomic_store_explicit(&g_zns_gc_running, true, memory_order_release);
+        if (pthread_create(&g_zns_gc_tid, NULL,
+                           dynamic_zns_gc_thread, t) != 0)
+        {
+            perror("pthread_create dynamic_zns_gc_thread");
+            atomic_store_explicit(&g_zns_gc_running, false,
+                                  memory_order_release);
+        }
+        else
+        {
+            fprintf(stderr,
+                    "[ctree_dynamic] periodic ZNS GC enabled: every %u ms "
+                    "(needs CTREE_DYNAMIC_ZNS_GC=1)\n",
+                    g_zns_gc_interval_ms);
+        }
+    }
+
     return t;
 }
 
 void cow_insert(cow_tree *t, int64_t key, const char *value)
 {
-    if (atomic_load_explicit(&g_gc_running, memory_order_acquire))
+    /* Take the insert-pause rdlock if EITHER background GC thread is
+     * running — both wrlock g_insert_pause for quiescence, and missing
+     * the ZNS-GC case lets foreground writes race with cow_gc_zns'
+     * migrate/reset (zone state diverges between mem and device). */
+    if (atomic_load_explicit(&g_gc_running, memory_order_acquire)
+        || atomic_load_explicit(&g_zns_gc_running, memory_order_acquire))
     {
         pthread_rwlock_rdlock(&g_insert_pause);
         do_single_insert(t, key, value);
@@ -3175,13 +3279,28 @@ static void *dyn_evict_worker(void *p)
         if (!p.is_leaf) { a->skipped_internal++; continue; }
 
         uint32_t home_zone = p.zone_id;
-        bool home_valid = (home_zone >= ZTREE_ILAYER_ZONE_START)
-                       && (home_zone < t->info.nr_zones)
-                       && !atomic_load_explicit(&t->zone_full[home_zone],
-                                                memory_order_acquire);
+        bool home_in_range = (home_zone >= ZTREE_ILAYER_ZONE_START)
+                          && (home_zone < t->info.nr_zones);
+        bool home_full = !home_in_range
+                      || atomic_load_explicit(&t->zone_full[home_zone],
+                                              memory_order_acquire);
+        /* Treat post-GC-reset (EMPTY) home as not-valid so we go through
+         * zone_alloc_llayer and its active-zone cap.  Direct-pick here
+         * would bypass the cap and trip the device's max_active_zones. */
+        bool home_empty = home_in_range
+                       && atomic_load_explicit(&t->zone_wp_bytes[home_zone],
+                                               memory_order_acquire)
+                          <= t->zones[home_zone].start;
+        bool home_valid = !home_full && !home_empty;
         uint32_t target = home_valid
                               ? home_zone
                               : zone_alloc_llayer(&t->za, p.node_id, ZTREE_INVALID_ZONE_ID);
+        if (target == ZTREE_INVALID_ZONE_ID)
+        {
+            /* At active cap — skip this leaf, stays on CNS. */
+            a->skipped_full++;
+            continue;
+        }
 
         /* Blocking — workers on same target zone queue, never CNS-fallback. */
         pthread_mutex_lock(&t->zone_write_locks[target]);
@@ -3408,6 +3527,7 @@ static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
     if (!p.is_leaf) return 0;  /* internals never live on ZNS — defensive */
 
     uint32_t target = zone_alloc_llayer(&t->za, nid, victim);
+    if (target == ZTREE_INVALID_ZONE_ID) return 0;  /* at active cap — defer */
     pthread_mutex_lock(&t->zone_write_locks[target]);
     if (atomic_load_explicit(&t->zone_full[target], memory_order_acquire))
     {
@@ -3521,7 +3641,7 @@ size_t cow_gc_zns(cow_tree *t)
     uint32_t *victims = malloc(sizeof(uint32_t) * t->info.nr_zones);
     if (!victims) return 0;
     int nvictims = 0;
-    for (uint32_t z = ZTREE_LLAYER_ZONE_START; z < t->info.nr_zones; z++)
+    for (uint32_t z = CTREE_DYNAMIC_LLAYER_BASE; z < t->info.nr_zones; z++)
     {
         if (!atomic_load_explicit(&t->zone_full[z], memory_order_acquire))
             continue;  /* only sealed zones — never the active write target */
@@ -3538,6 +3658,14 @@ size_t cow_gc_zns(cow_tree *t)
                                  : 0.0;
         if (stale_ratio > ZNS_GC_STALE_THRESHOLD)
             victims[nvictims++] = z;
+    }
+
+    if (nvictims > 0)
+    {
+        fprintf(stderr, "[ctree_dynamic] cow_gc_zns: %d victim(s):", nvictims);
+        for (int v = 0; v < nvictims; v++)
+            fprintf(stderr, " %u", victims[v]);
+        fputc('\n', stderr);
     }
 
     /* Phase 1: migrate every victim's live leaves out, in parallel.  All
@@ -3637,6 +3765,13 @@ void cow_close(cow_tree *t)
 {
     if (!t)
         return;
+
+    if (atomic_load_explicit(&g_zns_gc_running, memory_order_acquire))
+    {
+        atomic_store_explicit(&g_zns_gc_stop, true, memory_order_release);
+        pthread_join(g_zns_gc_tid, NULL);
+        atomic_store_explicit(&g_zns_gc_running, false, memory_order_release);
+    }
 
     if (atomic_load_explicit(&g_gc_running, memory_order_acquire))
     {

@@ -34,28 +34,16 @@ static inline uint32_t zone_monotonic_ts_16b(void)
     return (uint32_t)ms;
 }
 
-/*
- * Check whether a zone has room for at least one more page.
- * Returns 1 if the zone is usable, 0 if it is full.
- */
-static int zone_has_space(zone_alloc_t *za, uint32_t zone_id)
-{
-    if (atomic_load_explicit(&za->zone_full[zone_id], memory_order_acquire))
-        return 0;
-
-    uint64_t wp    = atomic_load_explicit(&za->zone_wp_bytes[zone_id],
-                                          memory_order_acquire);
-    uint64_t cap   = za->zones[zone_id].capacity;
-    uint64_t start = za->zones[zone_id].start;
-    return (wp + ZTREE_PAGE_SIZE <= start + cap) ? 1 : 0;
-}
-
-/* Dynamic_Allocation (paper §3.2): round-robin within the active group.
- * Expands group by 1 when all zones are sealed. */
+/* Round-robin picker with active-open cap = init_count.
+ * Round-robin walk: pick first non-full zone with space.  If the zone is
+ * EMPTY (wp == start), opening it would create a new write-active slot,
+ * so only allow it when current write-active count < init_count.
+ * Returns ZTREE_INVALID_ZONE_ID at cap (all empties skipped, no write-
+ * active had space) — caller spills to CNS. */
 static uint32_t rr_pick_zone(zone_alloc_t *za,
                               uint32_t pool_base,
                               uint32_t pool_size,
-                              uint32_t init_count __attribute__((unused)),
+                              uint32_t init_count,
                               _Atomic(uint32_t) *group_count,
                               _Atomic(uint32_t) *rr_counter,
                               uint32_t avoid_zone,
@@ -65,16 +53,51 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
         uint32_t count = atomic_load_explicit(group_count, memory_order_acquire);
         uint32_t start = atomic_fetch_add_explicit(rr_counter, 1, memory_order_relaxed);
 
+        /* Cheap lock-free count of write-active zones — used to gate
+         * opening new empties.  Slight overshoot under concurrent picks
+         * is acceptable; the device limit is comfortably above init_count. */
+        uint32_t wa = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t zid = pool_base + i;
+            if (atomic_load_explicit(&za->zone_full[zid],
+                                     memory_order_acquire))
+                continue;
+            if (atomic_load_explicit(&za->zone_wp_bytes[zid],
+                                     memory_order_acquire)
+                > za->zones[zid].start)
+                wa++;
+        }
+        bool allow_empty = (wa < init_count);
+
+        uint32_t first_empty = ZTREE_INVALID_ZONE_ID;
         for (uint32_t i = 0; i < count; i++) {
             uint32_t zone_id = pool_base + ((start + i) % count);
             if (zone_id == avoid_zone)
                 continue;
-            if (zone_has_space(za, zone_id))
+            if (atomic_load_explicit(&za->zone_full[zone_id],
+                                     memory_order_acquire))
+                continue;
+            uint64_t wp = atomic_load_explicit(&za->zone_wp_bytes[zone_id],
+                                               memory_order_acquire);
+            uint64_t zstart = za->zones[zone_id].start;
+            if (wp + ZTREE_PAGE_SIZE > zstart + za->zones[zone_id].capacity)
+                continue;  /* no space */
+            if (wp > zstart)
+                return zone_id;   /* write-active with space — pick */
+            /* empty — only return if we still have room under the cap */
+            if (allow_empty)
                 return zone_id;
+            if (first_empty == ZTREE_INVALID_ZONE_ID)
+                first_empty = zone_id;
         }
 
-        /* All active zones sealed.  Attach 1 replacement (fallback;
-         * primary growth is via zone_seal_and_replace). */
+        /* No pickable zone in walk.  If empties exist but cap blocked them,
+         * the caller falls back (CNS spill).  Else all zones are full —
+         * try to grow. */
+        if (first_empty != ZTREE_INVALID_ZONE_ID)
+            return ZTREE_INVALID_ZONE_ID;
+
+        /* All zones full — grow. */
         uint32_t new_count = count + 1;
         if (new_count > pool_size)
             new_count = pool_size;

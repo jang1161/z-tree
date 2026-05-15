@@ -157,6 +157,10 @@ size_t    cow_evict_cns_leaves(cow_tree *t);
 size_t    cow_gc_cns(cow_tree *t);
 size_t    cow_gc_zns(cow_tree *t);
 
+/* Emit a "begin:<name>" / "end:<name>" line into the phase log
+ * (<trace_path>.phases) for the plotter to draw a shaded band. */
+void      cow_phase_mark(cow_tree *t, const char *name);
+
 /* Diagnostic: walk cns_bitmap, load each marked node, classify is_leaf. */
 void      cow_count_cns_residents(cow_tree *t,
                                   size_t *out_internals,

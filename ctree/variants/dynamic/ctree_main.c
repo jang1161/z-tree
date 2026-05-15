@@ -2676,7 +2676,7 @@ static int try_pessimistic_delete(ztree_t *t, int64_t key,
     return DEL_OK;
 }
 
-int cow_delete(cow_tree *t, int64_t key)
+static int do_single_delete(cow_tree *t, int64_t key)
 {
     for (uint32_t retry = 0;; retry++) {
         if (retry >= 1000000U) {
@@ -2742,6 +2742,21 @@ int cow_delete(cow_tree *t, int64_t key)
         atomic_fetch_add_explicit(&t->stat_deletes, 1, memory_order_relaxed);
         return 1;
     }
+}
+
+int cow_delete(cow_tree *t, int64_t key)
+{
+    /* Same insert_pause rdlock as cow_insert so delete writes serialise
+     * with the background CNS / ZNS GC threads. */
+    if (atomic_load_explicit(&g_gc_running, memory_order_acquire)
+        || atomic_load_explicit(&g_zns_gc_running, memory_order_acquire))
+    {
+        pthread_rwlock_rdlock(&g_insert_pause);
+        int r = do_single_delete(t, key);
+        pthread_rwlock_unlock(&g_insert_pause);
+        return r;
+    }
+    return do_single_delete(t, key);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

@@ -59,12 +59,17 @@ echo "[trace] $TRACE_CSV"
 echo "[log]   $RUN_LOG"
 
 # Primary phase: load + workload A.  Then chain C, D, G.
-# CTREE_DYNAMIC_GC_INTERVAL_MS=0 disables the background GC thread so the
-# only evict+GC events are the explicit Maintenance() calls between phases.
-# CTREE_DYNAMIC_ZNS_GC=1 (passed through) enables the experimental ZNS GC.
+# CTREE_DYNAMIC_GC_INTERVAL_MS=0 disables the background CNS GC thread so
+# the only evict+gc_cns events are the explicit Maintenance() calls
+# between phases.
+# CTREE_DYNAMIC_ZNS_GC=1 (passed through) enables cow_gc_zns.
+# CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS (default 10000) drives the periodic
+# ZNS GC thread.  Set to 0 to disable; otherwise the thread quiesces and
+# runs cow_gc_zns every N ms during the workload.
 sudo CTREE_DYNAMIC_GC_INTERVAL_MS=0 \
      CNS_ODIRECT="$CNS_ODIRECT_VAL" \
-     CTREE_DYNAMIC_ZNS_GC="${CTREE_DYNAMIC_ZNS_GC:-0}" \
+     CTREE_DYNAMIC_ZNS_GC="${CTREE_DYNAMIC_ZNS_GC:-1}" \
+     CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS="${CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS:-10000}" \
      CTREE_DYNAMIC_TRACE_PATH="$TRACE_CSV" \
      "$YCSB_DIR/ycsb_ctree" -load -run \
   -db ctree \

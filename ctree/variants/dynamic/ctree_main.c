@@ -1064,6 +1064,7 @@ static void flush_page_immediate(ztree_t *t,
     bool     sticky_ok = false;
     bool     cns_path  = false;
     uint64_t zwl_hold_start = 0;
+    int      eoverflow_retries = 0;
 
 retry_flush:
     sticky_ok = false;
@@ -1332,11 +1333,42 @@ retry_flush:
         int e = errno;
         if (!cns_path && e == EOVERFLOW)
         {
-            atomic_fetch_sub_explicit(&t->zone_wp_bytes[target_zone],
-                                      ZTREE_PAGE_SIZE, memory_order_relaxed);
+            /* Re-sync zone_wp_bytes from the device's real WP rather than
+             * blindly subtracting PAGE.  An unbounded retry here would
+             * deadlock the tree, since this can run with every node latch
+             * on the delete/insert path held. */
+            struct zbd_zone zinfo;
+            unsigned int nz = 1;
+            if (zbd_report_zones(t->fd,
+                                 (off_t)t->zones[target_zone].start,
+                                 (off_t)t->info.zone_size,
+                                 ZBD_RO_ALL, &zinfo, &nz) == 0 && nz > 0)
+            {
+                atomic_store_explicit(&t->zone_wp_bytes[target_zone],
+                                      (uint64_t)zinfo.wp, memory_order_release);
+                if (zinfo.cond == ZBD_ZONE_COND_FULL)
+                    atomic_store_explicit(&t->zone_full[target_zone], 1,
+                                          memory_order_release);
+            }
+            else
+            {
+                atomic_fetch_sub_explicit(&t->zone_wp_bytes[target_zone],
+                                          ZTREE_PAGE_SIZE, memory_order_relaxed);
+            }
             record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
             zones_busy_dec(t);
             pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+            if (++eoverflow_retries > 1000)
+            {
+                fprintf(stderr,
+                        "flush_page_immediate(leaf): EOVERFLOW unrecoverable "
+                        "after %d retries — target_zone=%u cur_wp=0x%llx "
+                        "prev_zone=%u node_id=%llu\n",
+                        eoverflow_retries, target_zone,
+                        (unsigned long long)cur_wp, prev_zone,
+                        (unsigned long long)pg->node_id);
+                exit(EXIT_FAILURE);
+            }
             usleep(500);
             goto retry_flush;
         }

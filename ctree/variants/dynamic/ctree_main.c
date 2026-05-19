@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -61,28 +62,75 @@ static _Atomic bool     g_zns_gc_running     = false;
 static _Atomic bool     g_zns_gc_stop        = false;
 static unsigned         g_zns_gc_interval_ms = 0;
 
+/* CNS high-water-mark trigger.  dynamic_gc_thread also fires evict+gc_cns
+ * when F2FS usage >= g_cns_hwm_ratio (env CTREE_DYNAMIC_CNS_HWM_RATIO,
+ * default 0.90; 0 disables). */
+static double           g_cns_hwm_ratio   = 0.0;
+static unsigned         g_cns_hwm_poll_ms = 200;
+
+static double cns_used_ratio(void);
+
+/* Periodic trigger (g_gc_interval_ms) + HWM trigger (g_cns_hwm_ratio).
+ * Poll cadence = min(periodic interval, HWM poll), bounded below by 50ms. */
 static void *dynamic_gc_thread(void *arg)
 {
     cow_tree *t = (cow_tree *)arg;
-    /* Sleep in ~50ms slices so cow_close can stop us promptly. */
+
+    unsigned poll_ms;
+    if (g_gc_interval_ms > 0 && g_cns_hwm_ratio > 0.0)
+        poll_ms = g_gc_interval_ms < g_cns_hwm_poll_ms
+                      ? g_gc_interval_ms : g_cns_hwm_poll_ms;
+    else if (g_gc_interval_ms > 0)
+        poll_ms = g_gc_interval_ms;
+    else
+        poll_ms = g_cns_hwm_poll_ms;
+    if (poll_ms < 50) poll_ms = 50;
+
+    unsigned elapsed_periodic = 0;
+
     while (!atomic_load_explicit(&g_gc_stop, memory_order_acquire))
     {
         unsigned slept = 0;
-        while (slept < g_gc_interval_ms
+        while (slept < poll_ms
             && !atomic_load_explicit(&g_gc_stop, memory_order_acquire))
         {
-            unsigned step = (g_gc_interval_ms - slept > 50) ? 50 : (g_gc_interval_ms - slept);
+            unsigned step = (poll_ms - slept > 50) ? 50 : (poll_ms - slept);
             struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)step * 1000000L };
             nanosleep(&ts, NULL);
             slept += step;
         }
         if (atomic_load_explicit(&g_gc_stop, memory_order_acquire))
             break;
+        elapsed_periodic += slept;
 
+        const char *reason = NULL;
+        double ratio = 0.0;
+        if (g_cns_hwm_ratio > 0.0)
+        {
+            ratio = cns_used_ratio();
+            if (ratio >= g_cns_hwm_ratio)
+                reason = "hwm";
+        }
+        if (!reason && g_gc_interval_ms > 0
+            && elapsed_periodic >= g_gc_interval_ms)
+            reason = "periodic";
+        if (!reason)
+            continue;
+
+        if (strcmp(reason, "hwm") == 0)
+            fprintf(stderr,
+                    "[ctree_dynamic] CNS HWM trigger: %.1f%% >= %.1f%%\n",
+                    ratio * 100.0, g_cns_hwm_ratio * 100.0);
+
+        cow_phase_mark(t, strcmp(reason, "hwm") == 0
+                              ? "begin:cns_hwm_gc" : "begin:cns_periodic_gc");
         pthread_rwlock_wrlock(&g_insert_pause);
         cow_evict_cns_leaves(t);
         cow_gc_cns(t);
         pthread_rwlock_unlock(&g_insert_pause);
+        cow_phase_mark(t, strcmp(reason, "hwm") == 0
+                              ? "end:cns_hwm_gc" : "end:cns_periodic_gc");
+        elapsed_periodic = 0;
     }
     return NULL;
 }
@@ -138,6 +186,18 @@ static inline size_t cns_physical_bytes(ztree_t *t)
     struct stat st;
     if (fstat(t->cns_fd, &st) != 0) return 0;
     return (size_t)st.st_blocks * 512;
+}
+
+/* F2FS-level used ratio (this file + everything else under the mount).
+ * Used by the HWM trigger in dynamic_gc_thread. */
+static double cns_used_ratio(void)
+{
+    struct statvfs vfs;
+    if (statvfs(CTREE_CNS_FILE_PATH, &vfs) != 0) return 0.0;
+    uint64_t total = (uint64_t)vfs.f_blocks * vfs.f_frsize;
+    uint64_t avail = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+    if (total == 0) return 0.0;
+    return (double)(total - avail) / (double)total;
 }
 
 /* True iff zone_id is an LLayer ZNS leaf zone (excludes INVALID, CNS,
@@ -3075,14 +3135,30 @@ cow_tree *cow_open(const char *path)
         return NULL;
     }
 
-    /* Periodic evict+GC.  Default 1000ms; 0 disables. */
+    /* dynamic_gc_thread triggers: periodic interval and/or CNS HWM.
+     *   CTREE_DYNAMIC_GC_INTERVAL_MS   periodic cadence (default 0 = off)
+     *   CTREE_DYNAMIC_CNS_HWM_RATIO    HWM as fraction (default 0.90; 0 off)
+     *   CTREE_DYNAMIC_CNS_HWM_POLL_MS  HWM poll cadence (default 200)
+     * Thread starts if either trigger is enabled. */
     {
         const char *env = getenv("CTREE_DYNAMIC_GC_INTERVAL_MS");
-        long ms = env ? atol(env) : 1000;
+        long ms = env ? atol(env) : 0;
         if (ms < 0) ms = 0;
         g_gc_interval_ms = (unsigned)ms;
     }
-    if (g_gc_interval_ms > 0)
+    {
+        const char *env = getenv("CTREE_DYNAMIC_CNS_HWM_RATIO");
+        double r = env ? atof(env) : 0.90;
+        if (r < 0.0 || r > 1.0) r = 0.0;
+        g_cns_hwm_ratio = r;
+    }
+    {
+        const char *env = getenv("CTREE_DYNAMIC_CNS_HWM_POLL_MS");
+        long ms = env ? atol(env) : 200;
+        if (ms < 50) ms = 50;
+        g_cns_hwm_poll_ms = (unsigned)ms;
+    }
+    if (g_gc_interval_ms > 0 || g_cns_hwm_ratio > 0.0)
     {
         if (!atomic_load_explicit(&g_insert_pause_initialised, memory_order_acquire))
         {
@@ -3107,14 +3183,16 @@ cow_tree *cow_open(const char *path)
         else
         {
             fprintf(stderr,
-                    "[ctree_dynamic] periodic evict+GC enabled: every %u ms\n",
-                    g_gc_interval_ms);
+                    "[ctree_dynamic] CNS GC thread enabled: periodic=%ums  hwm=%.1f%% (poll %ums)\n",
+                    g_gc_interval_ms,
+                    g_cns_hwm_ratio * 100.0,
+                    g_cns_hwm_poll_ms);
         }
     }
     else
     {
         fprintf(stderr,
-                "[ctree_dynamic] periodic evict+GC disabled (CTREE_DYNAMIC_GC_INTERVAL_MS=0)\n");
+                "[ctree_dynamic] CNS GC thread disabled (no periodic, no HWM)\n");
     }
 
     /* Periodic ZNS GC.  Default 0 (disabled).  Also requires

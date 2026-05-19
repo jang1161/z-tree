@@ -26,9 +26,9 @@
 
 /* ── Zone budget overrides for this variant ────────────────────────────────
  * ILayer is dormant (internals on CNS).  3 freed active slots → +2 hot / +1 cold.
- * Active budget: 0 IZ + 10 Hot + 3 Cold + 1 Meta = 14 (within device limit). */
+ * Active budget: 0 IZ + 9 Hot + 3 Cold + 1 Meta = 13 (within device limit). */
 #undef  ZTREE_LZGROUP_HOT_INIT
-#define ZTREE_LZGROUP_HOT_INIT    10U
+#define ZTREE_LZGROUP_HOT_INIT     9U
 #undef  ZTREE_LZGROUP_COLD_INIT
 #define ZTREE_LZGROUP_COLD_INIT    3U
 

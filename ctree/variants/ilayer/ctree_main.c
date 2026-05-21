@@ -1158,7 +1158,7 @@ static void do_single_insert(ztree_t *t, int64_t key, const char *value)
         {
             if ((retry & 0xFU) == 0)
                 sched_yield();
-            if (retry >= 1000000U)
+            if (retry >= 10000U)
             {
                 fprintf(stderr, "cow_insert: excessive publish retries (key=%ld)\n", (long)key);
                 exit(EXIT_FAILURE);

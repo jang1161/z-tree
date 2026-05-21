@@ -65,12 +65,25 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
         uint32_t count = atomic_load_explicit(group_count, memory_order_acquire);
         uint32_t start = atomic_fetch_add_explicit(rr_counter, 1, memory_order_relaxed);
 
+        /* RR over available zones only — first-fit funnels all threads onto
+         * the first open zone after a full run. */
+        uint32_t navail = 0;
         for (uint32_t i = 0; i < count; i++) {
-            uint32_t zone_id = pool_base + ((start + i) % count);
-            if (zone_id == avoid_zone)
-                continue;
-            if (zone_has_space(za, zone_id))
-                return zone_id;
+            uint32_t zone_id = pool_base + i;
+            if (zone_id != avoid_zone && zone_has_space(za, zone_id))
+                navail++;
+        }
+        if (navail > 0) {
+            uint32_t target = start % navail;
+            uint32_t k = 0;
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t zone_id = pool_base + i;
+                if (zone_id == avoid_zone || !zone_has_space(za, zone_id))
+                    continue;
+                if (k++ == target)
+                    return zone_id;
+            }
+            continue;  /* lost a race; retry */
         }
 
         /* All active zones sealed.  Attach 1 replacement (fallback;

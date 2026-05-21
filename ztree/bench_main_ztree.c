@@ -154,7 +154,15 @@ static void run_test(const char *dev_path, int num_threads)
     printf("Verify: found %d / %d (%.2f%%)  missing %d  in %.2f s\n",
            found, total_keys, 100.0 * found / total_keys, missing, velapsed);
 
+    struct timespec close_start, close_end;
+    clock_gettime(CLOCK_MONOTONIC, &close_start);
     cow_close(t);
+    clock_gettime(CLOCK_MONOTONIC, &close_end);
+    double close_elapsed =
+        (close_end.tv_sec - close_start.tv_sec) +
+        (close_end.tv_nsec - close_start.tv_nsec) / 1e9;
+    printf("Elapsed (close): %.6f seconds\n", close_elapsed);
+    printf("Elapsed (insert+close): %.6f seconds\n", elapsed + close_elapsed);
 
     free(threads);
     free(args);

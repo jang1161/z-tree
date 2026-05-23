@@ -42,6 +42,10 @@
 #undef  ZTREE_LZGROUP_COLD_INIT
 #define ZTREE_LZGROUP_COLD_INIT    3U
 
+/* CNS lives on an F2FS sparse file: slot=node_id offsets are sparse, so
+ * physical use = live internal pages only (not bounded by raw device size). */
+#define CTREE_CNS_FILE_PATH "/mnt/cns/nodes.dat"
+
 /* CNS I/O mode toggle (env var CNS_ODIRECT=1 to enable). */
 static int g_cns_odirect = 0;
 
@@ -2288,22 +2292,30 @@ cow_tree *cow_open(const char *path)
         const char *od = getenv("CNS_ODIRECT");
         g_cns_odirect = (od && atoi(od) != 0) ? 1 : 0;
     }
-    int cns_flags = O_RDWR | (g_cns_odirect ? O_DIRECT : 0);
-    t->cns_fd = open(CTREE_CNS_DEV_PATH, cns_flags);
+    int cns_flags = O_RDWR | O_CREAT | (g_cns_odirect ? O_DIRECT : 0);
+    t->cns_fd = open(CTREE_CNS_FILE_PATH, cns_flags, 0644);
     fprintf(stderr,
-            "[ctree_ilayer] CNS mode: %s\n",
-            g_cns_odirect ? "O_DIRECT (page cache bypassed)" : "buffered I/O");
+            "[ctree_ilayer] CNS mode: %s  (file %s)\n",
+            g_cns_odirect ? "O_DIRECT (page cache bypassed)" : "buffered I/O",
+            CTREE_CNS_FILE_PATH);
     if (t->cns_fd < 0)
     {
         fprintf(stderr,
-                "[ctree_ilayer] FATAL: cannot open CNS device %s: %s\n"
-                "  This variant places all internal nodes on CNS; CNS is mandatory.\n",
-                CTREE_CNS_DEV_PATH, strerror(errno));
+                "[ctree_ilayer] FATAL: cannot open CNS file %s: %s\n"
+                "  Ensure F2FS is mounted on /mnt/cns:\n"
+                "    sudo mkfs.f2fs -f /dev/nvme3n1 && sudo mount -t f2fs /dev/nvme3n1 /mnt/cns\n",
+                CTREE_CNS_FILE_PATH, strerror(errno));
         if (t->direct_fd >= 0)
             close(t->direct_fd);
         zbd_close(t->fd);
         free(t);
         exit(EXIT_FAILURE);
+    }
+    if (ftruncate(t->cns_fd, 0) != 0)
+    {
+        fprintf(stderr,
+                "[ctree_ilayer] WARNING: ftruncate(0) on CNS file failed: %s\n",
+                strerror(errno));
     }
 
     /* No CNS bitmap in this variant — location is determined by pg->is_leaf. */
@@ -2481,7 +2493,7 @@ cow_tree *cow_open(const char *path)
 
     fprintf(stderr,
             "[ctree_ilayer] internal nodes → CNS %s (slot = node_id)\n",
-            CTREE_CNS_DEV_PATH);
+            CTREE_CNS_FILE_PATH);
     fprintf(stderr,
             "[ctree_ilayer] LLayer hot-pool [%u, %u)  init_group=%u"
             "  cold-pool [%u, %u)  init_group=%u\n",

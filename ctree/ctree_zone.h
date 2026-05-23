@@ -81,6 +81,19 @@ typedef struct {
 
     /* Serialises zone seal → finish → grow transitions. */
     pthread_mutex_t    lifecycle_lock;
+
+    /* Active-zone admission control (dynamic variant).  active_zones tracks
+     * ZNS leaf zones counted against the device's max-active budget: a new
+     * zone's first-write acquires a slot (<active_cap), and the slot is
+     * released only AFTER the zone is finished on the device (finish-then-
+     * release) so our counter is always >= the device's active count.
+     * admission_held[zid] is a per-zone "this zone holds one slot" bit that
+     * makes release exactly-once and excludes never-acquired zones (meta).
+     * Disabled (enabled=0) → helpers are no-ops, base/ilayer unaffected. */
+    _Atomic(uint32_t) active_zones;
+    uint32_t          active_cap;
+    int               admission_enabled;
+    _Atomic(uint8_t) *admission_held;  /* per-zone, sized nr_zones */
 } zone_alloc_t;
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -119,6 +132,21 @@ uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
  * Call AFTER zone_full is set and zone_write_lock is released.
  * Takes lifecycle_lock; at most one transition in flight at a time. */
 void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id);
+
+/* Admission control (no-op unless admission_enabled).
+ * zone_admission_acquire     – reserve one active slot for zone_id and mark it
+ *                              held; 1 ok, 0 at cap.  Call under the zone's
+ *                              write lock before its first write.
+ * zone_admission_release_zone – release the slot iff zone_id is held (CAS held
+ *                              1→0).  Call AFTER the zone is finished/full on
+ *                              the device (finish-then-release); exactly-once.
+ * zone_mark_full             – CAS zone_full 0→1 only (no admission side effect).
+ * zone_admission_try/release  – low-level counter ops (used internally). */
+int  zone_admission_acquire(zone_alloc_t *za, uint32_t zone_id);
+void zone_admission_release_zone(zone_alloc_t *za, uint32_t zone_id);
+int  zone_admission_try(zone_alloc_t *za);
+void zone_admission_release(zone_alloc_t *za);
+void zone_mark_full(zone_alloc_t *za, uint32_t zone_id);
 
 /* zone_heat_record_write  –  increment counter + update timestamp after page append. */
 void zone_heat_record_write(zone_alloc_t *za, ztree_node_id_t node_id);

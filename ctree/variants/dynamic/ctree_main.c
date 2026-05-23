@@ -828,7 +828,7 @@ static int zone_append_page(ztree_t *t, uint32_t zone_id,
     uint64_t zone_end = t->zones[zone_id].start + t->zones[zone_id].capacity;
     if (new_wp >= zone_end)
     {
-        atomic_store_explicit(&t->zone_full[zone_id], 1, memory_order_release);
+        zone_mark_full(&t->za, zone_id);
         zone_finish_if_full(t, zone_id);
     }
 
@@ -1238,7 +1238,7 @@ retry_flush:
                 record_zwl_hold(t, prev_zone, monotonic_ns() - zwl_hold_start);
                 zones_busy_dec(t);
                 pthread_mutex_unlock(&t->zone_write_locks[prev_zone]);
-                atomic_store_explicit(&t->zone_full[prev_zone], 1, memory_order_release);
+                zone_mark_full(&t->za, prev_zone);
                 nlt_set_zone_sealed(&t->nlt, prev_zone, true);
                 zone_seal_and_replace(&t->za, prev_zone);
             }
@@ -1338,7 +1338,9 @@ retry_flush:
                                         + t->zones[target_zone].capacity;
                     uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target_zone],
                                                        memory_order_relaxed);
-                    if (wp + ZTREE_PAGE_SIZE <= zone_end)
+                    if (wp + ZTREE_PAGE_SIZE <= zone_end
+                        && (wp != t->zones[target_zone].start
+                            || zone_admission_acquire(&t->za, target_zone)))
                     {
                         cur_wp = wp;
                         atomic_store_explicit(&t->zone_wp_bytes[target_zone],
@@ -1387,7 +1389,9 @@ retry_flush:
                                     + t->zones[target_zone].capacity;
                 uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target_zone],
                                                    memory_order_relaxed);
-                if (wp + ZTREE_PAGE_SIZE <= zone_end)
+                if (wp + ZTREE_PAGE_SIZE <= zone_end
+                    && (wp != t->zones[target_zone].start
+                        || zone_admission_acquire(&t->za, target_zone)))
                 {
                     cur_wp = wp;
                     atomic_store_explicit(&t->zone_wp_bytes[target_zone],
@@ -1498,8 +1502,10 @@ retry_flush:
                 atomic_store_explicit(&t->zone_wp_bytes[target_zone],
                                       (uint64_t)zinfo.wp, memory_order_release);
                 if (zinfo.cond == ZBD_ZONE_COND_FULL)
-                    atomic_store_explicit(&t->zone_full[target_zone], 1,
-                                          memory_order_release);
+                {
+                    zone_mark_full(&t->za, target_zone);
+                    zone_admission_release_zone(&t->za, target_zone);
+                }
             }
             else
             {
@@ -1542,7 +1548,7 @@ retry_flush:
                             + t->zones[target_zone].capacity;
         if (new_wp >= zone_end)
         {
-            atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
+            zone_mark_full(&t->za, target_zone);
             zone_seal_and_replace(&t->za, target_zone);
         }
 
@@ -1577,7 +1583,7 @@ retry_flush:
         uint64_t seal_threshold = (t->zones[target_zone].capacity * 95ULL) / 100ULL;
         if (zone_bytes_used >= seal_threshold)
         {
-            atomic_store_explicit(&t->zone_full[target_zone], 1, memory_order_release);
+            zone_mark_full(&t->za, target_zone);
             nlt_set_zone_sealed(&t->nlt, target_zone, true);
             zone_seal_and_replace(&t->za, target_zone);
         }
@@ -3100,6 +3106,12 @@ cow_tree *cow_open(const char *path)
                     t->fd, (uint64_t)t->info.zone_size,
                     t->zone_write_locks);
 
+    /* Active-zone admission: cap ZNS-leaf opens below device max (14) minus
+     * RLayer meta headroom, so grow-to-init can't trip max_active_zones. */
+    t->za.admission_enabled = 1;
+    t->za.active_cap = 12;
+    atomic_store_explicit(&t->za.active_zones, 0, memory_order_relaxed);
+
     fprintf(stderr,
             "[ctree_dynamic] internal nodes → CNS %s (slot = node_id)\n",
             CTREE_CNS_FILE_PATH);
@@ -3405,8 +3417,15 @@ static void *dyn_evict_worker(void *p)
         if (wp + ZTREE_PAGE_SIZE > zone_end)
         {
             pthread_mutex_unlock(&t->zone_write_locks[target]);
-            atomic_store_explicit(&t->zone_full[target], 1, memory_order_release);
+            zone_mark_full(&t->za, target);
             zone_seal_and_replace(&t->za, target);
+            a->skipped_full++;
+            continue;
+        }
+        if (wp == t->zones[target].start && !zone_admission_acquire(&t->za, target))
+        {
+            /* At active cap — leaf stays on CNS, retried next GC. */
+            pthread_mutex_unlock(&t->zone_write_locks[target]);
             a->skipped_full++;
             continue;
         }
@@ -3595,24 +3614,13 @@ size_t cow_gc_cns(cow_tree *t)
     return (before > after) ? (before - after) : 0;
 }
 
-/* ── ZNS region GC ───────────────────────────────────────────────────────
- * ZNS is append-only: stale CoW slots can only be reclaimed by resetting a
- * whole zone.  LFS-style: pick sealed LLayer zones whose stale ratio
- * exceeds ZNS_GC_STALE_THRESHOLD, migrate their live leaves to fresh zones
- * (zone_alloc_llayer picks the target — a reset victim re-enters the rr
- * window automatically since zone_has_space() becomes true), then
- * ZONE_RESET the victim.  Stop-the-world: called from Maintenance(). */
+/* ZNS GC: reclaim stale data by migrating live leaves from sealed zones
+ * with high stale ratios, then reset the victim zone. */
 #define ZNS_GC_STALE_THRESHOLD 0.5
 
-/* Migrate one live leaf (victim:slot, node_id=nid) to a fresh ZNS zone.
- * Returns 1 on success, 0 if skipped (not a leaf / already moved by
- * foreground / target full / I/O err).
- *
- * Takes the per-leaf node latch (wrlock) to serialise with foreground
- * cow_insert / cow_delete that may concurrently CoW the same leaf — both
- * paths take node_latch_for_id(nid) wrlock so only one publishes to NLT.
- * After acquiring the latch, we re-resolve NLT[nid]: if it no longer
- * points to (victim, slot), the foreground already moved it; skip. */
+/* Migrate one live leaf to a new ZNS zone.
+ * Takes the per-leaf wrlock to serialize with concurrent foreground CoW.
+ * After locking, recheck NLT[nid]; skip if the leaf was already moved. */
 static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
                                ztree_node_id_t nid, uint32_t slot)
 {
@@ -3658,8 +3666,14 @@ static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
     if (wp + ZTREE_PAGE_SIZE > zone_end)
     {
         pthread_mutex_unlock(&t->zone_write_locks[target]);
-        atomic_store_explicit(&t->zone_full[target], 1, memory_order_release);
+        zone_mark_full(&t->za, target);
         zone_seal_and_replace(&t->za, target);
+        node_unlock(t, nid);
+        return 0;
+    }
+    if (wp == t->zones[target].start && !zone_admission_acquire(&t->za, target))
+    {
+        pthread_mutex_unlock(&t->zone_write_locks[target]);
         node_unlock(t, nid);
         return 0;
     }
@@ -3863,6 +3877,9 @@ size_t cow_gc_zns(cow_tree *t)
         }
         atomic_store_explicit(&t->zone_wp_bytes[r->zone],
                               t->zones[r->zone].start, memory_order_release);
+        /* Reset frees the device slot; release ours if somehow still held
+         * (normally released at seal) so the slot can't leak across reuse. */
+        zone_admission_release_zone(&t->za, r->zone);
         atomic_store_explicit(&t->zone_full[r->zone], 0, memory_order_release);
         nlt_set_zone_sealed(&t->nlt, r->zone, false);
         zones_reset++;

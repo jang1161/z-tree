@@ -86,6 +86,20 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
             if (wp > zstart || allow_empty)
                 npick++;
         }
+        /* Grow to expose more empties — but only while we may actually open
+         * one (allow_empty).  Once write-active == init_count, npick naturally
+         * falls below init_count as zones fill; growing then can't open any
+         * empty and just runs group_count up to pool_size (scatters the RR
+         * window).  admission control caps real opens. */
+        if (allow_empty && npick > 0 && npick < init_count && count < pool_size) {
+            uint32_t new_count = count + (init_count - npick);
+            if (new_count > pool_size)
+                new_count = pool_size;
+            uint32_t expected = count;
+            atomic_compare_exchange_strong_explicit(group_count, &expected,
+                new_count, memory_order_acq_rel, memory_order_relaxed);
+            continue;
+        }
         if (npick > 0) {
             uint32_t target = start % npick, k = 0;
             for (uint32_t i = 0; i < count; i++) {
@@ -156,11 +170,11 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                         continue;
                     if (za->zone_write_locks)
                         pthread_mutex_lock(&za->zone_write_locks[zid]);
-                    atomic_store_explicit(
-                        &za->zone_full[zid], 1, memory_order_release);
+                    zone_mark_full(za, zid);
                     zbd_finish_zones(za->fd,
                                      (off_t)za->zones[zid].start,
                                      (off_t)za->zone_size);
+                    zone_admission_release_zone(za, zid);
                     if (za->zone_write_locks)
                         pthread_mutex_unlock(&za->zone_write_locks[zid]);
                 }
@@ -197,6 +211,71 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
             pthread_mutex_unlock(&za->lifecycle_lock);
         }
     }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Active-zone admission control
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+int zone_admission_try(zone_alloc_t *za)
+{
+    if (!za->admission_enabled)
+        return 1;
+    uint32_t cur = atomic_load_explicit(&za->active_zones, memory_order_acquire);
+    for (;;) {
+        if (cur >= za->active_cap)
+            return 0;
+        if (atomic_compare_exchange_weak_explicit(&za->active_zones, &cur, cur + 1,
+                memory_order_acq_rel, memory_order_acquire))
+            return 1;
+    }
+}
+
+void zone_admission_release(zone_alloc_t *za)
+{
+    if (!za->admission_enabled)
+        return;
+    uint32_t cur = atomic_load_explicit(&za->active_zones, memory_order_acquire);
+    while (cur > 0 &&
+           !atomic_compare_exchange_weak_explicit(&za->active_zones, &cur, cur - 1,
+               memory_order_acq_rel, memory_order_acquire))
+        ;  /* guard against underflow if a release ever lacks a matching acquire */
+}
+
+/* Reserve a slot for zone_id and mark it held.  Caller holds the zone's write
+ * lock and is about to do its first write (acquire precedes device-open).
+ * Idempotent per zone: if already held (e.g. an EOVERFLOW retry re-picks the
+ * same still-empty zone) it returns 1 without double-counting. */
+int zone_admission_acquire(zone_alloc_t *za, uint32_t zone_id)
+{
+    if (!za->admission_enabled)
+        return 1;
+    if (atomic_load_explicit(&za->admission_held[zone_id], memory_order_acquire))
+        return 1;
+    if (!zone_admission_try(za))
+        return 0;
+    atomic_store_explicit(&za->admission_held[zone_id], 1, memory_order_release);
+    return 1;
+}
+
+/* Release zone_id's slot iff currently held (exactly-once via CAS).  Call only
+ * after the zone is finished/full on the device, so active_zones never drops
+ * below the device's true active count. */
+void zone_admission_release_zone(zone_alloc_t *za, uint32_t zone_id)
+{
+    if (!za->admission_enabled)
+        return;
+    uint8_t held = 1;
+    if (atomic_compare_exchange_strong_explicit(&za->admission_held[zone_id],
+            &held, 0, memory_order_acq_rel, memory_order_relaxed))
+        zone_admission_release(za);
+}
+
+void zone_mark_full(zone_alloc_t *za, uint32_t zone_id)
+{
+    uint8_t expected = 0;
+    atomic_compare_exchange_strong_explicit(&za->zone_full[zone_id], &expected, 1,
+            memory_order_acq_rel, memory_order_relaxed);
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -259,11 +338,21 @@ void zone_alloc_init(zone_alloc_t *za,
     za->fd             = fd;
     za->zone_size      = zone_size;
     za->zone_write_locks = zone_write_locks;
+
+    /* Per-zone admission-held bits (owned here; only used if admission_enabled). */
+    za->admission_held = calloc(nr_zones, sizeof(_Atomic(uint8_t)));
+    if (!za->admission_held)
+    {
+        perror("zone_alloc_init: admission_held");
+        exit(EXIT_FAILURE);
+    }
 }
 
 void zone_alloc_destroy(zone_alloc_t *za)
 {
     pthread_mutex_destroy(&za->lifecycle_lock);
+    free(za->admission_held);
+    za->admission_held = NULL;
     /* zone arrays are owned by ztree_t; we must not free them here */
 }
 
@@ -289,7 +378,9 @@ void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id)
             && pre_nz > 0
             && pre_check.cond == ZBD_ZONE_COND_FULL)
         {
-            /* Already FULL — skip to avoid double-growing. */
+            /* Already FULL on the device (another thread finished it, or a
+             * natural fill).  Release our held slot, then skip the regrow. */
+            zone_admission_release_zone(za, zone_id);
             pthread_mutex_unlock(&za->lifecycle_lock);
             return;
         }
@@ -300,6 +391,8 @@ void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id)
     zbd_finish_zones(za->fd,
                      (off_t)za->zones[zone_id].start,
                      (off_t)za->zone_size);
+    /* Finish-then-release: the device freed the slot, so drop ours now. */
+    zone_admission_release_zone(za, zone_id);
 
     /* Grow by 1 only if writable zones < init_count (caps OPEN zones).
      * New zone is implicitly opened by its first pwrite. */

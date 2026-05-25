@@ -192,7 +192,8 @@ static void *dynamic_zns_gc_thread(void *arg)
 /* Dynamic variant uses CNS via an F2FS sparse file (so that
  * cns_physical_bytes() can read st_blocks and GC can punch holes).
  * F2FS mount must exist at /mnt/cns. */
-#define CTREE_CNS_FILE_PATH    "/mnt/cns/nodes.dat"
+#define CTREE_CNS_DIR          "/mnt/cns"
+#define CTREE_CNS_FILE_FMT     "/mnt/cns/nodes.%d.dat"
 
 /* In the dynamic variant internals live on CNS so the legacy IZ pool
  * range [2,50) is dormant — LLayer actually starts at zone 2.
@@ -210,9 +211,13 @@ static void *dynamic_zns_gc_thread(void *arg)
 static inline size_t cns_physical_bytes(ztree_t *t)
 {
     if (t->cns_fd < 0) return 0;
-    struct stat st;
-    if (fstat(t->cns_fd, &st) != 0) return 0;
-    return (size_t)st.st_blocks * 512;
+    size_t bytes = 0;
+    for (int k = 0; k < CTREE_CNS_SHARDS; k++) {
+        struct stat st;
+        if (t->cns_fd_shard[k] >= 0 && fstat(t->cns_fd_shard[k], &st) == 0)
+            bytes += (size_t)st.st_blocks * 512;
+    }
+    return bytes;
 }
 
 /* F2FS-level used ratio (this file + everything else under the mount).
@@ -220,7 +225,7 @@ static inline size_t cns_physical_bytes(ztree_t *t)
 static double cns_used_ratio(void)
 {
     struct statvfs vfs;
-    if (statvfs(CTREE_CNS_FILE_PATH, &vfs) != 0) return 0.0;
+    if (statvfs(CTREE_CNS_DIR, &vfs) != 0) return 0.0;
     uint64_t total = (uint64_t)vfs.f_blocks * vfs.f_frsize;
     uint64_t avail = (uint64_t)vfs.f_bavail * vfs.f_frsize;
     if (total == 0) return 0.0;
@@ -465,9 +470,15 @@ static inline uint32_t cns_slot_for_node(ztree_node_id_t node_id)
     return (uint32_t)node_id;
 }
 
+/* Sharded CNS: slot_id (== node_id) → shard (slot & N-1), dense offset within. */
 static inline off_t cns_slot_offset(uint32_t slot_id)
 {
-    return (off_t)slot_id * (off_t)ZTREE_PAGE_SIZE;
+    return (off_t)(slot_id / CTREE_CNS_SHARDS) * (off_t)ZTREE_PAGE_SIZE;
+}
+
+static inline int cns_shard_fd(ztree_t *t, uint32_t slot_id)
+{
+    return t->cns_fd_shard[slot_id & (CTREE_CNS_SHARDS - 1)];
 }
 
 /* CNS cache tag: bit 63 set + slot_id keeps CNS pages disjoint from ZNS pgnum. */
@@ -757,13 +768,13 @@ static void load_page_from_cns(ztree_t *t, uint32_t slot_id, ztree_page *dst)
     if (g_cns_odirect)
     {
         _Alignas(ZTREE_PAGE_SIZE) char raw[ZTREE_PAGE_SIZE];
-        n = pread(t->cns_fd, raw, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+        n = pread(cns_shard_fd(t, slot_id), raw, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
         if (n == (ssize_t)ZTREE_PAGE_SIZE)
             memcpy(dst, raw, ZTREE_PAGE_SIZE);
     }
     else
     {
-        n = pread(t->cns_fd, dst, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+        n = pread(cns_shard_fd(t, slot_id), dst, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
     }
     if (n != (ssize_t)ZTREE_PAGE_SIZE)
     {
@@ -1172,11 +1183,11 @@ static void flush_page_immediate(ztree_t *t,
         {
             _Alignas(ZTREE_PAGE_SIZE) char bounce[ZTREE_PAGE_SIZE];
             memcpy(bounce, pg, ZTREE_PAGE_SIZE);
-            pwr = pwrite(t->cns_fd, bounce, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+            pwr = pwrite(cns_shard_fd(t, slot_id), bounce, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
         }
         else
         {
-            pwr = pwrite(t->cns_fd, pg, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+            pwr = pwrite(cns_shard_fd(t, slot_id), pg, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
         }
         if (pwr != (ssize_t)ZTREE_PAGE_SIZE)
         {
@@ -1509,7 +1520,7 @@ retry_flush:
     if (!sticky_ok)
     {
         cns_path = true;
-        cur_wp = (uint64_t)pg->node_id * ZTREE_PAGE_SIZE;
+        cur_wp = (uint64_t)cns_slot_offset(pg->node_id);
         target_zone = CTREE_CNS_ZONE_ID;
         zones_busy_sample(t);
         if (prev_zone == CTREE_CNS_ZONE_ID)
@@ -1541,7 +1552,7 @@ retry_flush:
     if (cns_path)
     {
         memcpy(local_bounce, pg, ZTREE_PAGE_SIZE);
-        wfd = t->cns_fd;
+        wfd = cns_shard_fd(t, pg->node_id);
         wbuf = local_bounce;
     }
     else if (t->direct_fd >= 0)
@@ -2967,32 +2978,34 @@ cow_tree *cow_open(const char *path)
         g_cns_odirect = (od && atoi(od) != 0) ? 1 : 0;
     }
     int cns_flags = O_RDWR | O_CREAT | (g_cns_odirect ? O_DIRECT : 0);
-    t->cns_fd = open(CTREE_CNS_FILE_PATH, cns_flags, 0644);
+    for (int k = 0; k < CTREE_CNS_SHARDS; k++)
+    {
+        char path_k[256];
+        snprintf(path_k, sizeof path_k, CTREE_CNS_FILE_FMT, k);
+        int fd = open(path_k, cns_flags, 0644);
+        if (fd < 0)
+        {
+            fprintf(stderr,
+                    "[ctree_dynamic] FATAL: cannot open CNS file %s: %s\n"
+                    "  Ensure F2FS is mounted on %s:\n"
+                    "    sudo mkfs.f2fs -f /dev/nvme3n1 && sudo mount -t f2fs /dev/nvme3n1 %s\n",
+                    path_k, strerror(errno), CTREE_CNS_DIR, CTREE_CNS_DIR);
+            for (int j = 0; j < k; j++) close(t->cns_fd_shard[j]);
+            if (t->direct_fd >= 0) close(t->direct_fd);
+            zbd_close(t->fd);
+            free(t);
+            exit(EXIT_FAILURE);
+        }
+        if (ftruncate(fd, 0) != 0)
+            fprintf(stderr, "[ctree_dynamic] WARNING: ftruncate(0) on %s: %s\n",
+                    path_k, strerror(errno));
+        t->cns_fd_shard[k] = fd;
+    }
+    t->cns_fd = t->cns_fd_shard[0];  /* alias for validity checks */
     fprintf(stderr,
-            "[ctree_dynamic] CNS mode: %s  (file %s)\n",
+            "[ctree_dynamic] CNS mode: %s  (%d shards in %s)\n",
             g_cns_odirect ? "O_DIRECT (page cache bypassed)" : "buffered I/O",
-            CTREE_CNS_FILE_PATH);
-    if (t->cns_fd < 0)
-    {
-        fprintf(stderr,
-                "[ctree_dynamic] FATAL: cannot open CNS file %s: %s\n"
-                "  Ensure F2FS is mounted on /mnt/cns:\n"
-                "    sudo mkfs.f2fs -f /dev/nvme3n1 && sudo mount -t f2fs /dev/nvme3n1 /mnt/cns\n",
-                CTREE_CNS_FILE_PATH, strerror(errno));
-        if (t->direct_fd >= 0)
-            close(t->direct_fd);
-        zbd_close(t->fd);
-        free(t);
-        exit(EXIT_FAILURE);
-    }
-    /* Truncate to 0 for a clean baseline — physical size starts at 0 and
-     * grows as writes land.  Sparse holes between writes count as 0 bytes. */
-    if (ftruncate(t->cns_fd, 0) != 0)
-    {
-        fprintf(stderr,
-                "[ctree_dynamic] WARNING: ftruncate(0) on CNS file failed: %s\n",
-                strerror(errno));
-    }
+            CTREE_CNS_SHARDS, CTREE_CNS_DIR);
 
     /* No CNS bitmap in this variant — location is determined by pg->is_leaf. */
     /* Allocate cns_bitmap so leaf-spill can track which leaves currently
@@ -3209,7 +3222,7 @@ cow_tree *cow_open(const char *path)
 
     fprintf(stderr,
             "[ctree_dynamic] internal nodes → CNS %s (slot = node_id)\n",
-            CTREE_CNS_FILE_PATH);
+            CTREE_CNS_DIR);
     fprintf(stderr,
             "[ctree_dynamic] LLayer hot-pool [%u, %u)  init_group=%u"
             "  cold-pool [%u, %u)  init_group=%u\n",
@@ -3643,44 +3656,53 @@ struct dyn_gc_arg {
     size_t    punched_internal_caught;
 };
 
+/* Punch a run of same-shard node_ids [start..end] (step N → contiguous offsets). */
+static inline void gc_punch_run(cow_tree *t, struct dyn_gc_arg *a,
+                                uint32_t start, uint32_t end)
+{
+    uint32_t pages = ((end - start) / CTREE_CNS_SHARDS) + 1;
+    if (fallocate(cns_shard_fd(t, start),
+                  FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                  cns_slot_offset(start), (off_t)pages * ZTREE_PAGE_SIZE) == 0)
+        a->total_punched_pages += pages;
+}
+
 static void *dyn_gc_worker(void *p)
 {
     struct dyn_gc_arg *a = p;
     cow_tree *t = a->t;
-    uint32_t punch_start = 0;
-    int punch_active = 0;
+    uint32_t run_start[CTREE_CNS_SHARDS], run_end[CTREE_CNS_SHARDS];
+    int      run_active[CTREE_CNS_SHARDS] = {0};
 
-    /* nid==nid_end is sentinel: flush accumulated run at chunk boundary. */
-    for (uint32_t nid = a->nid_start; nid <= a->nid_end; nid++)
+    for (uint32_t nid = a->nid_start; nid < a->nid_end; nid++)
     {
+        int k = nid & (CTREE_CNS_SHARDS - 1);
         int slot_punchable = 0;
-        if (nid < a->nid_end && nid < a->max_node && !cns_bitmap_test(t, nid)) {
+        if (nid < a->max_node && !cns_bitmap_test(t, nid)) {
             nlt_location_t q = { .zone_id = CTREE_CNS_ZONE_ID,
                                  .node_id = nid,
                                  .slot_id = ZTREE_INVALID_SLOT_ID };
             nlt_location_t r;
-            if (nlt_lookup(&t->nlt, &q, &r)
-                && r.zone_id == CTREE_CNS_ZONE_ID) {
+            if (nlt_lookup(&t->nlt, &q, &r) && r.zone_id == CTREE_CNS_ZONE_ID)
                 a->punched_internal_caught++;
-            } else {
+            else
                 slot_punchable = 1;
-            }
         }
         if (slot_punchable) {
-            if (!punch_active) { punch_start = nid; punch_active = 1; }
-        } else if (punch_active) {
-            uint32_t run_len = nid - punch_start;
-            if (run_len > 0) {
-                off_t off = (off_t)punch_start * ZTREE_PAGE_SIZE;
-                off_t len = (off_t)run_len * ZTREE_PAGE_SIZE;
-                if (fallocate(t->cns_fd,
-                              FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
-                              off, len) == 0)
-                    a->total_punched_pages += run_len;
+            if (run_active[k] && nid == run_end[k] + CTREE_CNS_SHARDS) {
+                run_end[k] = nid;
+            } else {
+                if (run_active[k]) gc_punch_run(t, a, run_start[k], run_end[k]);
+                run_start[k] = run_end[k] = nid;
+                run_active[k] = 1;
             }
-            punch_active = 0;
+        } else if (run_active[k]) {
+            gc_punch_run(t, a, run_start[k], run_end[k]);
+            run_active[k] = 0;
         }
     }
+    for (int k = 0; k < CTREE_CNS_SHARDS; k++)
+        if (run_active[k]) gc_punch_run(t, a, run_start[k], run_end[k]);
     return NULL;
 }
 
@@ -4178,8 +4200,9 @@ void cow_close(cow_tree *t)
     zbd_close(t->fd);
     if (t->direct_fd >= 0)
         close(t->direct_fd);
-    if (t->cns_fd >= 0)
-        close(t->cns_fd);
+    for (int k = 0; k < CTREE_CNS_SHARDS; k++)
+        if (t->cns_fd_shard[k] >= 0)
+            close(t->cns_fd_shard[k]);
     if (t->trace_fp)
         fclose(t->trace_fp);
 

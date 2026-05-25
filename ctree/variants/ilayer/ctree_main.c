@@ -44,7 +44,8 @@
 
 /* CNS lives on an F2FS sparse file: slot=node_id offsets are sparse, so
  * physical use = live internal pages only (not bounded by raw device size). */
-#define CTREE_CNS_FILE_PATH "/mnt/cns/nodes.dat"
+#define CTREE_CNS_DIR       "/mnt/cns"
+#define CTREE_CNS_FILE_FMT  "/mnt/cns/nodes.%d.dat"
 
 /* CNS I/O mode toggle (env var CNS_ODIRECT=1 to enable). */
 static int g_cns_odirect = 0;
@@ -159,9 +160,15 @@ static inline uint32_t cns_slot_for_node(ztree_node_id_t node_id)
     return (uint32_t)node_id;
 }
 
+/* Sharded CNS: slot_id (== node_id) → shard (slot & N-1), dense offset within. */
 static inline off_t cns_slot_offset(uint32_t slot_id)
 {
-    return (off_t)slot_id * (off_t)ZTREE_PAGE_SIZE;
+    return (off_t)(slot_id / CTREE_CNS_SHARDS) * (off_t)ZTREE_PAGE_SIZE;
+}
+
+static inline int cns_shard_fd(ztree_t *t, uint32_t slot_id)
+{
+    return t->cns_fd_shard[slot_id & (CTREE_CNS_SHARDS - 1)];
 }
 
 /* CNS cache tag: bit 63 set + slot_id keeps CNS pages disjoint from ZNS pgnum. */
@@ -448,13 +455,13 @@ static void load_page_from_cns(ztree_t *t, uint32_t slot_id, ztree_page *dst)
     if (g_cns_odirect)
     {
         _Alignas(ZTREE_PAGE_SIZE) char raw[ZTREE_PAGE_SIZE];
-        n = pread(t->cns_fd, raw, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+        n = pread(cns_shard_fd(t, slot_id), raw, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
         if (n == (ssize_t)ZTREE_PAGE_SIZE)
             memcpy(dst, raw, ZTREE_PAGE_SIZE);
     }
     else
     {
-        n = pread(t->cns_fd, dst, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+        n = pread(cns_shard_fd(t, slot_id), dst, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
     }
     if (n != (ssize_t)ZTREE_PAGE_SIZE)
     {
@@ -863,11 +870,11 @@ static void flush_page_immediate(ztree_t *t,
         {
             _Alignas(ZTREE_PAGE_SIZE) char bounce[ZTREE_PAGE_SIZE];
             memcpy(bounce, pg, ZTREE_PAGE_SIZE);
-            pwr = pwrite(t->cns_fd, bounce, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+            pwr = pwrite(cns_shard_fd(t, slot_id), bounce, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
         }
         else
         {
-            pwr = pwrite(t->cns_fd, pg, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
+            pwr = pwrite(cns_shard_fd(t, slot_id), pg, ZTREE_PAGE_SIZE, cns_slot_offset(slot_id));
         }
         if (pwr != (ssize_t)ZTREE_PAGE_SIZE)
         {
@@ -2293,30 +2300,34 @@ cow_tree *cow_open(const char *path)
         g_cns_odirect = (od && atoi(od) != 0) ? 1 : 0;
     }
     int cns_flags = O_RDWR | O_CREAT | (g_cns_odirect ? O_DIRECT : 0);
-    t->cns_fd = open(CTREE_CNS_FILE_PATH, cns_flags, 0644);
+    for (int k = 0; k < CTREE_CNS_SHARDS; k++)
+    {
+        char path_k[256];
+        snprintf(path_k, sizeof path_k, CTREE_CNS_FILE_FMT, k);
+        int fd = open(path_k, cns_flags, 0644);
+        if (fd < 0)
+        {
+            fprintf(stderr,
+                    "[ctree_ilayer] FATAL: cannot open CNS file %s: %s\n"
+                    "  Ensure F2FS is mounted on %s:\n"
+                    "    sudo mkfs.f2fs -f /dev/nvme3n1 && sudo mount -t f2fs /dev/nvme3n1 %s\n",
+                    path_k, strerror(errno), CTREE_CNS_DIR, CTREE_CNS_DIR);
+            for (int j = 0; j < k; j++) close(t->cns_fd_shard[j]);
+            if (t->direct_fd >= 0) close(t->direct_fd);
+            zbd_close(t->fd);
+            free(t);
+            exit(EXIT_FAILURE);
+        }
+        if (ftruncate(fd, 0) != 0)
+            fprintf(stderr, "[ctree_ilayer] WARNING: ftruncate(0) on %s: %s\n",
+                    path_k, strerror(errno));
+        t->cns_fd_shard[k] = fd;
+    }
+    t->cns_fd = t->cns_fd_shard[0];  /* alias for validity checks */
     fprintf(stderr,
-            "[ctree_ilayer] CNS mode: %s  (file %s)\n",
+            "[ctree_ilayer] CNS mode: %s  (%d shards in %s)\n",
             g_cns_odirect ? "O_DIRECT (page cache bypassed)" : "buffered I/O",
-            CTREE_CNS_FILE_PATH);
-    if (t->cns_fd < 0)
-    {
-        fprintf(stderr,
-                "[ctree_ilayer] FATAL: cannot open CNS file %s: %s\n"
-                "  Ensure F2FS is mounted on /mnt/cns:\n"
-                "    sudo mkfs.f2fs -f /dev/nvme3n1 && sudo mount -t f2fs /dev/nvme3n1 /mnt/cns\n",
-                CTREE_CNS_FILE_PATH, strerror(errno));
-        if (t->direct_fd >= 0)
-            close(t->direct_fd);
-        zbd_close(t->fd);
-        free(t);
-        exit(EXIT_FAILURE);
-    }
-    if (ftruncate(t->cns_fd, 0) != 0)
-    {
-        fprintf(stderr,
-                "[ctree_ilayer] WARNING: ftruncate(0) on CNS file failed: %s\n",
-                strerror(errno));
-    }
+            CTREE_CNS_SHARDS, CTREE_CNS_DIR);
 
     /* No CNS bitmap in this variant — location is determined by pg->is_leaf. */
     t->cns_bitmap = NULL;
@@ -2676,8 +2687,9 @@ void cow_close(cow_tree *t)
     zbd_close(t->fd);
     if (t->direct_fd >= 0)
         close(t->direct_fd);
-    if (t->cns_fd >= 0)
-        close(t->cns_fd);
+    for (int k = 0; k < CTREE_CNS_SHARDS; k++)
+        if (t->cns_fd_shard[k] >= 0)
+            close(t->cns_fd_shard[k]);
     if (t->trace_fp)
         fclose(t->trace_fp);
 

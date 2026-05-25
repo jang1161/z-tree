@@ -16,6 +16,7 @@
 #define ZTREE_MAX_BATCH_PAGES      2048
 #define ZTREE_MAX_NVME_PAGES         64
 #define ZTREE_NODE_LATCH_BUCKETS  65536
+#define CTREE_CNS_SHARDS             64   /* dynamic: CNS file shards (inode-lock split) */
 
 struct ztree_s {
     /* ZNS device */
@@ -35,6 +36,7 @@ struct ztree_s {
 
     /* ── CNS fallback ──────────────────────────────────────────────────── */
     int              cns_fd;          /* fd for /dev/nvme3n1 (O_RDWR|O_DIRECT) */
+    int              cns_fd_shard[CTREE_CNS_SHARDS]; /* dynamic: sharded CNS fds */
     _Atomic(uint8_t) *cns_bitmap;    /* 1 bit per node_id: 1=on CNS, 0=on ZNS */
     uint32_t          cns_bitmap_bytes;
     _Atomic(uint32_t) cns_zones_busy;        /* current # of zone locks held */

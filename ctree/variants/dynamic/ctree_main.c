@@ -68,6 +68,13 @@ static unsigned         g_zns_gc_interval_ms = 0;
 static double           g_cns_hwm_ratio   = 0.0;
 static unsigned         g_cns_hwm_poll_ms = 200;
 
+/* Config-3 experiment: once CNS usage reaches g_cns_freeze_pct, stop spilling
+ * leaves to CNS (force them to ZNS, blocking) and run NO CNS GC; internal
+ * nodes still go to CNS.  env CTREE_DYNAMIC_CNS_FREEZE_PCT (0 = off).  One-way:
+ * with GC off CNS never drops, so g_leaf_cns_frozen stays set once tripped. */
+static double           g_cns_freeze_pct  = 0.0;
+static _Atomic bool     g_leaf_cns_frozen = false;
+
 static double cns_used_ratio(void);
 
 /* Periodic trigger (g_gc_interval_ms) + HWM trigger (g_cns_hwm_ratio).
@@ -102,6 +109,26 @@ static void *dynamic_gc_thread(void *arg)
         if (atomic_load_explicit(&g_gc_stop, memory_order_acquire))
             break;
         elapsed_periodic += slept;
+
+        /* Config-3 freeze mode: monitor CNS, trip the leaf-spill freeze, and
+         * never run CNS GC.  Once frozen we still poll (cheap) but stay set. */
+        if (g_cns_freeze_pct > 0.0)
+        {
+            if (!atomic_load_explicit(&g_leaf_cns_frozen, memory_order_acquire))
+            {
+                double r = cns_used_ratio();
+                if (r * 100.0 >= g_cns_freeze_pct)
+                {
+                    atomic_store_explicit(&g_leaf_cns_frozen, true,
+                                          memory_order_release);
+                    fprintf(stderr,
+                            "[ctree_dynamic] leaf CNS fallback FROZEN at %.1f%% "
+                            "(>= %.1f%%): leaves -> ZNS only, CNS GC off\n",
+                            r * 100.0, g_cns_freeze_pct);
+                }
+            }
+            continue;
+        }
 
         const char *reason = NULL;
         double ratio = 0.0;
@@ -1408,6 +1435,74 @@ retry_flush:
             }
         }
         }  /* end if (target_zone != INVALID) */
+    }
+
+    /* Step 2b: CNS-freeze mode (config 3) — leaves never spill to CNS.  Block
+     * on a ZNS zone until one accepts the page.  Deadlock-safe: foreground and
+     * ZNS-GC both take node-latch before zone-lock, and evict runs only under
+     * the insert-pause wrlock, so no thread ever holds a zone lock while
+     * waiting on this leaf's node latch.  Internal nodes are unaffected (they
+     * took the CNS path earlier), so only leaf placement changes. */
+    if (!sticky_ok && !cns_path
+        && atomic_load_explicit(&g_leaf_cns_frozen, memory_order_acquire))
+    {
+        long freeze_spins = 0;
+        while (!sticky_ok)
+        {
+            target_zone = zone_alloc_llayer(&t->za, pg->node_id, avoid_zone);
+            if (target_zone == ZTREE_INVALID_ZONE_ID)
+            {
+                /* All leaf zones at the active-zone cap — wait for a seal. */
+                if (++freeze_spins > 5000000)
+                {
+                    fprintf(stderr,
+                            "flush_page_immediate(leaf): frozen ZNS placement "
+                            "stuck (node_id=%llu) — no zone freed\n",
+                            (unsigned long long)pg->node_id);
+                    exit(EXIT_FAILURE);
+                }
+                usleep(20);
+                continue;
+            }
+            pg->zone_id = target_zone;
+            pthread_mutex_lock(&t->zone_write_locks[target_zone]);
+            uint64_t lock_t1 = monotonic_ns();
+            record_zwl_wait(t, target_zone, 0);
+            zones_busy_inc(t);
+            zwl_hold_start = lock_t1;
+
+            uint64_t zone_end = t->zones[target_zone].start
+                                + t->zones[target_zone].capacity;
+            uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target_zone],
+                                               memory_order_relaxed);
+            if (!atomic_load_explicit(&t->zone_full[target_zone],
+                                      memory_order_acquire)
+                && wp + ZTREE_PAGE_SIZE <= zone_end
+                && (wp != t->zones[target_zone].start
+                    || zone_admission_acquire(&t->za, target_zone)))
+            {
+                cur_wp = wp;
+                atomic_store_explicit(&t->zone_wp_bytes[target_zone],
+                                      wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
+                sticky_ok = true;
+                break;
+            }
+
+            /* No space / full / at cap — seal if full, drop lock, retry. */
+            bool no_space = (wp + ZTREE_PAGE_SIZE > zone_end);
+            record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
+            zones_busy_dec(t);
+            pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+            if (no_space)
+            {
+                zone_mark_full(&t->za, target_zone);
+                zone_seal_and_replace(&t->za, target_zone);
+            }
+            else
+            {
+                usleep(5);  /* at cap — let a sealer make room */
+            }
+        }
     }
 
     /* Step 3: CNS spill (every trylock above failed). */
@@ -3170,7 +3265,19 @@ cow_tree *cow_open(const char *path)
         if (ms < 50) ms = 50;
         g_cns_hwm_poll_ms = (unsigned)ms;
     }
-    if (g_gc_interval_ms > 0 || g_cns_hwm_ratio > 0.0)
+    {
+        const char *env = getenv("CTREE_DYNAMIC_CNS_FREEZE_PCT");
+        double p = env ? atof(env) : 0.0;
+        if (p < 0.0 || p > 100.0) p = 0.0;
+        g_cns_freeze_pct = p;
+        /* Freeze implies no CNS GC: silence the HWM/periodic triggers. */
+        if (g_cns_freeze_pct > 0.0)
+        {
+            g_cns_hwm_ratio  = 0.0;
+            g_gc_interval_ms = 0;
+        }
+    }
+    if (g_gc_interval_ms > 0 || g_cns_hwm_ratio > 0.0 || g_cns_freeze_pct > 0.0)
     {
         if (!atomic_load_explicit(&g_insert_pause_initialised, memory_order_acquire))
         {
@@ -3194,11 +3301,17 @@ cow_tree *cow_open(const char *path)
         }
         else
         {
-            fprintf(stderr,
-                    "[ctree_dynamic] CNS GC thread enabled: periodic=%ums  hwm=%.1f%% (poll %ums)\n",
-                    g_gc_interval_ms,
-                    g_cns_hwm_ratio * 100.0,
-                    g_cns_hwm_poll_ms);
+            if (g_cns_freeze_pct > 0.0)
+                fprintf(stderr,
+                        "[ctree_dynamic] CNS FREEZE mode: leaf spill stops at "
+                        "%.1f%% CNS, no CNS GC (poll %ums)\n",
+                        g_cns_freeze_pct, g_cns_hwm_poll_ms);
+            else
+                fprintf(stderr,
+                        "[ctree_dynamic] CNS GC thread enabled: periodic=%ums  hwm=%.1f%% (poll %ums)\n",
+                        g_gc_interval_ms,
+                        g_cns_hwm_ratio * 100.0,
+                        g_cns_hwm_poll_ms);
         }
     }
     else

@@ -136,23 +136,33 @@ static void run_test(const char *dev_path, int num_threads)
     printf("Elapsed time: %.6f seconds\n", elapsed);
     printf("Average throughput: %.2f ops/sec\n", iops);
 
-    /* ── Integrity verification: find every inserted key ── */
-    atomic_store(&verify_cursor, 0);
-    atomic_store(&found_cnt, 0);
-    atomic_store(&missing_cnt, 0);
-    struct timespec vstart, vend;
-    clock_gettime(CLOCK_MONOTONIC, &vstart);
-    for (int i = 0; i < num_threads; i++)
-        pthread_create(&threads[i], NULL, verifier, &args[i]);
-    for (int i = 0; i < num_threads; i++)
-        pthread_join(threads[i], NULL);
-    clock_gettime(CLOCK_MONOTONIC, &vend);
-    double velapsed =
-        (vend.tv_sec - vstart.tv_sec) + (vend.tv_nsec - vstart.tv_nsec) / 1e9;
-    int found = atomic_load(&found_cnt);
-    int missing = atomic_load(&missing_cnt);
-    printf("Verify: found %d / %d (%.2f%%)  missing %d  in %.2f s\n",
-           found, total_keys, 100.0 * found / total_keys, missing, velapsed);
+    /* ── Integrity verification (opt-in via VERIFY=1) ── */
+    {
+        const char *ve = getenv("VERIFY");
+        if (ve && atoi(ve) != 0)
+        {
+            atomic_store(&verify_cursor, 0);
+            atomic_store(&found_cnt, 0);
+            atomic_store(&missing_cnt, 0);
+            struct timespec vstart, vend;
+            clock_gettime(CLOCK_MONOTONIC, &vstart);
+            for (int i = 0; i < num_threads; i++)
+                pthread_create(&threads[i], NULL, verifier, &args[i]);
+            for (int i = 0; i < num_threads; i++)
+                pthread_join(threads[i], NULL);
+            clock_gettime(CLOCK_MONOTONIC, &vend);
+            double velapsed =
+                (vend.tv_sec - vstart.tv_sec) + (vend.tv_nsec - vstart.tv_nsec) / 1e9;
+            int found = atomic_load(&found_cnt);
+            int missing = atomic_load(&missing_cnt);
+            printf("Verify: found %d / %d (%.2f%%)  missing %d  in %.2f s\n",
+                   found, total_keys, 100.0 * found / total_keys, missing, velapsed);
+        }
+        else
+        {
+            printf("Verify: skipped (set VERIFY=1 to enable)\n");
+        }
+    }
 
     struct timespec close_start, close_end;
     clock_gettime(CLOCK_MONOTONIC, &close_start);

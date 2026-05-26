@@ -860,6 +860,16 @@ retry_flush:
                 continue;
             }
 
+            /* First write opens a device-active zone; wait if at cap. */
+            if (wp == zone_start
+                && !zone_admission_acquire(&t->za, target_zone))
+            {
+                record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
+                pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
+                usleep(20);
+                continue;
+            }
+
             cur_wp = wp;
             atomic_store_explicit(&t->zone_wp_bytes[target_zone],
                                    wp + ZTREE_PAGE_SIZE, memory_order_relaxed);
@@ -914,9 +924,28 @@ retry_flush:
         int e = errno;
         if (e == EOVERFLOW)
         {
-            /* EOVERFLOW: too many active zones — undo, sleep, retry. */
-            atomic_fetch_sub_explicit(&t->zone_wp_bytes[target_zone],
-                                      ZTREE_PAGE_SIZE, memory_order_relaxed);
+            /* Re-sync WP from device; if FULL, seal + release the slot. */
+            struct zbd_zone zinfo;
+            unsigned int nz = 1;
+            if (zbd_report_zones(t->fd,
+                                 (off_t)t->zones[target_zone].start,
+                                 (off_t)t->info.zone_size,
+                                 ZBD_RO_ALL, &zinfo, &nz) == 0 && nz > 0)
+            {
+                atomic_store_explicit(&t->zone_wp_bytes[target_zone],
+                                      (uint64_t)zinfo.wp, memory_order_release);
+                if (zinfo.cond == ZBD_ZONE_COND_FULL)
+                {
+                    atomic_store_explicit(&t->zone_full[target_zone], 1,
+                                          memory_order_release);
+                    zone_admission_release_zone(&t->za, target_zone);
+                }
+            }
+            else
+            {
+                atomic_fetch_sub_explicit(&t->zone_wp_bytes[target_zone],
+                                          ZTREE_PAGE_SIZE, memory_order_relaxed);
+            }
             record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
             pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
             usleep(500);
@@ -2453,6 +2482,11 @@ cow_tree *cow_open(const char *path)
                     t->zone_full, t->zone_wp_bytes, t->zones, t->info.nr_zones,
                     t->fd, (uint64_t)t->info.zone_size,
                     t->zone_write_locks);
+
+    /* Active-zone admission (finish-then-release); leaf blocks at cap. */
+    t->za.admission_enabled = 1;
+    t->za.active_cap = 13;
+    atomic_store_explicit(&t->za.active_zones, 0, memory_order_relaxed);
 
     fprintf(stderr,
             "[ztree] ILayer pool [%u, %u)  init_group=%u\n",

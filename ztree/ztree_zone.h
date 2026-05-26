@@ -81,6 +81,12 @@ typedef struct {
 
     /* Serialises zone seal → finish → grow transitions. */
     pthread_mutex_t    lifecycle_lock;
+
+    /* Active-zone admission (finish-then-release); leaf blocks at cap. */
+    _Atomic(uint32_t) active_zones;
+    uint32_t          active_cap;
+    int               admission_enabled;
+    _Atomic(uint8_t) *admission_held;
 } zone_alloc_t;
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -119,6 +125,10 @@ uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
  * Call AFTER zone_full is set and zone_write_lock is released.
  * Takes lifecycle_lock; at most one transition in flight at a time. */
 void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id);
+
+/* Admission control (no-op unless admission_enabled). */
+int  zone_admission_acquire(zone_alloc_t *za, uint32_t zone_id);
+void zone_admission_release_zone(zone_alloc_t *za, uint32_t zone_id);
 
 /* zone_heat_record_write  –  increment counter + update timestamp after page append. */
 void zone_heat_record_write(zone_alloc_t *za, ztree_node_id_t node_id);

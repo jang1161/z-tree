@@ -35,7 +35,7 @@
 #define ZTREE_ILAYER_INIT_COUNT    3U   /* initial IZGroup size (paper: 4)  */
 #define ZTREE_LLAYER_ZONE_START  130U   /* first zone of LLayer pool        */
 #define ZTREE_LZGROUP_INIT_SIZE   10U   /* initial LZGroup total size       */
-#define ZTREE_LZGROUP_HOT_INIT     7U   /* initial hot  zones (paper: 6)    */
+#define ZTREE_LZGROUP_HOT_INIT     8U   /* initial hot  zones (paper: 6)    */
 #define ZTREE_LZGROUP_COLD_INIT    2U   /* initial cold zones (paper: 2)    */
 
 /* Magic numbers for on-disk structures */

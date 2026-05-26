@@ -120,6 +120,7 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                     zbd_finish_zones(za->fd,
                                      (off_t)za->zones[zid].start,
                                      (off_t)za->zone_size);
+                    zone_admission_release_zone(za, zid);
                     if (za->zone_write_locks)
                         pthread_mutex_unlock(&za->zone_write_locks[zid]);
                 }
@@ -218,12 +219,68 @@ void zone_alloc_init(zone_alloc_t *za,
     za->fd             = fd;
     za->zone_size      = zone_size;
     za->zone_write_locks = zone_write_locks;
+
+    za->admission_held = calloc(nr_zones, sizeof(_Atomic(uint8_t)));
+    if (!za->admission_held)
+    {
+        perror("zone_alloc_init: admission_held");
+        exit(EXIT_FAILURE);
+    }
 }
 
 void zone_alloc_destroy(zone_alloc_t *za)
 {
     pthread_mutex_destroy(&za->lifecycle_lock);
+    free(za->admission_held);
+    za->admission_held = NULL;
     /* zone arrays are owned by ztree_t; we must not free them here */
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Active-zone admission (finish-then-release).  Per-zone held bit gives
+ * exactly-once release; release fires only after the device finish completes
+ * so our active_zones count never under-estimates the device's active count.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+static int admission_try(zone_alloc_t *za)
+{
+    if (!za->admission_enabled) return 1;
+    uint32_t cur = atomic_load_explicit(&za->active_zones, memory_order_acquire);
+    for (;;) {
+        if (cur >= za->active_cap) return 0;
+        if (atomic_compare_exchange_weak_explicit(&za->active_zones, &cur, cur + 1,
+                memory_order_acq_rel, memory_order_acquire))
+            return 1;
+    }
+}
+
+static void admission_release(zone_alloc_t *za)
+{
+    if (!za->admission_enabled) return;
+    uint32_t cur = atomic_load_explicit(&za->active_zones, memory_order_acquire);
+    while (cur > 0 &&
+           !atomic_compare_exchange_weak_explicit(&za->active_zones, &cur, cur - 1,
+               memory_order_acq_rel, memory_order_acquire))
+        ;
+}
+
+int zone_admission_acquire(zone_alloc_t *za, uint32_t zone_id)
+{
+    if (!za->admission_enabled) return 1;
+    if (atomic_load_explicit(&za->admission_held[zone_id], memory_order_acquire))
+        return 1;
+    if (!admission_try(za)) return 0;
+    atomic_store_explicit(&za->admission_held[zone_id], 1, memory_order_release);
+    return 1;
+}
+
+void zone_admission_release_zone(zone_alloc_t *za, uint32_t zone_id)
+{
+    if (!za->admission_enabled) return;
+    uint8_t held = 1;
+    if (atomic_compare_exchange_strong_explicit(&za->admission_held[zone_id],
+            &held, 0, memory_order_acq_rel, memory_order_relaxed))
+        admission_release(za);
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -248,7 +305,8 @@ void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id)
             && pre_nz > 0
             && pre_check.cond == ZBD_ZONE_COND_FULL)
         {
-            /* Already FULL — skip to avoid double-growing. */
+            /* Already FULL — skip to avoid double-growing, but release slot. */
+            zone_admission_release_zone(za, zone_id);
             pthread_mutex_unlock(&za->lifecycle_lock);
             return;
         }
@@ -259,6 +317,8 @@ void zone_seal_and_replace(zone_alloc_t *za, uint32_t zone_id)
     zbd_finish_zones(za->fd,
                      (off_t)za->zones[zone_id].start,
                      (off_t)za->zone_size);
+    /* Finish-then-release: device freed the slot, drop ours. */
+    zone_admission_release_zone(za, zone_id);
 
     /* Grow by 1 only if writable zones < init_count (caps OPEN zones).
      * New zone is implicitly opened by its first pwrite. */

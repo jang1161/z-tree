@@ -1,32 +1,77 @@
 #!/usr/bin/env bash
-# Sawtooth experiment: load → A → C → D → G(delete), with cow_evict_cns_leaves
-# + cow_gc_cns between each phase.  Uses the modified `ycsb_ctree -chain ...`
-# binary built against the `dynamic` ctree variant.
+# Usage: scripts/run_ycsb_dynamic.sh <variant> <records> <opcount> <threads>
+#   variant : dynamic | ilayer | ztree
+# Env:
+#   CNS_ODIRECT=1   bypass CNS page cache  (dynamic/ilayer only; ztree ignores)
+#   RUN_TAG=...     override the timestamp suffix in the output filename
 #
-# Usage:
-#   scripts/run_ycsb_dynamic.sh [recordcount] [operationcount] [threads]
-# Defaults: 1M records, 200K ops per phase, 64 threads.
+# Runs:  load + workloadA + chain(C,D,G).
+#   - dynamic: CNS sharded + GC envs + trace + plot.
+#   - ilayer : same chain (ilayer has no CNS GC; Maintenance is no-op leaf-wise).
+#   - ztree  : no CNS, no dynamic envs, no trace/plot.
+#
+# Logs:  logs/<variant>_multi-workload/<mode>/...
 
 set -e
 
-RECCOUNT="${1:-1000000}"
-OPCOUNT="${2:-200000}"
-THREADS="${3:-64}"
+VARIANT="${1:?variant required (dynamic|ilayer|ztree)}"
+RECCOUNT="${2:-1000000}"
+OPCOUNT="${3:-200000}"
+THREADS="${4:-64}"
 
-# CNS_ODIRECT=1 to bypass kernel page cache for CNS writes/reads.
-# Default 0 (buffered).  Toggling this is the primary knob for measuring
-# how much of the sawtooth's drop comes from F2FS reclaiming page-cached
-# blocks vs actual on-device physical reclamation.
 CNS_ODIRECT_VAL="${CNS_ODIRECT:-0}"
-MODE_TAG=$([ "$CNS_ODIRECT_VAL" = "1" ] && echo "odirect" || echo "buffered")
+
+case "$VARIANT" in
+  dynamic|ilayer)
+    BIN=ycsb_ctree; DB=ctree
+    PROPS_REL=ctree/ctree.properties
+    DEV_PROP=ctree.device
+    MODE_TAG=$([ "$CNS_ODIRECT_VAL" = "1" ] && echo "odirect" || echo "buffered")
+    USE_CNS=1
+    ;;
+  ztree)
+    BIN=ycsb_ztree; DB=ztree
+    PROPS_REL=ztree/ztree.properties
+    DEV_PROP=ztree.device
+    MODE_TAG=zns
+    USE_CNS=0
+    ;;
+  *)
+    echo "unknown variant: $VARIANT (use dynamic|ilayer|ztree)" >&2
+    exit 1
+    ;;
+esac
+
+USE_TRACE=1  # all variants emit trace now
+ZNS_GC_ON="${CTREE_DYNAMIC_ZNS_GC:-1}"
+ZNS_GC_INT="${CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS:-10000}"
+if [ "$VARIANT" = "dynamic" ]; then
+  DYN_ENVS=(
+    CTREE_DYNAMIC_GC_INTERVAL_MS=0
+    CNS_ODIRECT="$CNS_ODIRECT_VAL"
+    CTREE_DYNAMIC_ZNS_GC="$ZNS_GC_ON"
+    CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS="$ZNS_GC_INT"
+  )
+elif [ "$VARIANT" = "ilayer" ]; then
+  DYN_ENVS=(
+    CNS_ODIRECT="$CNS_ODIRECT_VAL"
+    CTREE_DYNAMIC_ZNS_GC="$ZNS_GC_ON"
+    CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS="$ZNS_GC_INT"
+  )
+else
+  DYN_ENVS=(
+    CTREE_DYNAMIC_ZNS_GC="$ZNS_GC_ON"
+    CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS="$ZNS_GC_INT"
+  )
+fi
 
 ZNS=/dev/nvme3n2
-
-YCSB_DIR="$(cd "$(dirname "$0")/../../YCSB-cpp" && pwd)"
-LOG_DIR="$(cd "$(dirname "$0")/.." && pwd)/logs/dynamic_multi-workload/$MODE_TAG"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+YCSB_DIR="$(cd "$REPO_ROOT/../YCSB-cpp" && pwd)"
+LOG_DIR="$REPO_ROOT/logs/${VARIANT}_multi-workload/$MODE_TAG"
 mkdir -p "$LOG_DIR"
 
-# Compact count formatting: 10000000 → 10M, 500000 → 500K.
 fmt_count() {
   case "$1" in
     *000000) echo "$(($1 / 1000000))M" ;;
@@ -36,68 +81,63 @@ fmt_count() {
 }
 KEYS_TAG=$(fmt_count "$RECCOUNT")
 OPS_TAG=$(fmt_count "$OPCOUNT")
-
-# Timestamp suffix prevents overwriting previous runs.  Set RUN_TAG="latest"
-# (or any fixed string) to keep a stable path that does overwrite.
-# Naming convention: K<keys>_O<ops>_T<threads>_<mode>_<timestamp>
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 RUN_NAME="K${KEYS_TAG}_O${OPS_TAG}_T${THREADS}_${MODE_TAG}_${RUN_TAG}"
 TRACE_CSV="$LOG_DIR/${RUN_NAME}.csv"
 RUN_LOG="$LOG_DIR/${RUN_NAME}.log"
 
-# Wipe disks so we start from a fresh tree.
-echo "[reset] $ZNS  + remount /mnt/cns"
+# ── Ensure the binary is built against the right variant ────────────────
+if [ "$VARIANT" = "dynamic" ] || [ "$VARIANT" = "ilayer" ]; then
+  CTREE_VARIANT_REL="../z-tree/ctree/variants/$VARIANT/ctree_main.c"
+  echo "[build] $BIN  (CTREE_VARIANT=$VARIANT)"
+  ( cd "$YCSB_DIR" && rm -f "$BIN" && \
+    make BIND_CTREE=1 CTREE_VARIANT="$CTREE_VARIANT_REL" -j4 >/dev/null )
+else
+  echo "[build] $BIN  (BIND_ZTREE=1)"
+  ( cd "$YCSB_DIR" && rm -f "$BIN" && make BIND_ZTREE=1 -j4 >/dev/null )
+fi
+
+# ── Reset device(s) ─────────────────────────────────────────────────────
+echo "[reset] $ZNS"
 sudo nvme zns reset-zone -a "$ZNS" >/dev/null
+if [ "$USE_CNS" = "1" ]; then
+  echo "[reset] /mnt/cns/nodes.*.dat"
+  sudo rm -f /mnt/cns/nodes.dat /mnt/cns/nodes.*.dat
+fi
 
-# F2FS sparse file lives at /mnt/cns/nodes.dat — wiping the file is
-# sufficient (no need to mkfs.f2fs each run); ctree_dynamic ftruncates
-# on open if cns_open_flags include O_CREAT|O_TRUNC.
-sudo rm -f /mnt/cns/nodes.dat
-
-echo "[run]   records=$RECCOUNT  ops/phase=$OPCOUNT  threads=$THREADS  mode=$MODE_TAG"
-echo "[trace] $TRACE_CSV"
+echo "[run]   variant=$VARIANT  records=$RECCOUNT  ops/phase=$OPCOUNT  threads=$THREADS  mode=$MODE_TAG"
 echo "[log]   $RUN_LOG"
 
-# Primary phase: load + workload A.  Then chain C, D, G.
-# CTREE_DYNAMIC_GC_INTERVAL_MS=0 disables the background CNS GC thread so
-# the only evict+gc_cns events are the explicit Maintenance() calls
-# between phases.
-# CTREE_DYNAMIC_ZNS_GC=1 (passed through) enables cow_gc_zns.
-# CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS (default 10000) drives the periodic
-# ZNS GC thread.  Set to 0 to disable; otherwise the thread quiesces and
-# runs cow_gc_zns every N ms during the workload.
-sudo CTREE_DYNAMIC_GC_INTERVAL_MS=0 \
-     CNS_ODIRECT="$CNS_ODIRECT_VAL" \
-     CTREE_DYNAMIC_ZNS_GC="${CTREE_DYNAMIC_ZNS_GC:-1}" \
-     CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS="${CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS:-10000}" \
-     CTREE_DYNAMIC_TRACE_PATH="$TRACE_CSV" \
-     "$YCSB_DIR/ycsb_ctree" -load -run \
-  -db ctree \
-  -P "$YCSB_DIR/workloads/workloada" \
-  -P "$YCSB_DIR/ctree/ctree.properties" \
-  -p ctree.device="$ZNS" \
-  -p recordcount="$RECCOUNT" \
-  -p operationcount="$OPCOUNT" \
-  -p chain_opcount="$OPCOUNT" \
-  -p status.interval=10 \
-  -threads "$THREADS" \
-  -chain "$YCSB_DIR/workloads/workloadc,$YCSB_DIR/workloads/workloadd,$YCSB_DIR/workloads/workloadg" \
-  -s 2>&1 | tee "$RUN_LOG"
+RUN_CMD=( "$YCSB_DIR/$BIN" -load -run
+          -db "$DB"
+          -P "$YCSB_DIR/workloads/workloada"
+          -P "$YCSB_DIR/$PROPS_REL"
+          -p "$DEV_PROP=$ZNS"
+          -p recordcount="$RECCOUNT"
+          -p operationcount="$OPCOUNT"
+          -p chain_opcount="$OPCOUNT"
+          -p status.interval=10
+          -threads "$THREADS"
+          -chain "$YCSB_DIR/workloads/workloadc,$YCSB_DIR/workloads/workloadd,$YCSB_DIR/workloads/workloadg"
+          -s )
 
+if [ "$USE_TRACE" = "1" ]; then
+  sudo "${DYN_ENVS[@]}" CTREE_DYNAMIC_TRACE_PATH="$TRACE_CSV" \
+       "${RUN_CMD[@]}" 2>&1 | tee "$RUN_LOG"
+else
+  sudo "${DYN_ENVS[@]}" "${RUN_CMD[@]}" 2>&1 | tee "$RUN_LOG"
+fi
+
+# ── Plot (all variants now emit the trace CSV) ──────────────────────────
 echo
-echo "[plot] generating graphs/ctree_dynamic/${RUN_NAME}.png"
-
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# Drop privileges for plot step so matplotlib (installed in user env) is found.
-# When invoked via `sudo bash run_...`, $SUDO_USER is set; otherwise we're
-# already running as the user.  4th arg = explicit output basename.
+echo "[plot] ${RUN_NAME}.png  (variant=$VARIANT)"
 if [ -n "$SUDO_USER" ]; then
   sudo -u "$SUDO_USER" \
     CTREE_DYNAMIC_TRACE_PATH="$TRACE_CSV" \
     python3 "$REPO_ROOT/graphs/plot_dynamic_zns_cns.py" \
-      "$RECCOUNT" "$THREADS" "$MODE_TAG" "$RUN_NAME"
+      "$RECCOUNT" "$THREADS" "$MODE_TAG" "$RUN_NAME" "$VARIANT"
 else
   CTREE_DYNAMIC_TRACE_PATH="$TRACE_CSV" \
     python3 "$REPO_ROOT/graphs/plot_dynamic_zns_cns.py" \
-      "$RECCOUNT" "$THREADS" "$MODE_TAG" "$RUN_NAME"
+      "$RECCOUNT" "$THREADS" "$MODE_TAG" "$RUN_NAME" "$VARIANT"
 fi

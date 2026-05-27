@@ -537,3 +537,25 @@ void nlt_sync_zone(nlt_t *nlt, uint32_t zone_id)
 
     atomic_thread_fence(memory_order_release);
 }
+
+void nlt_zone_for_each(nlt_t *nlt, uint32_t zone_id,
+                       void (*cb)(ztree_node_id_t, uint32_t, void *),
+                       void *ctx)
+{
+    if (zone_id == ZTREE_INVALID_ZONE_ID || !cb)
+        return;
+    nlt_zone_entry_t *zone = nlt_probe_zone_atomic(nlt, zone_id);
+    if (!zone)
+        return;
+    nlt_slot_t *tracker = nlt_zone_tracker(zone);
+    if (!tracker)
+        return;
+    size_t cap = zone->tracker_cap;
+    for (size_t i = 0; i < cap; i++)
+    {
+        uint64_t v = atomic_load_explicit(&tracker[i], memory_order_acquire);
+        if (v == NLT_SLOT_EMPTY || v == NLT_SLOT_TOMBSTONE)
+            continue;
+        cb(nlt_unpack_node(v), nlt_unpack_slot(v), ctx);
+    }
+}

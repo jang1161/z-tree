@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <stdio.h>
+
 #include "ztree_types.h"
 #include "ztree_nlt.h"
 #include "ztree_zone.h"
@@ -99,6 +101,13 @@ struct ztree_s {
     _Atomic(uint64_t) prof_nl_wr_wait_ns_sum;
     _Atomic(uint64_t) prof_nl_wr_acquire_count;
     _Atomic(uint64_t) prof_nl_wr_max_wait_ns;
+
+    /* Trace for ZNS/CNS plot — env CTREE_DYNAMIC_TRACE_PATH. */
+    FILE             *trace_fp;
+    uint64_t          trace_start_ns;
+
+    /* Per-zone live-leaf count for ZNS GC victim selection. */
+    _Atomic(uint32_t) *zone_valid_leaves;
 };
 
 typedef struct ztree_s ztree_t;

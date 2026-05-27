@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -101,26 +102,87 @@ static inline uint64_t monotonic_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-static inline void maybe_trace_sample(ztree_t *t)
+/* Sum st_blocks across all CNS shards (sparse holes excluded). */
+static inline size_t cns_physical_bytes(ztree_t *t)
 {
-    if (!t->trace_fp)
-        return;
+    if (t->cns_fd < 0) return 0;
+    size_t bytes = 0;
+    for (int k = 0; k < CTREE_CNS_SHARDS; k++) {
+        struct stat st;
+        if (t->cns_fd_shard[k] >= 0 && fstat(t->cns_fd_shard[k], &st) == 0)
+            bytes += (size_t)st.st_blocks * 512;
+    }
+    return bytes;
+}
+
+/* Cumulative bytes written across LLayer zones (zone 2+). */
+static inline size_t zns_physical_bytes(ztree_t *t)
+{
+    size_t total = 0;
+    for (uint32_t z = 2; z < t->info.nr_zones; z++) {
+        uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[z], memory_order_relaxed);
+        uint64_t start = t->zones[z].start;
+        if (wp > start) total += (size_t)(wp - start);
+    }
+    return total;
+}
+
+static inline void emit_trace_row(ztree_t *t)
+{
+    if (!t->trace_fp) return;
     uint64_t total = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed);
-    if (total % TRACE_SAMPLE_INTERVAL != 0)
-        return;
     double elapsed = (double)(monotonic_ns() - t->trace_start_ns) / 1e9;
     int64_t internals = atomic_load_explicit(&t->stat_cns_current, memory_order_relaxed);
     uint32_t total_nodes = atomic_load_explicit(&t->next_node_id, memory_order_relaxed) - 1;
     int64_t leaves = (int64_t)total_nodes - internals;
     uint64_t cns_w = atomic_load_explicit(&t->stat_cns_writes, memory_order_relaxed);
     uint32_t height = atomic_load_explicit(&t->tree_height, memory_order_relaxed);
-    fprintf(t->trace_fp, "%.3f,%lld,%lld,%llu,%llu,%u\n",
-            elapsed,
-            (long long)leaves,
-            (long long)internals,
-            (unsigned long long)total,
-            (unsigned long long)cns_w,
-            height);
+    size_t cns_phys = cns_physical_bytes(t);
+    size_t zns_phys = zns_physical_bytes(t);
+    fprintf(t->trace_fp, "%.3f,%lld,%lld,%llu,%llu,%u,%zu,%zu\n",
+            elapsed, (long long)leaves, (long long)internals,
+            (unsigned long long)total, (unsigned long long)cns_w,
+            height, cns_phys, zns_phys);
+}
+
+static inline void maybe_trace_sample(ztree_t *t)
+{
+    if (!t->trace_fp) return;
+    uint64_t total = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed);
+    if (total % TRACE_SAMPLE_INTERVAL != 0) return;
+    emit_trace_row(t);
+}
+
+static inline void force_trace_sample(ztree_t *t)
+{
+    emit_trace_row(t);
+    if (t->trace_fp) fflush(t->trace_fp);
+}
+
+/* Override the weak stub in YCSB-cpp's ctree_db_stubs.c. */
+void cow_phase_mark(cow_tree *t, const char *name)
+{
+    static FILE *phase_fp = NULL;
+    static int tried_open = 0;
+    if (!t) return;
+    if (!phase_fp && !tried_open) {
+        tried_open = 1;
+        const char *path = getenv("CTREE_DYNAMIC_PHASE_PATH");
+        char fallback[1024];
+        if (!path || !*path) {
+            const char *tp = getenv("CTREE_DYNAMIC_TRACE_PATH");
+            if (tp) { snprintf(fallback, sizeof fallback, "%s.phases", tp); path = fallback; }
+        }
+        if (path) {
+            phase_fp = fopen(path, "w");
+            if (phase_fp) fprintf(phase_fp, "time_sec,phase\n");
+        }
+    }
+    if (phase_fp) {
+        double sec = (double)(monotonic_ns() - t->trace_start_ns) / 1e9;
+        fprintf(phase_fp, "%.3f,%s\n", sec, name);
+        fflush(phase_fp);
+    }
 }
 
 static inline uint64_t ztree_hash64(ztree_node_id_t id)
@@ -847,6 +909,32 @@ static int load_latest_node(ztree_t *t,
  *     parent rewrite happens only via split propagation, never via CoW.
  *   Leaf node → ZNS, sticky-on-prev_zone or zone_alloc_llayer + blocking lock.
  */
+/* ZNS GC forward decls + small helpers (full implementation at end of file). */
+#define ILAYER_LLAYER_BASE      2U
+#define ZNS_GC_STALE_THRESHOLD  0.5
+
+static pthread_t   g_zns_gc_tid;
+static _Atomic bool g_zns_gc_running = false;
+static _Atomic bool g_zns_gc_stop    = false;
+static unsigned     g_zns_gc_interval_ms = 0;
+
+static inline void zone_valid_leaves_move(ztree_t *t,
+                                          uint32_t prev_zone,
+                                          uint32_t target_zone) {
+    if (prev_zone != ZTREE_INVALID_ZONE_ID
+        && prev_zone != CTREE_CNS_ZONE_ID
+        && prev_zone >= ILAYER_LLAYER_BASE)
+        atomic_fetch_sub_explicit(&t->zone_valid_leaves[prev_zone], 1,
+                                  memory_order_relaxed);
+    if (target_zone != CTREE_CNS_ZONE_ID
+        && target_zone >= ILAYER_LLAYER_BASE)
+        atomic_fetch_add_explicit(&t->zone_valid_leaves[target_zone], 1,
+                                  memory_order_relaxed);
+}
+
+static void *ilayer_zns_gc_thread(void *arg);
+size_t cow_gc_zns(cow_tree *t);
+
 static void flush_page_immediate(ztree_t *t,
                                  ztree_page *pg,
                                  uint32_t prev_zone,
@@ -1118,6 +1206,7 @@ retry_flush:
     /* Atomic insert-new + remove-stale-from-prev so each node has exactly
      * one bucket entry (paper §3.1.2 "latest valid" invariant). */
     nlt_update_migrate(&t->nlt, &loc, prev_zone);
+    zone_valid_leaves_move(t, prev_zone, target_zone);
 
     uint64_t zone_bytes_used = new_wp - t->zones[target_zone].start;
     uint64_t seal_threshold = (t->zones[target_zone].capacity * 95ULL) / 100ULL;
@@ -2379,10 +2468,18 @@ cow_tree *cow_open(const char *path)
 
     /* Trace: per-time-step ZNS leaf vs CNS internal valid page counts.
      * Columns match plot_zns_cns_trace.py schema. */
-    t->trace_fp = fopen("/tmp/ctree_ilayer_trace.csv", "w");
+    {
+        const char *trace_path = getenv("CTREE_DYNAMIC_TRACE_PATH");
+        if (!trace_path || !*trace_path)
+            trace_path = "/tmp/ctree_ilayer_trace.csv";
+        t->trace_fp = fopen(trace_path, "w");
+        if (t->trace_fp)
+            fprintf(stderr, "[ctree_ilayer] trace -> %s\n", trace_path);
+    }
     t->trace_start_ns = monotonic_ns();
     if (t->trace_fp)
-        fprintf(t->trace_fp, "time_sec,zns_current,cns_current,appends,cns_writes,height\n");
+        fprintf(t->trace_fp,
+                "time_sec,zns_current,cns_current,appends,cns_writes,height,cns_phys_bytes,zns_phys_bytes\n");
     atomic_store_explicit(&t->stat_cns_current, 0, memory_order_relaxed);
     atomic_store_explicit(&t->stat_cns_writes, 0, memory_order_relaxed);
     atomic_store_explicit(&t->tree_height, 1, memory_order_relaxed);
@@ -2390,12 +2487,14 @@ cow_tree *cow_open(const char *path)
     t->zones = calloc(t->info.nr_zones, sizeof *t->zones);
     t->zone_wp_bytes = calloc(t->info.nr_zones, sizeof *t->zone_wp_bytes);
     t->zone_full = calloc(t->info.nr_zones, sizeof *t->zone_full);
-    if (!t->zones || !t->zone_wp_bytes || !t->zone_full)
+    t->zone_valid_leaves = calloc(t->info.nr_zones, sizeof *t->zone_valid_leaves);
+    if (!t->zones || !t->zone_wp_bytes || !t->zone_full || !t->zone_valid_leaves)
     {
         perror("calloc zones");
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
+        free(t->zone_valid_leaves);
         close(t->cns_fd);
         if (t->direct_fd >= 0)
             close(t->direct_fd);
@@ -2585,6 +2684,28 @@ cow_tree *cow_open(const char *path)
         return NULL;
     }
 
+    /* ZNS GC background thread (env CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS, default off;
+     * actual work also requires CTREE_DYNAMIC_ZNS_GC=1). */
+    {
+        const char *env = getenv("CTREE_DYNAMIC_ZNS_GC_INTERVAL_MS");
+        long ms = env ? atol(env) : 0;
+        if (ms < 0) ms = 0;
+        g_zns_gc_interval_ms = (unsigned)ms;
+    }
+    if (g_zns_gc_interval_ms > 0) {
+        atomic_store_explicit(&g_zns_gc_stop, false, memory_order_relaxed);
+        atomic_store_explicit(&g_zns_gc_running, true, memory_order_release);
+        if (pthread_create(&g_zns_gc_tid, NULL, ilayer_zns_gc_thread, t) != 0) {
+            perror("pthread_create ilayer_zns_gc_thread");
+            atomic_store_explicit(&g_zns_gc_running, false, memory_order_release);
+        } else {
+            fprintf(stderr,
+                    "[ctree_ilayer] ZNS GC thread enabled: interval=%ums "
+                    "(needs CTREE_DYNAMIC_ZNS_GC=1)\n",
+                    g_zns_gc_interval_ms);
+        }
+    }
+
     return t;
 }
 
@@ -2593,10 +2714,204 @@ void cow_insert(cow_tree *t, int64_t key, const char *value)
     do_single_insert(t, key, value);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ZNS GC (ported from dynamic): periodic background reclaim of sealed LLayer
+ * zones with > ZNS_GC_STALE_THRESHOLD stale ratio.  Migrates live leaves via
+ * per-leaf node-latch coordination, then resets the victim zone.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static int gc_maint_threads(void) {
+    const char *e = getenv("CTREE_DYNAMIC_MAINT_THREADS");
+    int n = e ? atoi(e) : 8;
+    if (n < 1) n = 1;
+    if (n > 32) n = 32;
+    return n;
+}
+
+static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
+                               ztree_node_id_t nid, uint32_t slot) {
+    node_wrlock(t, nid);
+    nlt_location_t query  = { .zone_id = victim, .node_id = nid,
+                              .slot_id = ZTREE_INVALID_SLOT_ID };
+    nlt_location_t actual;
+    if (!nlt_lookup(&t->nlt, &query, &actual)
+        || actual.zone_id != victim || actual.slot_id != slot) {
+        node_unlock(t, nid);
+        return 0;
+    }
+    ztree_page p;
+    ztree_pagenum_t pn = zone_slot_to_pn(t, victim, slot);
+    load_page_by_pn(t, pn, &p);
+    if (!p.is_leaf) { node_unlock(t, nid); return 0; }
+
+    uint32_t target = zone_alloc_llayer(&t->za, nid, victim);
+    if (target == ZTREE_INVALID_ZONE_ID) { node_unlock(t, nid); return 0; }
+    pthread_mutex_lock(&t->zone_write_locks[target]);
+    if (atomic_load_explicit(&t->zone_full[target], memory_order_acquire)) {
+        pthread_mutex_unlock(&t->zone_write_locks[target]);
+        node_unlock(t, nid); return 0;
+    }
+    uint64_t zone_end = t->zones[target].start + t->zones[target].capacity;
+    uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[target], memory_order_relaxed);
+    if (wp + ZTREE_PAGE_SIZE > zone_end) {
+        pthread_mutex_unlock(&t->zone_write_locks[target]);
+        atomic_store_explicit(&t->zone_full[target], 1, memory_order_release);
+        zone_seal_and_replace(&t->za, target);
+        node_unlock(t, nid); return 0;
+    }
+    if (wp == t->zones[target].start
+        && !zone_admission_acquire(&t->za, target)) {
+        pthread_mutex_unlock(&t->zone_write_locks[target]);
+        node_unlock(t, nid); return 0;
+    }
+    atomic_store_explicit(&t->zone_wp_bytes[target], wp + ZTREE_PAGE_SIZE,
+                          memory_order_relaxed);
+    uint64_t cur_wp = wp;
+    uint32_t new_slot = (uint32_t)((cur_wp - t->zones[target].start) / ZTREE_PAGE_SIZE);
+    p.zone_id = target; p.slot_id = new_slot;
+
+    _Alignas(ZTREE_PAGE_SIZE) char bounce[ZTREE_PAGE_SIZE];
+    memcpy(bounce, &p, ZTREE_PAGE_SIZE);
+    int wfd = (t->direct_fd >= 0) ? t->direct_fd : t->fd;
+    ssize_t pwr = pwrite(wfd, bounce, ZTREE_PAGE_SIZE, (off_t)cur_wp);
+    if (pwr != (ssize_t)ZTREE_PAGE_SIZE) {
+        atomic_fetch_sub_explicit(&t->zone_wp_bytes[target], ZTREE_PAGE_SIZE,
+                                  memory_order_relaxed);
+        pthread_mutex_unlock(&t->zone_write_locks[target]);
+        node_unlock(t, nid); return 0;
+    }
+    pthread_mutex_unlock(&t->zone_write_locks[target]);
+
+    nlt_location_t newloc = { .zone_id = target, .node_id = nid, .slot_id = new_slot };
+    nlt_update_migrate(&t->nlt, &newloc, victim);
+    zone_valid_leaves_move(t, victim, target);
+    node_unlock(t, nid);
+    return 1;
+}
+
+struct zns_gc_ctx { cow_tree *t; uint32_t victim; size_t seen, migrated; };
+static void zns_gc_migrate_cb(ztree_node_id_t nid, uint32_t slot, void *vp) {
+    struct zns_gc_ctx *c = vp;
+    c->seen++;
+    c->migrated += (size_t)zns_gc_migrate_leaf(c->t, c->victim, nid, slot);
+}
+
+struct zns_victim_result { uint32_t zone, counter_before; size_t seen, migrated; };
+static void zns_gc_migrate_victim(cow_tree *t, struct zns_victim_result *r) {
+    r->counter_before = atomic_load_explicit(&t->zone_valid_leaves[r->zone],
+                                             memory_order_relaxed);
+    struct zns_gc_ctx ctx = { .t = t, .victim = r->zone, .seen = 0, .migrated = 0 };
+    nlt_zone_for_each(&t->nlt, r->zone, zns_gc_migrate_cb, &ctx);
+    r->seen = ctx.seen; r->migrated = ctx.migrated;
+}
+
+struct zns_gc_arg { cow_tree *t; struct zns_victim_result *results; int v_start, v_end; };
+static void *zns_gc_worker(void *p) {
+    struct zns_gc_arg *a = p;
+    for (int v = a->v_start; v < a->v_end; v++)
+        zns_gc_migrate_victim(a->t, &a->results[v]);
+    return NULL;
+}
+
+size_t cow_gc_zns(cow_tree *t) {
+    if (!t) return 0;
+    const char *e = getenv("CTREE_DYNAMIC_ZNS_GC");
+    if (!e || e[0] != '1') return 0;
+    force_trace_sample(t);
+    size_t before = zns_physical_bytes(t);
+
+    uint32_t *victims = malloc(sizeof(uint32_t) * t->info.nr_zones);
+    if (!victims) return 0;
+    int nvictims = 0;
+    for (uint32_t z = ILAYER_LLAYER_BASE; z < t->info.nr_zones; z++) {
+        if (!atomic_load_explicit(&t->zone_full[z], memory_order_acquire)) continue;
+        uint64_t start = t->zones[z].start;
+        uint64_t wp = atomic_load_explicit(&t->zone_wp_bytes[z], memory_order_relaxed);
+        if (wp <= start) continue;
+        uint64_t used = wp - start;
+        uint64_t valid = (uint64_t)atomic_load_explicit(&t->zone_valid_leaves[z],
+                                                       memory_order_relaxed)
+                         * ZTREE_PAGE_SIZE;
+        double sr = (used > valid) ? (1.0 - (double)valid / (double)used) : 0.0;
+        if (sr > ZNS_GC_STALE_THRESHOLD) victims[nvictims++] = z;
+    }
+    if (nvictims == 0) { free(victims); return 0; }
+
+    fprintf(stderr, "[ctree_ilayer] cow_gc_zns: %d victim(s)\n", nvictims);
+    struct zns_victim_result *results = malloc(sizeof(*results) * (size_t)nvictims);
+    if (!results) { free(victims); return 0; }
+    for (int v = 0; v < nvictims; v++)
+        results[v] = (struct zns_victim_result){ .zone = victims[v] };
+
+    int N = gc_maint_threads();
+    if (N > nvictims) N = nvictims;
+    if (N < 1) N = 1;
+    pthread_t tids[32]; struct zns_gc_arg args[32];
+    int per = (nvictims + N - 1) / N;
+    for (int i = 0; i < N; i++) {
+        int s = i * per, ee = ((i + 1) * per > nvictims) ? nvictims : (i + 1) * per;
+        args[i] = (struct zns_gc_arg){ .t = t, .results = results, .v_start = s, .v_end = ee };
+        pthread_create(&tids[i], NULL, zns_gc_worker, &args[i]);
+    }
+    for (int i = 0; i < N; i++) pthread_join(tids[i], NULL);
+
+    size_t total_migrated = 0, zones_reset = 0;
+    for (int v = 0; v < nvictims; v++) {
+        struct zns_victim_result *r = &results[v];
+        total_migrated += r->migrated;
+        uint32_t remaining = atomic_load_explicit(&t->zone_valid_leaves[r->zone],
+                                                  memory_order_acquire);
+        if (remaining > 0) continue;
+        off_t zstart = (off_t)t->zones[r->zone].start;
+        if (zbd_reset_zones(t->fd, zstart, (off_t)t->info.zone_size) != 0) continue;
+        atomic_store_explicit(&t->zone_wp_bytes[r->zone],
+                              t->zones[r->zone].start, memory_order_release);
+        zone_admission_release_zone(&t->za, r->zone);
+        atomic_store_explicit(&t->zone_full[r->zone], 0, memory_order_release);
+        nlt_set_zone_sealed(&t->nlt, r->zone, false);
+        zones_reset++;
+    }
+    free(results); free(victims);
+    size_t after = zns_physical_bytes(t);
+    force_trace_sample(t);
+    fprintf(stderr,
+            "[ctree_ilayer] cow_gc_zns: migrated=%zu  reset=%zu  "
+            "zns_phys: %zu → %zu KB  (freed %zu KB)\n",
+            total_migrated, zones_reset, before/1024, after/1024,
+            (before > after) ? (before - after)/1024 : 0);
+    return (before > after) ? (before - after) : 0;
+}
+
+static void *ilayer_zns_gc_thread(void *arg) {
+    cow_tree *t = (cow_tree *)arg;
+    while (!atomic_load_explicit(&g_zns_gc_stop, memory_order_acquire)) {
+        unsigned slept = 0;
+        while (slept < g_zns_gc_interval_ms
+            && !atomic_load_explicit(&g_zns_gc_stop, memory_order_acquire)) {
+            unsigned step = (g_zns_gc_interval_ms - slept > 50)
+                                ? 50 : (g_zns_gc_interval_ms - slept);
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)step * 1000000L };
+            nanosleep(&ts, NULL);
+            slept += step;
+        }
+        if (atomic_load_explicit(&g_zns_gc_stop, memory_order_acquire)) break;
+        cow_phase_mark(t, "begin:zns_gc_periodic");
+        cow_gc_zns(t);
+        cow_phase_mark(t, "end:zns_gc_periodic");
+    }
+    return NULL;
+}
+
 void cow_close(cow_tree *t)
 {
     if (!t)
         return;
+
+    if (atomic_load_explicit(&g_zns_gc_running, memory_order_acquire)) {
+        atomic_store_explicit(&g_zns_gc_stop, true, memory_order_release);
+        pthread_join(g_zns_gc_tid, NULL);
+        atomic_store_explicit(&g_zns_gc_running, false, memory_order_release);
+    }
 
     atomic_store_explicit(&t->stop_flusher, true, memory_order_release);
     pthread_join(t->flusher_tid, NULL);
@@ -2732,6 +3047,7 @@ void cow_close(cow_tree *t)
     free(t->zones);
     free(t->zone_wp_bytes);
     free(t->zone_full);
+    free(t->zone_valid_leaves);
 
     zbd_close(t->fd);
     if (t->direct_fd >= 0)

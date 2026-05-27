@@ -566,6 +566,16 @@ static inline void node_wrlock(ztree_t *t, ztree_node_id_t id)
     prof_update_max(&t->prof_nl_wr_max_wait_ns, wait);
 }
 
+/* Non-blocking variant — used by ZNS GC to avoid foreground deadlock. */
+static inline int node_trywrlock(ztree_t *t, ztree_node_id_t id)
+{
+    if (id == ZTREE_INVALID_NODE_ID) return 1;
+    if (pthread_rwlock_trywrlock(node_latch_for_id(t, id)) != 0)
+        return 0;
+    atomic_fetch_add_explicit(&t->prof_nl_wr_acquire_count, 1, memory_order_relaxed);
+    return 1;
+}
+
 static inline void node_rdlock(ztree_t *t, ztree_node_id_t id)
 {
     if (id == ZTREE_INVALID_NODE_ID)
@@ -3755,10 +3765,105 @@ size_t cow_gc_cns(cow_tree *t)
 /* Migrate one live leaf to a new ZNS zone.
  * Takes the per-leaf wrlock to serialize with concurrent foreground CoW.
  * After locking, recheck NLT[nid]; skip if the leaf was already moved. */
+/* Read root snapshot via seqlock. */
+static uint64_t gc_root_snapshot(ztree_t *t,
+                                 ztree_node_id_t *out_nid,
+                                 uint32_t *out_zone,
+                                 uint32_t *out_slot) {
+    for (;;) {
+        uint64_t s1 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
+        if (s1 & 1ULL) continue;
+        *out_nid  = atomic_load_explicit(&t->volatile_sb.root_node_id, memory_order_acquire);
+        *out_zone = atomic_load_explicit(&t->volatile_sb.root_zone_id, memory_order_acquire);
+        *out_slot = atomic_load_explicit(&t->volatile_sb.root_slot_id, memory_order_acquire);
+        uint64_t s2 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
+        if (s1 == s2 && (s2 & 1ULL) == 0) return s2;
+    }
+}
+
+/* Descend from root using `key`, find parent of target_nid, rewrite its
+ * child_zone_id to NLT-current.  Parent is CNS — no further cascade. */
+static int gc_cascade_parent(ztree_t *t,
+                             ztree_node_id_t target_nid,
+                             int64_t key) {
+    ztree_node_id_t root_nid;
+    uint32_t root_zone, root_slot;
+    uint64_t seq_snapshot = gc_root_snapshot(t, &root_nid, &root_zone, &root_slot);
+    if (root_nid == ZTREE_INVALID_NODE_ID) return 0;
+
+    nlt_location_t want_q = { .zone_id = ZTREE_INVALID_ZONE_ID,
+                              .node_id = target_nid,
+                              .slot_id = ZTREE_INVALID_SLOT_ID };
+    nlt_location_t want;
+    if (!nlt_lookup(&t->nlt, &want_q, &want)) return 0;
+
+    if (root_nid == target_nid) {
+        if (root_zone == want.zone_id && root_slot == want.slot_id) return 1;
+        return try_publish_root_if_unchanged(t, seq_snapshot,
+                                             target_nid, want.zone_id, want.slot_id);
+    }
+
+    insert_path_frame path[MAX_HEIGHT];
+    int depth = 0;
+    ztree_node_id_t cur_id   = root_nid;
+    uint32_t        cur_zone = root_zone;
+
+    while (1) {
+        if (depth >= MAX_HEIGHT) return 0;
+        insert_path_frame *f = &path[depth++];
+        f->node_id = cur_id;
+        if (!load_latest_node(t, cur_zone, cur_id,
+                              &f->zone_id, &f->slot_id, &f->page))
+            return 0;
+        if (f->page.is_leaf) return 0;
+        uint32_t cidx = child_pos_for_key(&f->page, key);
+        ztree_node_id_t child_nid;
+        uint32_t        child_zone;
+        if (cidx == RIGHTMOST_IDX) {
+            child_nid  = f->page.ptr_node_id;
+            child_zone = f->page.ptr_zone_id;
+        } else {
+            child_nid  = f->page.internal[cidx].child_node_id;
+            child_zone = f->page.internal[cidx].child_zone_id;
+        }
+        if (child_nid == target_nid) break;
+        cur_id   = child_nid;
+        cur_zone = child_zone;
+    }
+
+    insert_path_frame *pf = &path[depth - 1];
+    if (!node_trywrlock(t, pf->node_id)) return 0;
+    if (!load_latest_node(t, pf->zone_id, pf->node_id,
+                          &pf->zone_id, &pf->slot_id, &pf->page)) {
+        node_unlock(t, pf->node_id); return 0;
+    }
+    uint32_t cidx = child_pos_for_id(&pf->page, target_nid);
+    if (cidx == UINT32_MAX) {
+        node_unlock(t, pf->node_id); return 0;
+    }
+    uint32_t cur_child_zone = (cidx == RIGHTMOST_IDX)
+                                  ? pf->page.ptr_zone_id
+                                  : pf->page.internal[cidx].child_zone_id;
+    if (cur_child_zone == want.zone_id) {
+        node_unlock(t, pf->node_id); return 1;
+    }
+    if (cidx == RIGHTMOST_IDX)
+        pf->page.ptr_zone_id = want.zone_id;
+    else
+        pf->page.internal[cidx].child_zone_id = want.zone_id;
+
+    propagate_state prop;
+    memset(&prop, 0, sizeof prop);
+    flush_page_immediate(t, &pf->page, pf->zone_id, ZTREE_INVALID_ZONE_ID,
+                         &prop.left_zone_changed, &prop.left_zone, &prop.left_slot);
+    node_unlock(t, pf->node_id);
+    return 1;
+}
+
 static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
                                ztree_node_id_t nid, uint32_t slot)
 {
-    node_wrlock(t, nid);
+    if (!node_trywrlock(t, nid)) return 0;  /* skip contended; next cycle */
 
     /* Re-verify the leaf still lives at (victim, slot). */
     nlt_location_t query = { .zone_id = victim, .node_id = nid,
@@ -3775,11 +3880,12 @@ static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
     ztree_page p;
     ztree_pagenum_t pn = zone_slot_to_pn(t, victim, slot);
     load_page_by_pn(t, pn, &p);
-    if (!p.is_leaf)
+    if (!p.is_leaf || p.num_keys == 0)
     {
         node_unlock(t, nid);
-        return 0;  /* internals never live on ZNS — defensive */
+        return 0;
     }
+    int64_t cascade_key = (int64_t)p.leaf[0].key;
 
     uint32_t target = zone_alloc_llayer(&t->za, nid, victim);
     if (target == ZTREE_INVALID_ZONE_ID)
@@ -3837,6 +3943,7 @@ static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
     nlt_update_migrate(&t->nlt, &newloc, victim);
     zone_valid_leaves_move(t, victim, target);
     node_unlock(t, nid);
+    (void)gc_cascade_parent(t, nid, cascade_key);
     return 1;
 }
 

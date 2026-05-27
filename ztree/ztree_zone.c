@@ -38,24 +38,12 @@ static inline uint32_t zone_monotonic_ts_16b(void)
  * Check whether a zone has room for at least one more page.
  * Returns 1 if the zone is usable, 0 if it is full.
  */
-static int zone_has_space(zone_alloc_t *za, uint32_t zone_id)
-{
-    if (atomic_load_explicit(&za->zone_full[zone_id], memory_order_acquire))
-        return 0;
-
-    uint64_t wp    = atomic_load_explicit(&za->zone_wp_bytes[zone_id],
-                                          memory_order_acquire);
-    uint64_t cap   = za->zones[zone_id].capacity;
-    uint64_t start = za->zones[zone_id].start;
-    return (wp + ZTREE_PAGE_SIZE <= start + cap) ? 1 : 0;
-}
-
 /* Dynamic_Allocation (paper §3.2): round-robin within the active group.
  * Expands group by 1 when all zones are sealed. */
 static uint32_t rr_pick_zone(zone_alloc_t *za,
                               uint32_t pool_base,
                               uint32_t pool_size,
-                              uint32_t init_count __attribute__((unused)),
+                              uint32_t init_count,
                               _Atomic(uint32_t) *group_count,
                               _Atomic(uint32_t) *rr_counter,
                               uint32_t avoid_zone,
@@ -65,25 +53,65 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
         uint32_t count = atomic_load_explicit(group_count, memory_order_acquire);
         uint32_t start = atomic_fetch_add_explicit(rr_counter, 1, memory_order_relaxed);
 
-        /* RR over available zones only — first-fit funnels all threads onto
-         * the first open zone after a full run. */
+        /* Count write-active zones (gates new-empty opens at init_count). */
+        uint32_t wa = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t zid = pool_base + i;
+            if (atomic_load_explicit(&za->zone_full[zid], memory_order_acquire))
+                continue;
+            if (atomic_load_explicit(&za->zone_wp_bytes[zid], memory_order_acquire)
+                > za->zones[zid].start)
+                wa++;
+        }
+        bool allow_empty = (wa < init_count);
+
+        /* Candidate count: write-active-with-space + (empties if allow_empty). */
         uint32_t navail = 0;
         for (uint32_t i = 0; i < count; i++) {
-            uint32_t zone_id = pool_base + i;
-            if (zone_id != avoid_zone && zone_has_space(za, zone_id))
-                navail++;
+            uint32_t zid = pool_base + i;
+            if (zid == avoid_zone) continue;
+            if (atomic_load_explicit(&za->zone_full[zid], memory_order_acquire))
+                continue;
+            uint64_t wp = atomic_load_explicit(&za->zone_wp_bytes[zid],
+                                               memory_order_acquire);
+            uint64_t zstart = za->zones[zid].start;
+            if (wp + ZTREE_PAGE_SIZE > zstart + za->zones[zid].capacity)
+                continue;
+            if (wp > zstart || allow_empty) navail++;
         }
+
         if (navail > 0) {
-            uint32_t target = start % navail;
-            uint32_t k = 0;
+            uint32_t target = start % navail, k = 0;
             for (uint32_t i = 0; i < count; i++) {
-                uint32_t zone_id = pool_base + i;
-                if (zone_id == avoid_zone || !zone_has_space(za, zone_id))
+                uint32_t zid = pool_base + i;
+                if (zid == avoid_zone) continue;
+                if (atomic_load_explicit(&za->zone_full[zid], memory_order_acquire))
                     continue;
-                if (k++ == target)
-                    return zone_id;
+                uint64_t wp = atomic_load_explicit(&za->zone_wp_bytes[zid],
+                                                   memory_order_acquire);
+                uint64_t zstart = za->zones[zid].start;
+                if (wp + ZTREE_PAGE_SIZE > zstart + za->zones[zid].capacity)
+                    continue;
+                if ((wp > zstart || allow_empty) && k++ == target)
+                    return zid;
             }
             continue;  /* lost a race; retry */
+        }
+
+        /* navail == 0.  If a throttled empty exists (allow_empty was false),
+         * tell the caller to back off (admission slot full); else fall through
+         * to grow.  Without INVALID handling, caller would deadlock. */
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t zid = pool_base + i;
+            if (zid == avoid_zone) continue;
+            if (atomic_load_explicit(&za->zone_full[zid], memory_order_acquire))
+                continue;
+            uint64_t wp = atomic_load_explicit(&za->zone_wp_bytes[zid],
+                                               memory_order_acquire);
+            uint64_t zstart = za->zones[zid].start;
+            if (wp + ZTREE_PAGE_SIZE > zstart + za->zones[zid].capacity)
+                continue;
+            return ZTREE_INVALID_ZONE_ID;  /* throttled by per-group cap */
         }
 
         /* All active zones sealed.  Attach 1 replacement (fallback;

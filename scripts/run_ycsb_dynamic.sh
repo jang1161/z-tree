@@ -10,7 +10,7 @@
 #   - ilayer : same chain (ilayer has no CNS GC; Maintenance is no-op leaf-wise).
 #   - ztree  : no CNS, no dynamic envs, no trace/plot.
 #
-# Logs:  logs/<variant>_multi-workload/<mode>/...
+# Logs:  logs/ycsb_multi/<variant>/<mode>/...
 
 set -e
 
@@ -69,7 +69,7 @@ ZNS=/dev/nvme3n2
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 YCSB_DIR="$(cd "$REPO_ROOT/../YCSB-cpp" && pwd)"
-LOG_DIR="$REPO_ROOT/logs/${VARIANT}_multi-workload/$MODE_TAG"
+LOG_DIR="$REPO_ROOT/logs/ycsb_multi/${VARIANT}/$MODE_TAG"
 mkdir -p "$LOG_DIR"
 
 fmt_count() {
@@ -116,7 +116,7 @@ RUN_CMD=( "$YCSB_DIR/$BIN" -load -run
           -p recordcount="$RECCOUNT"
           -p operationcount="$OPCOUNT"
           -p chain_opcount="$OPCOUNT"
-          -p status.interval=10
+          -p status.interval=20
           -threads "$THREADS"
           -chain "$YCSB_DIR/workloads/workloadc,$YCSB_DIR/workloads/workloadd,$YCSB_DIR/workloads/workloadg"
           -s )

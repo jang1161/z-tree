@@ -40,6 +40,9 @@ static inline uint32_t zone_monotonic_ts_16b(void)
  * so only allow it when current write-active count < init_count.
  * Returns ZTREE_INVALID_ZONE_ID at cap (all empties skipped, no write-
  * active had space) — caller spills to CNS. */
+/* prefer_existing: pack into a write-active zone only (no new-empty open,
+ * no grow); returns INVALID if none has space.  Used by ZNS GC to skip
+ * burning an admission slot when open zones already have room. */
 static uint32_t rr_pick_zone(zone_alloc_t *za,
                               uint32_t pool_base,
                               uint32_t pool_size,
@@ -47,7 +50,8 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                               _Atomic(uint32_t) *group_count,
                               _Atomic(uint32_t) *rr_counter,
                               uint32_t avoid_zone,
-                              const char *layer_name)
+                              const char *layer_name,
+                              int prefer_existing)
 {
     for (;;) {
         uint32_t count = atomic_load_explicit(group_count, memory_order_acquire);
@@ -65,7 +69,7 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                 > za->zones[zid].start)
                 wa++;
         }
-        bool allow_empty = (wa < init_count);
+        bool allow_empty = prefer_existing ? false : (wa < init_count);
 
         /* Pick pool = write-active-with-space, plus empties while under the
          * init_count cap.  RR over the pool — first-fit funnels all threads
@@ -119,6 +123,10 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
             }
             continue;  /* lost a race; retry */
         }
+
+        /* prefer_existing: no write-active zone had space — give up. */
+        if (prefer_existing)
+            return ZTREE_INVALID_ZONE_ID;
 
         /* Nothing pickable.  A non-full zone with space exists only when an
          * empty was throttled by the cap → caller spills to CNS.  Else all
@@ -449,7 +457,7 @@ uint32_t zone_alloc_ilayer(zone_alloc_t *za, uint32_t avoid_zone)
                         za->ilayer_init_count,
                         &za->ilayer_group_count, &za->ilayer_rr,
                         avoid_zone,
-                        "ILayer");
+                        "ILayer", 0);
 }
 
 uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
@@ -462,14 +470,35 @@ uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
                             za->hot_init_count,
                             &za->hot_group_count, &za->hot_rr,
                             avoid_zone,
-                            "LLayer-hot");
+                            "LLayer-hot", 0);
     } else {
         return rr_pick_zone(za,
                             za->cold_pool_base, za->cold_pool_size,
                             za->cold_init_count,
                             &za->cold_group_count, &za->cold_rr,
                             avoid_zone,
-                            "LLayer-cold");
+                            "LLayer-cold", 0);
+    }
+}
+
+/* GC variant: pack into an open zone only (INVALID if none has space). */
+uint32_t zone_alloc_llayer_existing(zone_alloc_t *za, ztree_node_id_t node_id,
+                                    uint32_t avoid_zone)
+{
+    if (zone_is_hot(za, node_id)) {
+        return rr_pick_zone(za,
+                            za->hot_pool_base, za->hot_pool_size,
+                            za->hot_init_count,
+                            &za->hot_group_count, &za->hot_rr,
+                            avoid_zone,
+                            "LLayer-hot", 1);
+    } else {
+        return rr_pick_zone(za,
+                            za->cold_pool_base, za->cold_pool_size,
+                            za->cold_init_count,
+                            &za->cold_group_count, &za->cold_rr,
+                            avoid_zone,
+                            "LLayer-cold", 1);
     }
 }
 

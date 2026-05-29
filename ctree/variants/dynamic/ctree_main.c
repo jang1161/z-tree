@@ -3887,7 +3887,10 @@ static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
     }
     int64_t cascade_key = (int64_t)p.leaf[0].key;
 
-    uint32_t target = zone_alloc_llayer(&t->za, nid, victim);
+    /* Prefer an open zone (no admission slot); open new only if none has space. */
+    uint32_t target = zone_alloc_llayer_existing(&t->za, nid, victim);
+    if (target == ZTREE_INVALID_ZONE_ID)
+        target = zone_alloc_llayer(&t->za, nid, victim);
     if (target == ZTREE_INVALID_ZONE_ID)
     {
         node_unlock(t, nid);
@@ -3970,6 +3973,7 @@ struct zns_victim_result {
     uint32_t counter_before;
     size_t   seen;
     size_t   migrated;
+    int      done;
 };
 
 static void zns_gc_migrate_victim(cow_tree *t, struct zns_victim_result *r)
@@ -4084,46 +4088,50 @@ size_t cow_gc_zns(cow_tree *t)
     {
         struct zns_victim_result *r = &results[v];
         total_migrated += r->migrated;
-
         if (r->seen != (size_t)r->counter_before)
-        {
             drift_zones++;
-            if (dynamic_verbose())
-                fprintf(stderr,
-                        "[ctree_dynamic] cow_gc_zns: counter drift victim=%u "
-                        "counter=%u actual=%zu\n",
-                        r->zone, r->counter_before, r->seen);
-        }
+    }
 
-        /* Reset is safe when no live leaf still references the victim.
-         * With per-leaf-latched migration, foreground CoWs may have moved
-         * some leaves out concurrently (migrated < seen), but those moves
-         * also decrement zone_valid_leaves.  So zone_valid_leaves==0 is
-         * the authoritative "victim is fully drained" signal. */
-        uint32_t remaining = atomic_load_explicit(
-            &t->zone_valid_leaves[r->zone], memory_order_acquire);
-        if (remaining > 0)
+    /* Reset drained victims; re-migrate stragglers (transient trylock holds)
+     * over a few short passes — foreground releases latches in between. */
+    for (int pass = 0; pass <= 3; pass++)
+    {
+        int pending = 0;
+        for (int v = 0; v < nvictims; v++)
         {
-            fprintf(stderr,
-                    "[ctree_dynamic] cow_gc_zns: victim %u — %u live leaf(s) "
-                    "still ref the zone, skipping reset (retry next cycle)\n",
-                    r->zone, remaining);
-            continue;
+            struct zns_victim_result *r = &results[v];
+            if (r->done) continue;
+            uint32_t remaining = atomic_load_explicit(
+                &t->zone_valid_leaves[r->zone], memory_order_acquire);
+            if (remaining == 0)
+            {
+                off_t zstart = (off_t)t->zones[r->zone].start;
+                if (zbd_reset_zones(t->fd, zstart, (off_t)t->info.zone_size) != 0)
+                {
+                    perror("cow_gc_zns: zbd_reset_zones");
+                    continue;
+                }
+                atomic_store_explicit(&t->zone_wp_bytes[r->zone],
+                                      t->zones[r->zone].start, memory_order_release);
+                zone_admission_release_zone(&t->za, r->zone);
+                atomic_store_explicit(&t->zone_full[r->zone], 0, memory_order_release);
+                nlt_set_zone_sealed(&t->nlt, r->zone, false);
+                r->done = 1; zones_reset++;
+            }
+            else
+            {
+                pending = 1;
+            }
         }
-        off_t zstart = (off_t)t->zones[r->zone].start;
-        if (zbd_reset_zones(t->fd, zstart, (off_t)t->info.zone_size) != 0)
+        if (!pending || pass == 3) break;
+        usleep(20000);
+        for (int v = 0; v < nvictims; v++)
         {
-            perror("cow_gc_zns: zbd_reset_zones");
-            continue;
+            struct zns_victim_result *r = &results[v];
+            if (r->done) continue;
+            zns_gc_migrate_victim(t, r);
+            total_migrated += r->migrated;
         }
-        atomic_store_explicit(&t->zone_wp_bytes[r->zone],
-                              t->zones[r->zone].start, memory_order_release);
-        /* Reset frees the device slot; release ours if somehow still held
-         * (normally released at seal) so the slot can't leak across reuse. */
-        zone_admission_release_zone(&t->za, r->zone);
-        atomic_store_explicit(&t->zone_full[r->zone], 0, memory_order_release);
-        nlt_set_zone_sealed(&t->nlt, r->zone, false);
-        zones_reset++;
     }
     free(results);
     free(victims);

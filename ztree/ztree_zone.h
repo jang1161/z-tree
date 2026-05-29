@@ -121,6 +121,11 @@ uint32_t zone_alloc_ilayer(zone_alloc_t *za, uint32_t avoid_zone);
 uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
                            uint32_t avoid_zone);
 
+/* GC variants: pack into an open zone only (INVALID if none has space). */
+uint32_t zone_alloc_ilayer_existing(zone_alloc_t *za, uint32_t avoid_zone);
+uint32_t zone_alloc_llayer_existing(zone_alloc_t *za, ztree_node_id_t node_id,
+                                    uint32_t avoid_zone);
+
 /* zone_seal_and_replace  –  finish a sealed zone and grow its group by 1.
  * Call AFTER zone_full is set and zone_write_lock is released.
  * Takes lifecycle_lock; at most one transition in flight at a time. */

@@ -40,6 +40,9 @@ static inline uint32_t zone_monotonic_ts_16b(void)
  */
 /* Dynamic_Allocation (paper §3.2): round-robin within the active group.
  * Expands group by 1 when all zones are sealed. */
+/* prefer_existing: pack into a write-active zone only (no new-empty open,
+ * no group grow); returns INVALID if none has space.  Used by ZNS GC to
+ * avoid burning an admission slot when open zones already have room. */
 static uint32_t rr_pick_zone(zone_alloc_t *za,
                               uint32_t pool_base,
                               uint32_t pool_size,
@@ -47,7 +50,8 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                               _Atomic(uint32_t) *group_count,
                               _Atomic(uint32_t) *rr_counter,
                               uint32_t avoid_zone,
-                              const char *layer_name)
+                              const char *layer_name,
+                              int prefer_existing)
 {
     for (;;) {
         uint32_t count = atomic_load_explicit(group_count, memory_order_acquire);
@@ -63,7 +67,7 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
                 > za->zones[zid].start)
                 wa++;
         }
-        bool allow_empty = (wa < init_count);
+        bool allow_empty = prefer_existing ? false : (wa < init_count);
 
         /* Candidate count: write-active-with-space + (empties if allow_empty). */
         uint32_t navail = 0;
@@ -97,6 +101,10 @@ static uint32_t rr_pick_zone(zone_alloc_t *za,
             }
             continue;  /* lost a race; retry */
         }
+
+        /* prefer_existing: no write-active zone had space — give up. */
+        if (prefer_existing)
+            return ZTREE_INVALID_ZONE_ID;
 
         /* navail == 0.  If a throttled empty exists (allow_empty was false),
          * tell the caller to back off (admission slot full); else fall through
@@ -403,7 +411,7 @@ uint32_t zone_alloc_ilayer(zone_alloc_t *za, uint32_t avoid_zone)
                         za->ilayer_init_count,
                         &za->ilayer_group_count, &za->ilayer_rr,
                         avoid_zone,
-                        "ILayer");
+                        "ILayer", 0);
 }
 
 uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
@@ -416,14 +424,45 @@ uint32_t zone_alloc_llayer(zone_alloc_t *za, ztree_node_id_t node_id,
                             za->hot_init_count,
                             &za->hot_group_count, &za->hot_rr,
                             avoid_zone,
-                            "LLayer-hot");
+                            "LLayer-hot", 0);
     } else {
         return rr_pick_zone(za,
                             za->cold_pool_base, za->cold_pool_size,
                             za->cold_init_count,
                             &za->cold_group_count, &za->cold_rr,
                             avoid_zone,
-                            "LLayer-cold");
+                            "LLayer-cold", 0);
+    }
+}
+
+/* GC variants: pack into an already-open zone (no admission slot needed). */
+uint32_t zone_alloc_ilayer_existing(zone_alloc_t *za, uint32_t avoid_zone)
+{
+    return rr_pick_zone(za,
+                        za->ilayer_pool_base, za->ilayer_pool_size,
+                        za->ilayer_init_count,
+                        &za->ilayer_group_count, &za->ilayer_rr,
+                        avoid_zone,
+                        "ILayer", 1);
+}
+
+uint32_t zone_alloc_llayer_existing(zone_alloc_t *za, ztree_node_id_t node_id,
+                                    uint32_t avoid_zone)
+{
+    if (zone_is_hot(za, node_id)) {
+        return rr_pick_zone(za,
+                            za->hot_pool_base, za->hot_pool_size,
+                            za->hot_init_count,
+                            &za->hot_group_count, &za->hot_rr,
+                            avoid_zone,
+                            "LLayer-hot", 1);
+    } else {
+        return rr_pick_zone(za,
+                            za->cold_pool_base, za->cold_pool_size,
+                            za->cold_init_count,
+                            &za->cold_group_count, &za->cold_rr,
+                            avoid_zone,
+                            "LLayer-cold", 1);
     }
 }
 

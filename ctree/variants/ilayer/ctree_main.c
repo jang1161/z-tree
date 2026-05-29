@@ -2846,7 +2846,10 @@ static int zns_gc_migrate_leaf(cow_tree *t, uint32_t victim,
     if (!p.is_leaf || p.num_keys == 0) { node_unlock(t, nid); return 0; }
     int64_t cascade_key = (int64_t)p.leaf[0].key;
 
-    uint32_t target = zone_alloc_llayer(&t->za, nid, victim);
+    /* Prefer an open zone (no admission slot); open new only if none has space. */
+    uint32_t target = zone_alloc_llayer_existing(&t->za, nid, victim);
+    if (target == ZTREE_INVALID_ZONE_ID)
+        target = zone_alloc_llayer(&t->za, nid, victim);
     if (target == ZTREE_INVALID_ZONE_ID) { node_unlock(t, nid); return 0; }
     pthread_mutex_lock(&t->zone_write_locks[target]);
     if (atomic_load_explicit(&t->zone_full[target], memory_order_acquire)) {
@@ -2899,7 +2902,7 @@ static void zns_gc_migrate_cb(ztree_node_id_t nid, uint32_t slot, void *vp) {
     c->migrated += (size_t)zns_gc_migrate_leaf(c->t, c->victim, nid, slot);
 }
 
-struct zns_victim_result { uint32_t zone, counter_before; size_t seen, migrated; };
+struct zns_victim_result { uint32_t zone, counter_before; size_t seen, migrated; int done; };
 static void zns_gc_migrate_victim(cow_tree *t, struct zns_victim_result *r) {
     r->counter_before = atomic_load_explicit(&t->zone_valid_leaves[r->zone],
                                              memory_order_relaxed);
@@ -2959,20 +2962,40 @@ size_t cow_gc_zns(cow_tree *t) {
     for (int i = 0; i < N; i++) pthread_join(tids[i], NULL);
 
     size_t total_migrated = 0, zones_reset = 0;
-    for (int v = 0; v < nvictims; v++) {
-        struct zns_victim_result *r = &results[v];
-        total_migrated += r->migrated;
-        uint32_t remaining = atomic_load_explicit(&t->zone_valid_leaves[r->zone],
-                                                  memory_order_acquire);
-        if (remaining > 0) continue;
-        off_t zstart = (off_t)t->zones[r->zone].start;
-        if (zbd_reset_zones(t->fd, zstart, (off_t)t->info.zone_size) != 0) continue;
-        atomic_store_explicit(&t->zone_wp_bytes[r->zone],
-                              t->zones[r->zone].start, memory_order_release);
-        zone_admission_release_zone(&t->za, r->zone);
-        atomic_store_explicit(&t->zone_full[r->zone], 0, memory_order_release);
-        nlt_set_zone_sealed(&t->nlt, r->zone, false);
-        zones_reset++;
+    for (int v = 0; v < nvictims; v++)
+        total_migrated += results[v].migrated;
+
+    /* Reset drained victims; re-migrate stragglers (transient trylock holds)
+     * over a few short passes. */
+    for (int pass = 0; pass <= 3; pass++) {
+        int pending = 0;
+        for (int v = 0; v < nvictims; v++) {
+            struct zns_victim_result *r = &results[v];
+            if (r->done) continue;
+            uint32_t remaining = atomic_load_explicit(&t->zone_valid_leaves[r->zone],
+                                                      memory_order_acquire);
+            if (remaining == 0) {
+                off_t zstart = (off_t)t->zones[r->zone].start;
+                if (zbd_reset_zones(t->fd, zstart, (off_t)t->info.zone_size) != 0)
+                    continue;
+                atomic_store_explicit(&t->zone_wp_bytes[r->zone],
+                                      t->zones[r->zone].start, memory_order_release);
+                zone_admission_release_zone(&t->za, r->zone);
+                atomic_store_explicit(&t->zone_full[r->zone], 0, memory_order_release);
+                nlt_set_zone_sealed(&t->nlt, r->zone, false);
+                r->done = 1; zones_reset++;
+            } else {
+                pending = 1;
+            }
+        }
+        if (!pending || pass == 3) break;
+        usleep(20000);
+        for (int v = 0; v < nvictims; v++) {
+            struct zns_victim_result *r = &results[v];
+            if (r->done) continue;
+            zns_gc_migrate_victim(t, r);
+            total_migrated += r->migrated;
+        }
     }
     free(results); free(victims);
     size_t after = zns_physical_bytes(t);

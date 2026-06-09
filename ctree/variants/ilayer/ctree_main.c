@@ -30,10 +30,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "ctree_main.h"
+
+/* Filesystem name of a mount point (for the CNS startup log). */
+static const char *cns_fstype_name(const char *path)
+{
+    struct statfs sf;
+    if (statfs(path, &sf) != 0) return "unknown";
+    switch ((unsigned long)sf.f_type) {
+    case 0xF2F52010UL: return "f2fs";
+    case 0xEF53UL:     return "ext4";
+    case 0x58465342UL: return "xfs";
+    default:           return "other";
+    }
+}
 
 /* ── Zone budget overrides for this variant ────────────────────────────────
  * ILayer is dormant (internals on CNS).  3 freed active slots → +2 hot / +1 cold.
@@ -2467,9 +2481,11 @@ cow_tree *cow_open(const char *path)
         t->cns_fd_shard[k] = fd;
     }
     t->cns_fd = t->cns_fd_shard[0];  /* alias for validity checks */
+    fprintf(stderr, "[ctree_ilayer] CNS mount: %s\n",
+            cns_fstype_name(CTREE_CNS_DIR));
     fprintf(stderr,
-            "[ctree_ilayer] CNS mode: %s  (%d shards in %s)\n",
-            g_cns_odirect ? "O_DIRECT (page cache bypassed)" : "buffered I/O",
+            "[ctree_ilayer] CNS mode: %s (%d shards in %s)\n",
+            g_cns_odirect ? "O_DIRECT" : "buffered I/O",
             CTREE_CNS_SHARDS, CTREE_CNS_DIR);
 
     /* No CNS bitmap in this variant — location is determined by pg->is_leaf. */
@@ -2661,9 +2677,6 @@ cow_tree *cow_open(const char *path)
     atomic_store_explicit(&t->za.active_zones, 0, memory_order_relaxed);
 
     fprintf(stderr,
-            "[ctree_ilayer] internal nodes → CNS %s (slot = node_id)\n",
-            CTREE_CNS_DIR);
-    fprintf(stderr,
             "[ctree_ilayer] LLayer hot-pool [%u, %u)  init_group=%u"
             "  cold-pool [%u, %u)  init_group=%u\n",
             hot_pool_base,  hot_pool_base  + hot_pool_size,  ZTREE_LZGROUP_HOT_INIT,
@@ -2710,8 +2723,7 @@ cow_tree *cow_open(const char *path)
             atomic_store_explicit(&g_zns_gc_running, false, memory_order_release);
         } else {
             fprintf(stderr,
-                    "[ctree_ilayer] ZNS GC thread enabled: interval=%ums "
-                    "(needs CTREE_DYNAMIC_ZNS_GC=1)\n",
+                    "[ctree_ilayer] ZNS GC thread enabled: interval=%ums\n",
                     g_zns_gc_interval_ms);
         }
     }

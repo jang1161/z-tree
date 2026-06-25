@@ -8,7 +8,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "ztree_main.h"
+#include "ctree_main.h"
 
 typedef struct
 {
@@ -26,7 +26,8 @@ static _Atomic int missing_cnt = 0;
 static _Atomic bool monitor_stop = false;
 
 /* Per-second throughput sampler: every 1s, log ops completed in that second.
- * Output to CTREE_TPUT_PATH (CSV) or stderr. */
+ * Output to CTREE_TPUT_PATH (CSV) or stderr. Lets us see the throughput dip
+ * during CNS GC cycles. */
 static void *tput_monitor(void *arg)
 {
     (void)arg;
@@ -97,18 +98,36 @@ static void *verifier(void *arg)
 
 static void reset_device(const char *dev_path)
 {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "sudo nvme zns reset-zone -a %s", dev_path);
+    char cmd[640];
+
+    /* F2FS variant: CNS lives on an F2FS mount over the dm-hyhost R-region.
+     * NEVER `nvme zns reset-zone -a` / `blkdiscard` the whole device — that
+     * would reset the R-region zones and corrupt the mounted F2FS.  Instead:
+     *   (1) reset ONLY the S-region zones (offset >= CTREE_S_START_SECTORS),
+     *   (2) clear the CNS node files (F2FS frees the blocks; cow_open also
+     *       ftruncate(0)s each shard, this just gives a clean cns_phys base).
+     * CTREE_S_START_SECTORS must equal the r_end used in f2fs_setup.sh. */
+    const char *s_start = getenv("CTREE_S_START_SECTORS");
+    if (!s_start || !*s_start) s_start = "8388608";   /* 4 GiB R-region default */
+    snprintf(cmd, sizeof(cmd), "sudo blkzone reset -o %s %s", s_start, dev_path);
     int rc = system(cmd);
-    if (rc == -1)
-    {
-        perror("system(nvme reset-zone)");
-    }
+    if (rc != 0)
+        fprintf(stderr,
+                "WARNING: blkzone reset -o %s %s failed (rc=%d); ensure the "
+                "S-region is empty (full reset BEFORE mounting F2FS)\n",
+                s_start, dev_path, rc);
+
+    const char *cns_dir = getenv("CTREE_CNS_DIR");
+    if (!cns_dir || !*cns_dir) cns_dir = "/mnt/hyhost";
+    snprintf(cmd, sizeof(cmd), "sudo rm -f %s/nodes.*.dat", cns_dir);
+    rc = system(cmd);
+    if (rc != 0)
+        fprintf(stderr, "WARNING: rm %s/nodes.*.dat failed (rc=%d)\n", cns_dir, rc);
 }
 
 static void run_test(const char *dev_path, int num_threads)
 {
-    printf("Resetting ZNS device...\n");
+    printf("Resetting devices...\n");
     reset_device(dev_path);
     sleep(1);
 

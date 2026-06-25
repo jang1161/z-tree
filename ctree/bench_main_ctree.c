@@ -2,6 +2,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -22,6 +23,33 @@ static _Atomic int work_cursor = 0;
 static _Atomic int verify_cursor = 0;
 static _Atomic int found_cnt = 0;
 static _Atomic int missing_cnt = 0;
+static _Atomic bool monitor_stop = false;
+
+/* Per-second throughput sampler: every 1s, log ops completed in that second.
+ * Output to CTREE_TPUT_PATH (CSV) or stderr. Lets us see the throughput dip
+ * during CNS GC cycles. */
+static void *tput_monitor(void *arg)
+{
+    (void)arg;
+    const char *path = getenv("CTREE_TPUT_PATH");
+    FILE *fp = path ? fopen(path, "w") : stderr;
+    if (!fp) fp = stderr;
+    fprintf(fp, "sec,ops_this_sec,cumulative\n");
+    fflush(fp);
+    int prev = 0, sec = 0;
+    while (!atomic_load(&monitor_stop))
+    {
+        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+        int cur = atomic_load(&progress_count);
+        sec++;
+        fprintf(fp, "%d,%d,%d\n", sec, cur - prev, cur);
+        fflush(fp);
+        prev = cur;
+    }
+    if (fp != stderr) fclose(fp);
+    return NULL;
+}
 
 static void *worker(void *arg)
 {
@@ -76,10 +104,18 @@ static void reset_device(const char *dev_path)
     if (rc == -1)
         perror("system(nvme reset-zone)");
 
-    /* Discard CNS device to reset FTL state */
-    rc = system("sudo blkdiscard /dev/nvme3n1");
+    /* CNS is a persistent F2FS at /mnt/cns — reset by removing the node files,
+     * NEVER blkdiscard the device (that wipes the filesystem). */
+    if (system("mountpoint -q /mnt/cns") != 0)
+    {
+        fprintf(stderr,
+                "ERROR: /mnt/cns is not mounted — CNS nodes need an F2FS there.\n"
+                "  mount it first:  sudo mount /dev/nvme3n1 /mnt/cns\n");
+        exit(1);
+    }
+    rc = system("sudo rm -f /mnt/cns/nodes.dat /mnt/cns/nodes.*.dat");
     if (rc == -1)
-        perror("system(blkdiscard nvme3n1)");
+        perror("system(rm /mnt/cns nodes)");
 }
 
 static void run_test(const char *dev_path, int num_threads)
@@ -114,6 +150,10 @@ static void run_test(const char *dev_path, int num_threads)
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
+    atomic_store(&monitor_stop, false);
+    pthread_t monitor;
+    pthread_create(&monitor, NULL, tput_monitor, NULL);
+
     for (int i = 0; i < num_threads; i++)
     {
         args[i].t = t;
@@ -125,6 +165,8 @@ static void run_test(const char *dev_path, int num_threads)
     {
         pthread_join(threads[i], NULL);
     }
+    atomic_store(&monitor_stop, true);
+    pthread_join(monitor, NULL);
     printf("\n");
 
     clock_gettime(CLOCK_MONOTONIC, &end);

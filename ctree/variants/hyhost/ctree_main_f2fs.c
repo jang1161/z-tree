@@ -85,6 +85,11 @@ static _Atomic bool     g_leaf_cns_frozen = false;
  * ENOSPC. env CTREE_DYNAMIC_CNS_GC_FREEZE=0 to disable. */
 static int              g_gc_freeze_spill = 1;
 
+/* Leaf-spill (CNS fallback) accounting — leaf-only (internal nodes return
+ * before the leaf write section).  spill_ratio = cns / (zns + cns). */
+static _Atomic(uint64_t) g_leaf_zns = 0;   /* leaf flush landed on a ZNS zone */
+static _Atomic(uint64_t) g_leaf_cns = 0;   /* leaf flush spilled to CNS (fallback) */
+
 /* Stop-the-world CNS GC (env CNS_GC_BLOCKING=1, for comparison): GC thread
  * takes the wrlock around evict+punch, inserts take the rdlock — so inserts
  * pause entirely during a GC cycle (the pre-non-blocking behavior). */
@@ -227,11 +232,15 @@ static void *dynamic_zns_gc_thread(void *arg)
     return NULL;
 }
 
-/* Dynamic variant uses CNS via an F2FS sparse file (so that
- * cns_physical_bytes() can read st_blocks and GC can punch holes).
- * F2FS mount must exist at /mnt/cns. */
-#define CTREE_CNS_DIR          "/mnt/cns"
-#define CTREE_CNS_FILE_FMT     "/mnt/cns/nodes.%d.dat"
+/* hyhost F2FS variant: CNS lives on an F2FS mount over the dm-hyhost
+ * R-region (sparse files, so cns_physical_bytes() reads st_blocks and GC
+ * punches holes — same as the dynamic variant).  Mount defaults to
+ * /mnt/hyhost; override with CTREE_CNS_DIR. */
+static const char *cns_dir(void)
+{
+    const char *d = getenv("CTREE_CNS_DIR");
+    return (d && *d) ? d : "/mnt/hyhost";
+}
 
 /* In the dynamic variant internals live on CNS so the legacy IZ pool
  * range [2,50) is dormant — LLayer actually starts at zone 2.
@@ -260,10 +269,41 @@ static inline size_t cns_physical_bytes(ztree_t *t)
 
 /* F2FS-level used ratio (this file + everything else under the mount).
  * Used by the HWM trigger in dynamic_gc_thread. */
+/* When F2FS sits on a dm-hyhost target, the real ENOSPC pressure is dm's
+ * PHYSICAL line occupancy (F2FS LFS + dm out-of-place = double CoW), not the
+ * F2FS-logical statvfs view — statvfs stays low while dm lines fill with stale.
+ * Read dm's own accounting (dmsetup status <name>); the dm device name comes
+ * from CTREE_CNS_DM_NAME (default hyhost0).  If dmsetup yields nothing (e.g.
+ * F2FS-A direct on the raw device, no dm), fall back to statvfs. */
 static double cns_used_ratio(void)
 {
+    const char *name = getenv("CTREE_CNS_DM_NAME");
+    if (!name || !*name) name = "hyhost0";
+    char cmd[160];
+    snprintf(cmd, sizeof cmd, "dmsetup status %s 2>/dev/null", name);
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        char buf[512];
+        if (fgets(buf, sizeof buf, fp)) {
+            char *p;
+            long lines = 0, lpb = 0, fl = 0, co = 0;
+            if ((p = strstr(buf, " lines=")))      lines = atol(p + 7);
+            if ((p = strstr(buf, "line_pblocks="))) lpb  = atol(p + 13);
+            if ((p = strstr(buf, "free_lines=")))   fl   = atol(p + 11);
+            if ((p = strstr(buf, "cur_off=")))      co   = atol(p + 8);
+            if (lines > 0 && lpb > 0) {
+                double used = (fl >= lines) ? 0.0
+                            : ((double)(lines - fl - 1) * lpb + co);
+                pclose(fp);
+                return used / ((double)lines * lpb);
+            }
+        }
+        pclose(fp);
+    }
+
+    /* Fallback: F2FS-logical usage (no dm layer, e.g. -A direct). */
     struct statvfs vfs;
-    if (statvfs(CTREE_CNS_DIR, &vfs) != 0) return 0.0;
+    if (statvfs(cns_dir(), &vfs) != 0) return 0.0;
     uint64_t total = (uint64_t)vfs.f_blocks * vfs.f_frsize;
     uint64_t avail = (uint64_t)vfs.f_bavail * vfs.f_frsize;
     if (total == 0) return 0.0;
@@ -1725,6 +1765,7 @@ retry_flush:
 
     if (!cns_path)
     {
+        atomic_fetch_add_explicit(&g_leaf_zns, 1, memory_order_relaxed);
         record_zwl_hold(t, target_zone, monotonic_ns() - zwl_hold_start);
         zones_busy_dec(t);
         pthread_mutex_unlock(&t->zone_write_locks[target_zone]);
@@ -1746,6 +1787,7 @@ retry_flush:
     }
     else
     {
+        atomic_fetch_add_explicit(&g_leaf_cns, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&t->stat_cns_writes, 1, memory_order_relaxed);
         if (!cns_bitmap_test(t, pg->node_id))
             atomic_fetch_add_explicit(&t->stat_cns_current, 1, memory_order_relaxed);
@@ -3056,15 +3098,15 @@ cow_tree *cow_open(const char *path)
     for (int k = 0; k < CTREE_CNS_SHARDS; k++)
     {
         char path_k[256];
-        snprintf(path_k, sizeof path_k, CTREE_CNS_FILE_FMT, k);
+        snprintf(path_k, sizeof path_k, "%s/nodes.%d.dat", cns_dir(), k);
         int fd = open(path_k, cns_flags, 0644);
         if (fd < 0)
         {
             fprintf(stderr,
-                    "[ctree_dynamic] FATAL: cannot open CNS file %s: %s\n"
-                    "  Ensure F2FS is mounted on %s:\n"
-                    "    sudo mkfs.f2fs -f /dev/nvme3n1 && sudo mount -t f2fs /dev/nvme3n1 %s\n",
-                    path_k, strerror(errno), CTREE_CNS_DIR, CTREE_CNS_DIR);
+                    "[ctree_hyhost_f2fs] FATAL: cannot open CNS file %s: %s\n"
+                    "  Ensure F2FS is mounted on %s (dm-hyhost R-region):\n"
+                    "    sudo ~/HYSSD/dm-hyhost/scripts/f2fs_setup.sh /dev/nvme0n1 <r_end> %s\n",
+                    path_k, strerror(errno), cns_dir(), cns_dir());
             for (int j = 0; j < k; j++) close(t->cns_fd_shard[j]);
             if (t->direct_fd >= 0) close(t->direct_fd);
             zbd_close(t->fd);
@@ -3077,12 +3119,12 @@ cow_tree *cow_open(const char *path)
         t->cns_fd_shard[k] = fd;
     }
     t->cns_fd = t->cns_fd_shard[0];  /* alias for validity checks */
-    fprintf(stderr, "[ctree_dynamic] CNS mount: %s\n",
-            cns_fstype_name(CTREE_CNS_DIR));
+    fprintf(stderr, "[ctree_hyhost_f2fs] CNS mount: %s (%s)\n",
+            cns_dir(), cns_fstype_name(cns_dir()));
     fprintf(stderr,
-            "[ctree_dynamic] CNS mode: %s (%d shards in %s)\n",
+            "[ctree_hyhost_f2fs] CNS mode: %s (%d shards in %s)\n",
             g_cns_odirect ? "O_DIRECT" : "buffered I/O",
-            CTREE_CNS_SHARDS, CTREE_CNS_DIR);
+            CTREE_CNS_SHARDS, cns_dir());
 
     /* No CNS bitmap in this variant — location is determined by pg->is_leaf. */
     /* Allocate cns_bitmap so leaf-spill can track which leaves currently
@@ -3169,6 +3211,30 @@ cow_tree *cow_open(const char *path)
         zbd_close(t->fd);
         free(t);
         return NULL;
+    }
+
+    /* hyhost: the device's front zones are the R-region (CNS, owned by
+     * dm-hyhost + F2FS).  ctree's ZNS structures (meta z0/1, LLayer z2+) must
+     * live in the S-region only, so shift the reported zone array past the
+     * reserved (R) zones and shrink nr_zones — logical zone 0 == first S-zone.
+     * reserved==0 (real full-ZNS namespace) makes this a no-op. */
+    {
+        uint32_t reserved = t->info.nr_rzones;
+        if (reserved > 0 && reserved < t->info.nr_zones)
+        {
+            memmove(t->zones, t->zones + reserved,
+                    (size_t)(t->info.nr_zones - reserved) * sizeof *t->zones);
+            t->info.nr_zones -= reserved;
+            fprintf(stderr,
+                    "[ctree_hyhost_f2fs] reserved(R)=%u zones skipped; ZNS uses %u "
+                    "S-zones (logical 0 = phys zone %u)\n",
+                    reserved, t->info.nr_zones, reserved);
+        }
+        else
+        {
+            fprintf(stderr, "[ctree_hyhost_f2fs] reserved(R)=%u; no zone offset "
+                    "(ZNS uses all %u zones)\n", reserved, t->info.nr_zones);
+        }
     }
 
     for (uint32_t z = 0; z < t->info.nr_zones; z++)
@@ -4282,6 +4348,7 @@ void cow_close(cow_tree *t)
             "    nlt_only_updates  = %llu  (parent skipped, same zone OR internal CoW)\n"
             "    zone_changes      = %llu  (leaf moved to new zone)\n"
             "    parent_rewrites   = %llu\n"
+            "  leaf-spill: zns=%llu cns=%llu  spill_ratio=%.2f%%\n"
             "  avg_flush_us   = %.1f\n",
             (unsigned long long)inserts,
             (unsigned long long)deletes,
@@ -4297,6 +4364,14 @@ void cow_close(cow_tree *t)
             (unsigned long long)nlt_only,
             (unsigned long long)zone_chg,
             (unsigned long long)par_rew,
+            (unsigned long long)atomic_load_explicit(&g_leaf_zns, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_leaf_cns, memory_order_relaxed),
+            (atomic_load_explicit(&g_leaf_zns, memory_order_relaxed)
+             + atomic_load_explicit(&g_leaf_cns, memory_order_relaxed) > 0)
+              ? 100.0 * (double)atomic_load_explicit(&g_leaf_cns, memory_order_relaxed)
+                / (double)(atomic_load_explicit(&g_leaf_zns, memory_order_relaxed)
+                           + atomic_load_explicit(&g_leaf_cns, memory_order_relaxed))
+              : 0.0,
             (fl_samp > 0) ? (double)fl_sum / (double)fl_samp / 1000.0 : 0.0);
 
     uint64_t nlt_wait  = atomic_load_explicit(&t->nlt.prof_wait_ns_sum,   memory_order_relaxed);
